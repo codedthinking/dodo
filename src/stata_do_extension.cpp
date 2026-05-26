@@ -28,7 +28,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",
                                               "generate",  "replace",   "rename",  "sort",    "order",
                                               "egen",      "collapse",  "count",   "describe", "summarize",
                                               "tabulate",  "head",      "tail",    "save",    "append",
-                                              "mvencode",  "reshape",  "do",      "label"};
+                                              "mvencode",  "reshape",  "do",      "label",  "codebook"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -471,7 +471,62 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			return "SELECT 'OK' AS status";
 		}
 
-		throw ParserException("Unknown label subcommand. Use: label variable, label define, or label values");
+		if (StringUtil::StartsWith(lower_args, "list")) {
+			// label list — show all defined labels
+			// Build a UNION ALL of variable labels and value label definitions
+			string sql = "SELECT * FROM (VALUES ";
+			bool has_rows = false;
+
+			// Variable labels
+			for (auto &[col, label] : state.variable_labels) {
+				string escaped = label;
+				size_t pos = 0;
+				while ((pos = escaped.find('\'', pos)) != string::npos) {
+					escaped.replace(pos, 1, "''");
+					pos += 2;
+				}
+				if (has_rows) {
+					sql += ", ";
+				}
+				sql += "('" + col + "', 'variable', '" + escaped + "')";
+				has_rows = true;
+			}
+
+			// Column-to-value-label mappings
+			for (auto &[col, lbl_name] : state.column_labels) {
+				if (has_rows) {
+					sql += ", ";
+				}
+				sql += "('" + col + "', 'value_label', '" + lbl_name + "')";
+				has_rows = true;
+			}
+
+			// Value label definitions
+			for (auto &[lbl_name, mapping] : state.value_label_defs) {
+				for (auto &[val, text] : mapping) {
+					string escaped = text;
+					size_t pos = 0;
+					while ((pos = escaped.find('\'', pos)) != string::npos) {
+						escaped.replace(pos, 1, "''");
+						pos += 2;
+					}
+					if (has_rows) {
+						sql += ", ";
+					}
+					sql += "('" + lbl_name + "', '" + to_string(val) + "', '" + escaped + "')";
+					has_rows = true;
+				}
+			}
+
+			if (!has_rows) {
+				return "SELECT 'No labels defined' AS message";
+			}
+
+			sql += ") AS t(name, type, value) ORDER BY name, type";
+			return sql;
+		}
+
+		throw ParserException("Unknown label subcommand. Use: label variable, label define, label values, or label list");
 	}
 
 	if (!state.HasData()) {
@@ -830,7 +885,8 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		    prev + ") sub WHERE _rn > _total - " + n);
 	}
 
-	if (cmd.command == "describe") {
+	if (cmd.command == "describe" || cmd.command == "codebook") {
+		// codebook is an alias for describe that doesn't conflict with SQL
 		// Build a query that shows column metadata including labels
 		// Base: column_name, column_type from DESCRIBE
 		// Enhanced: add variable_label and value_label columns from state
@@ -842,32 +898,38 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		}
 
 		// Build a CASE expression for variable labels
-		string var_label_expr = "CASE column_name";
-		bool has_var_labels = false;
-		for (auto &[col, label] : state.variable_labels) {
-			string escaped = label;
-			// Escape single quotes
-			size_t pos = 0;
-			while ((pos = escaped.find('\'', pos)) != string::npos) {
-				escaped.replace(pos, 1, "''");
-				pos += 2;
+		string var_label_expr;
+		if (!state.variable_labels.empty()) {
+			var_label_expr = "CASE column_name";
+			for (auto &[col, label] : state.variable_labels) {
+				string escaped = label;
+				size_t pos = 0;
+				while ((pos = escaped.find('\'', pos)) != string::npos) {
+					escaped.replace(pos, 1, "''");
+					pos += 2;
+				}
+				var_label_expr += " WHEN '" + col + "' THEN '" + escaped + "'";
 			}
-			var_label_expr += " WHEN '" + col + "' THEN '" + escaped + "'";
-			has_var_labels = true;
+			var_label_expr += " ELSE '' END";
+		} else {
+			var_label_expr = "''";
 		}
-		var_label_expr += " ELSE '' END AS variable_label";
 
 		// Build a CASE expression for value label names
-		string val_label_expr = "CASE column_name";
-		bool has_val_labels = false;
-		for (auto &[col, label_name] : state.column_labels) {
-			val_label_expr += " WHEN '" + col + "' THEN '" + label_name + "'";
-			has_val_labels = true;
+		string val_label_expr;
+		if (!state.column_labels.empty()) {
+			val_label_expr = "CASE column_name";
+			for (auto &[col, label_name] : state.column_labels) {
+				val_label_expr += " WHEN '" + col + "' THEN '" + label_name + "'";
+			}
+			val_label_expr += " ELSE '' END";
+		} else {
+			val_label_expr = "''";
 		}
-		val_label_expr += " ELSE '' END AS value_label";
 
-		return "SELECT column_name, column_type, " + var_label_expr + ", " + val_label_expr +
-		       " FROM (DESCRIBE " + state.BuildQuery("SELECT * FROM " + prev) + ")";
+		return "SELECT column_name, column_type, " + var_label_expr + " AS variable_label, " +
+		       val_label_expr + " AS value_label FROM (DESCRIBE " +
+		       state.BuildQuery("SELECT * FROM " + prev) + ")";
 	}
 
 	if (cmd.command == "summarize") {

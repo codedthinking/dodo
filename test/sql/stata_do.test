@@ -580,18 +580,84 @@ label define sector_lbl 1 "Primary" 2 "Secondary" 3 "Tertiary"
 statement ok
 label values id sector_lbl
 
-# labels survive transformations (tested via describe in interactive mode)
-# Note: describe with labels only works when used interactively or via
-# do-files, because the standard SQL parser grabs "describe" before our
-# extension in the test framework's batch mode.
+# codebook — alias for describe that doesn't conflict with SQL
+# Note: empty label fields are empty strings; sqllogictest puts each value on its own line
+query IIII rowsort
+codebook
+----
+id
+BIGINT
+(empty)
+sector_lbl
+name
+VARCHAR
+(empty)
+(empty)
+revenue
+BIGINT
+Annual revenue in USD
+(empty)
+year
+BIGINT
+Fiscal year
+(empty)
 
+# labels survive transformations
 statement ok
 keep if year == 2018
 
-query I
-count
+query IIII rowsort
+codebook
 ----
-3
+id
+BIGINT
+(empty)
+sector_lbl
+name
+VARCHAR
+(empty)
+(empty)
+revenue
+BIGINT
+Annual revenue in USD
+(empty)
+year
+BIGINT
+Fiscal year
+(empty)
+
+# label list — show all defined labels
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+label variable revenue "Annual revenue in USD"
+
+statement ok
+label define yesno 0 "No" 1 "Yes"
+
+statement ok
+label values id yesno
+
+query III
+label list
+----
+id	value_label	yesno
+revenue	variable	Annual revenue in USD
+yesno	0	No
+yesno	1	Yes
+
+# codebook without labels — just column_name and column_type
+statement ok
+use "test/data/firms.csv", clear
+
+query II
+codebook
+----
+id	BIGINT
+name	VARCHAR
+revenue	BIGINT
+year	BIGINT
 
 statement ok
 clear
