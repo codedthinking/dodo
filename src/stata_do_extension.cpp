@@ -24,11 +24,12 @@ static string Trim(const string &s) {
 // Stata Command Tokenizer
 //===--------------------------------------------------------------------===//
 
-static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",   "keep",    "drop",
-                                              "generate",  "replace",   "rename",  "sort",    "order",
-                                              "egen",      "collapse",  "count",   "describe", "summarize",
-                                              "tabulate",  "head",      "tail",    "save",    "append",
-                                              "mvencode",  "reshape",  "do",      "label",  "codebook"};
+static const vector<string> STATA_COMMANDS = {"use",       "list",       "clear",   "keep",    "drop",
+                                              "generate",  "replace",    "rename",  "sort",    "order",
+                                              "egen",      "collapse",   "count",   "describe", "summarize",
+                                              "tabulate",  "head",       "tail",    "save",    "append",
+                                              "mvencode",  "reshape",    "do",      "label",   "codebook",
+                                              "duplicates", "expand",    "export",  "import"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -37,7 +38,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",
 static bool IsTransformationCommand(const string &command) {
 	static const vector<string> TRANSFORMATION = {"use", "clear", "do", "keep", "drop", "generate", "replace",
 	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
-	                                              "reshape", "append", "label"};
+	                                              "reshape", "append", "label", "duplicates", "expand", "import"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -761,6 +762,20 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		throw ParserException("Unknown label subcommand. Use: label variable, label define, label values, or label list");
 	}
 
+	if (cmd.command == "import") {
+		// import delimited "file", clear — same as use for CSV
+		string lower_args = StringUtil::Lower(cmd.arguments);
+		if (!StringUtil::StartsWith(lower_args, "delimited ")) {
+			throw ParserException("'import' only supports 'import delimited'");
+		}
+		string rest = Trim(cmd.arguments.substr(10));
+		string filename = ExtractQuotedString(rest);
+		state.Clear();
+		state.AddStep("SELECT * FROM read_csv('" + filename + "')");
+		state.current_source = filename;
+		return "SELECT 'OK' AS status";
+	}
+
 	if (!state.HasData()) {
 		throw ParserException("No dataset in memory. Use 'use' to load data first.");
 	}
@@ -1074,6 +1089,88 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		// DuckDB supports: SELECT col1, col2, * EXCLUDE (col1, col2) FROM t
 		state.AddStep("SELECT " + col_list + ", * EXCLUDE (" + col_list + ") FROM " + prev);
 		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "duplicates") {
+		// duplicates drop [varlist]
+		string lower_args = StringUtil::Lower(cmd.arguments);
+		if (!StringUtil::StartsWith(lower_args, "drop")) {
+			throw ParserException("'duplicates' only supports 'duplicates drop [varlist]'");
+		}
+		string rest = Trim(cmd.arguments.substr(4));
+		if (rest.empty()) {
+			// duplicates drop — deduplicate on all columns
+			state.AddStep("SELECT DISTINCT * FROM " + prev);
+		} else {
+			// duplicates drop var1 var2 — keep first row per group of varlist
+			auto vars = StringUtil::Split(rest, ' ');
+			string col_list;
+			for (idx_t i = 0; i < vars.size(); i++) {
+				if (i > 0) {
+					col_list += ", ";
+				}
+				col_list += Trim(vars[i]);
+			}
+			// Use ROW_NUMBER to keep first row per group
+			state.AddStep("SELECT * EXCLUDE (_dedup_rn) FROM ("
+			              "SELECT *, ROW_NUMBER() OVER (PARTITION BY " + col_list + ") AS _dedup_rn FROM " + prev +
+			              ") WHERE _dedup_rn = 1");
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "expand") {
+		// expand N [, generate(newvar)]
+		// N can be a constant or a variable name
+		string n_expr = Trim(cmd.arguments);
+		string gen_var;
+		// Check for generate() option
+		if (!cmd.options.empty()) {
+			string lower_opts = StringUtil::Lower(cmd.options);
+			idx_t gen_pos = lower_opts.find("generate(");
+			if (gen_pos == string::npos) {
+				gen_pos = lower_opts.find("gen(");
+			}
+			if (gen_pos != string::npos) {
+				idx_t start = cmd.options.find('(', gen_pos) + 1;
+				idx_t end = cmd.options.find(')', start);
+				if (end != string::npos) {
+					gen_var = Trim(cmd.options.substr(start, end - start));
+				}
+			}
+		}
+
+		// Generate a series for each row and cross join
+		// If N is a variable, each row can have a different expansion count
+		if (gen_var.empty()) {
+			state.AddStep("SELECT * EXCLUDE (_expand_idx) FROM ("
+			              "SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
+			              " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
+		} else {
+			// generate(newvar) — newvar is 0 for original row, 1 for copies
+			state.AddStep("SELECT * EXCLUDE (_expand_idx), "
+			              "CASE WHEN _expand_idx = 1 THEN 0 ELSE 1 END AS " + gen_var +
+			              " FROM (SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
+			              " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	// --- Side-effect commands ---
+	if (cmd.command == "export") {
+		// export delimited using "file", replace
+		string lower_args = StringUtil::Lower(cmd.arguments);
+		if (!StringUtil::StartsWith(lower_args, "delimited ")) {
+			throw ParserException("'export' only supports 'export delimited'");
+		}
+		string rest = Trim(cmd.arguments.substr(10));
+		// Strip optional "using" keyword
+		string lower_rest = StringUtil::Lower(rest);
+		if (StringUtil::StartsWith(lower_rest, "using ")) {
+			rest = Trim(rest.substr(6));
+		}
+		string filename = ExtractQuotedString(rest);
+		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + filename + "' (FORMAT CSV, HEADER)";
 	}
 
 	// --- Terminal commands ---
@@ -1451,9 +1548,13 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 
 		// Check for SQL-conflicting commands:
 		// use "file" — SQL USE schema conflicts
+		// import delimited — SQL IMPORT conflicts
 		// describe, summarize — SQL DESCRIBE/SUMMARIZE conflicts
 		// reshape wide — PIVOT generates MULTI statements
 		if (StringUtil::StartsWith(lower, "use ") && (lower.find('"') != string::npos || lower.find('\'') != string::npos)) {
+			has_conflict_commands = true;
+		}
+		if (StringUtil::StartsWith(lower, "import ")) {
 			has_conflict_commands = true;
 		}
 		if (StringUtil::StartsWith(lower, "describe") || StringUtil::StartsWith(lower, "summarize")) {

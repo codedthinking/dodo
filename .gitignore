@@ -10,3 +10,4 @@ test/python/__pycache__/
 test/data/large.csv
 test/data/firms_2018.csv
 test/data/firms_out.csv
+test/data/firms_export.csv

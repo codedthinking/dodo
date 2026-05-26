@@ -756,3 +756,90 @@ list
 
 statement ok
 clear
+
+# ============================================================
+# M13: duplicates drop, expand, export/import delimited
+# ============================================================
+
+# duplicates drop (all columns)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+append using "test/data/firms.csv"
+
+query I
+count
+----
+10
+
+statement ok
+duplicates drop
+
+query I
+count
+----
+5
+
+# duplicates drop on specific columns
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+duplicates drop year
+
+query I
+count
+----
+2
+
+# expand
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+expand 3
+
+query I
+count
+----
+15
+
+# expand with generate()
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+expand 2, generate(copy)
+
+query I
+count
+----
+10
+
+query I
+count if copy == 1
+----
+5
+
+# export delimited
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+export delimited using "test/data/firms_export.csv", replace
+
+# import delimited
+statement ok
+import delimited "test/data/firms_export.csv", clear
+
+query I
+count
+----
+3
+
+statement ok
+clear
