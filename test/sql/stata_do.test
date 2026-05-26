@@ -457,3 +457,104 @@ count
 
 statement ok
 clear
+
+# ============================================================
+# M7: save, append, mvencode
+# ============================================================
+
+# save to CSV
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+save "test/data/firms_2018.csv", replace
+
+# reload saved file
+statement ok
+use "test/data/firms_2018.csv", clear
+
+query I
+count
+----
+3
+
+# append
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2017
+
+statement ok
+append using "test/data/firms_2018.csv"
+
+query I
+count
+----
+5
+
+# mvencode
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+replace revenue = NULL if year == 2017
+
+statement ok
+mvencode revenue, mv(0)
+
+query I
+list revenue
+----
+0
+2000
+0
+3000
+500
+
+statement ok
+clear
+
+# ============================================================
+# M8: reshape long / wide
+# ============================================================
+
+# reshape long
+statement ok
+use "test/data/panel.csv", clear
+
+statement ok
+reshape long revenue, i(id name) j(year)
+
+statement ok
+sort id year
+
+query IIRI
+list
+----
+1	Acme	2017	1000
+1	Acme	2018	1200
+2	Beta	2017	2000
+2	Beta	2018	2500
+3	Gamma	2017	1500
+3	Gamma	2018	1800
+
+# reshape wide (roundtrip)
+statement ok
+reshape wide revenue, i(id name) j(year)
+
+statement ok
+sort id
+
+query IIII
+list
+----
+1	Acme	1000	1200
+2	Beta	2000	2500
+3	Gamma	1500	1800
+
+statement ok
+clear

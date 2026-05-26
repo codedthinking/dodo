@@ -7,3 +7,5 @@ testext
 test/python/__pycache__/
 .Rhistory
 test/data/large.csv
+test/data/firms_2018.csv
+test/data/firms_out.csv

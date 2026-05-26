@@ -788,7 +788,186 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 
 	if (cmd.command == "save") {
 		string filename = ExtractQuotedString(cmd.arguments);
-		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + filename + "'";
+		// Detect format from extension
+		string lower_fn = StringUtil::Lower(filename);
+		string format_clause;
+		if (StringUtil::EndsWith(lower_fn, ".csv")) {
+			format_clause = " (FORMAT CSV, HEADER)";
+		} else if (StringUtil::EndsWith(lower_fn, ".parquet")) {
+			format_clause = " (FORMAT PARQUET)";
+		}
+		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + filename + "'" + format_clause;
+	}
+
+	if (cmd.command == "append") {
+		// append using "file.csv"
+		string args = cmd.arguments;
+		string lower_args = StringUtil::Lower(args);
+		// Strip optional "using" keyword
+		if (StringUtil::StartsWith(lower_args, "using ")) {
+			args = Trim(args.substr(6));
+		}
+		string filename = ExtractQuotedString(args);
+		string read_expr = FileReadFunction(filename);
+		state.AddStep("SELECT * FROM " + prev + " UNION ALL BY NAME SELECT * FROM " + read_expr);
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "mvencode") {
+		// mvencode var1 var2 [_all], mv(value)
+		// Replace missing values with a specified value
+		string mv_value = "0";  // default
+		// Parse mv() from options
+		string lower_opts = StringUtil::Lower(cmd.options);
+		idx_t mv_pos = lower_opts.find("mv(");
+		if (mv_pos != string::npos) {
+			idx_t start = mv_pos + 3;
+			idx_t end = cmd.options.find(')', start);
+			if (end != string::npos) {
+				mv_value = Trim(cmd.options.substr(start, end - start));
+			}
+		}
+
+		auto vars = StringUtil::Split(cmd.arguments, ' ');
+		// Check for _all
+		bool all_vars = false;
+		for (auto &v : vars) {
+			if (StringUtil::Lower(Trim(v)) == "_all") {
+				all_vars = true;
+				break;
+			}
+		}
+
+		if (all_vars) {
+			// Replace missing in all columns — use COALESCE with COLUMNS(*)
+			// DuckDB doesn't support COALESCE on COLUMNS(*) directly, so we use a workaround:
+			// SELECT COLUMNS(c -> COALESCE(c, mv_value)) FROM _prev
+			// Actually DuckDB supports: SELECT * REPLACE (...) but we'd need column names
+			// Simplest: just pass through, user should list columns explicitly
+			throw ParserException("'mvencode _all' is not yet supported. List column names explicitly.");
+		}
+
+		string replace_list;
+		for (idx_t i = 0; i < vars.size(); i++) {
+			string var = Trim(vars[i]);
+			if (var.empty()) {
+				continue;
+			}
+			if (i > 0) {
+				replace_list += ", ";
+			}
+			replace_list += "COALESCE(" + var + ", " + mv_value + ") AS " + var;
+		}
+		state.AddStep("SELECT * REPLACE (" + replace_list + ") FROM " + prev);
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "reshape") {
+		// reshape long varlist, i(id_vars) j(time_var)
+		// reshape wide varlist, i(id_vars) j(time_var)
+		string lower_args = StringUtil::Lower(cmd.arguments);
+		bool is_long = StringUtil::StartsWith(lower_args, "long ");
+		bool is_wide = StringUtil::StartsWith(lower_args, "wide ");
+
+		if (!is_long && !is_wide) {
+			throw ParserException("'reshape' requires 'long' or 'wide': reshape long/wide varlist, i(ids) j(timevar)");
+		}
+
+		string varlist_str = Trim(cmd.arguments.substr(5)); // skip "long " or "wide "
+		auto value_vars = StringUtil::Split(varlist_str, ' ');
+
+		// Parse i() and j() from options
+		string i_vars, j_var;
+		string opts = cmd.options;
+		string lower_opt = StringUtil::Lower(opts);
+
+		idx_t i_pos = lower_opt.find("i(");
+		if (i_pos != string::npos) {
+			idx_t start = i_pos + 2;
+			idx_t end = opts.find(')', start);
+			if (end != string::npos) {
+				i_vars = Trim(opts.substr(start, end - start));
+			}
+		}
+
+		idx_t j_pos = lower_opt.find("j(");
+		if (j_pos != string::npos) {
+			idx_t start = j_pos + 2;
+			idx_t end = opts.find(')', start);
+			if (end != string::npos) {
+				j_var = Trim(opts.substr(start, end - start));
+			}
+		}
+
+		if (j_var.empty()) {
+			throw ParserException("'reshape' requires j(varname) option");
+		}
+
+		if (is_long) {
+			// UNPIVOT: wide → long
+			// Stata convention: "reshape long revenue, i(id) j(year)" means
+			// unpivot columns matching revenue_* pattern, strip the prefix from j values
+			// Use COLUMNS('stub_.*') regex to match, then strip prefix from j var
+			if (value_vars.size() == 1) {
+				string stub = Trim(value_vars[0]);
+				state.AddStep(
+				    "SELECT * REPLACE (REPLACE(" + j_var + ", '" + stub + "_', '') AS " + j_var +
+				    ") FROM (UNPIVOT " + prev + " ON COLUMNS('" + stub + "_.*') INTO NAME " +
+				    j_var + " VALUE " + stub + ")");
+			} else {
+				// Multiple value vars: each stub becomes a value column
+				// UNPIVOT ON COLUMNS('stub1_.*'), COLUMNS('stub2_.*') INTO NAME j VALUE stub1, stub2
+				string on_clause;
+				string value_names;
+				string replace_expr = "REPLACE(" + j_var;
+				for (idx_t i = 0; i < value_vars.size(); i++) {
+					string stub = Trim(value_vars[i]);
+					if (i > 0) {
+						on_clause += ", ";
+						value_names += ", ";
+					}
+					on_clause += "COLUMNS('" + stub + "_.*')";
+					value_names += stub;
+					replace_expr += ", '" + stub + "_', ''";
+				}
+				// Strip all prefixes from j var
+				replace_expr = "REGEXP_REPLACE(" + j_var + ", '^[^_]+_', '') AS " + j_var;
+				state.AddStep(
+				    "SELECT * REPLACE (" + replace_expr +
+				    ") FROM (UNPIVOT " + prev + " ON " + on_clause + " INTO NAME " +
+				    j_var + " VALUE " + value_names + ")");
+			}
+		} else {
+			// PIVOT: long → wide
+			// DuckDB PIVOT internally expands to multiple statements, so it can't live
+			// inside a CTE. We create a temp table from the current chain, PIVOT it,
+			// then restart the chain from the temp table.
+			if (i_vars.empty()) {
+				throw ParserException("'reshape wide' requires i(id_vars) option");
+			}
+			if (value_vars.size() != 1) {
+				throw ParserException("'reshape wide' currently supports one value variable");
+			}
+			string value_var = Trim(value_vars[0]);
+			auto i_var_list = StringUtil::Split(i_vars, ' ');
+			string i_cols;
+			for (idx_t i = 0; i < i_var_list.size(); i++) {
+				if (i > 0) {
+					i_cols += ", ";
+				}
+				i_cols += Trim(i_var_list[i]);
+			}
+			// PIVOT generates MULTI statements that can't live in CTEs.
+			// Strategy: create temp table via PIVOT, restart chain from it.
+			string subquery = "(" + state.BuildQuery("SELECT * FROM " + prev) + ")";
+			state.Clear();
+			// __PIVOT__ marker tells plan_function/parser_override to handle specially
+			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _stata_pivot AS (PIVOT " +
+			       subquery + " ON " + j_var + " USING FIRST(" + value_var +
+			       ") GROUP BY " + i_cols + ");" +
+			       "||STATE||_stata_pivot";
+		}
+		return "SELECT 'OK' AS status";
 	}
 
 	throw ParserException("Unimplemented Stata command: " + cmd.command);
@@ -834,6 +1013,10 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 	    (lower.size() == 9 || lower[9] == ' ' || lower[9] == ';')) {
 		is_ours = true;
 	}
+	// reshape wide needs parser_override because PIVOT generates MULTI statements
+	if (StringUtil::StartsWith(lower, "reshape") && lower.find("wide") != string::npos && state.HasData()) {
+		is_ours = true;
+	}
 
 	if (!is_ours) {
 		return ParserOverrideResult();
@@ -842,6 +1025,23 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 	try {
 		auto cmd = TokenizeCommand(query);
 		string sql = ProcessCommand(cmd, state);
+
+		// Handle __PIVOT__ marker: CREATE TEMP TABLE + restart chain
+		if (StringUtil::StartsWith(sql, "__PIVOT__:")) {
+			string rest = sql.substr(10);
+			// Split on ||STATE|| marker
+			idx_t state_pos = rest.find("||STATE||");
+			string pivot_sql = rest.substr(0, state_pos);
+			string table_name = rest.substr(state_pos + 9);
+
+			Parser parser;
+			parser.ParseQuery(pivot_sql);
+
+			// Restart chain from the temp table
+			state.AddStep("SELECT * FROM " + table_name);
+
+			return ParserOverrideResult(std::move(parser.statements));
+		}
 
 		Parser parser;
 		parser.ParseQuery(sql);
