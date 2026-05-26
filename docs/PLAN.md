@@ -312,6 +312,86 @@ When saving to a DuckLake-attached catalog (not a plain file), emit:
 
 ---
 
+## Phase 2: Real-World Compatibility
+
+Based on commands used in [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create). See `docs/MISSING_COMMANDS.md` for full inventory.
+
+### M11: Expression functions (`cond`, `inrange`, `inlist`, `substr`, `real`)
+- `cond(test, a, b)` → `CASE WHEN test THEN a ELSE b END`
+- `inrange(x, lo, hi)` → `x BETWEEN lo AND hi`
+- `inlist(x, a, b, c)` → `x IN (a, b, c)`
+- `substr(s, start, len)` → `SUBSTRING(s, start, len)` (Stata is 1-indexed, same as SQL)
+- `real(s)` → `CAST(s AS DOUBLE)`
+- `int(x)` → `CAST(x AS INTEGER)`
+- Add `firstnm` to collapse aggregate functions → `FIRST(x)`
+- **Test:** expressions from balance.do: `real(substr(frame_id, 3, .))`, `cond(missing(L.assets), ...)`
+
+### M12: `merge` (joins)
+- `merge 1:1 varlist using "file"` → inner/left join on varlist
+- `merge m:1 varlist using "file"` → left join
+- `merge 1:m varlist using "file"` → left join (other direction)
+- Options: `keep(match)` → INNER JOIN, `keep(master match)` → LEFT JOIN, `nogen` → exclude `_merge` column
+- The `using` file is loaded via `read_csv`/`read_parquet`/etc. (same as `use`)
+- SQL: `SELECT * FROM _prev JOIN read_csv('file') USING (varlist)`
+- `joinby varlist using "file"` → unrestricted cross join on matching keys
+- **Test:** merge m:1 from ceo-panel.do, merge 1:1 from unfiltered.do
+
+### M13: `duplicates drop`, `expand`, `export delimited`
+- `duplicates drop` → `SELECT DISTINCT * FROM _prev`
+- `duplicates drop varlist` → deduplicate on specific columns (keep first)
+- `expand N` → replicate each row N times (N can be a variable)
+  - SQL: `SELECT * FROM _prev, GENERATE_SERIES(1, N) AS t(idx)` then drop idx
+  - `expand N, generate(newvar)` → keep the index as a new 0/1 variable
+- `export delimited using "file", replace` → `COPY ... TO 'file' (FORMAT CSV, HEADER)`
+- `import delimited "file", clear` → same as `use "file.csv", clear`
+- **Test:** duplicates drop from edgelist.do, expand from ceo-panel.do
+
+### M14: Local macros and loops
+- `local name value` → store in `StataDoStateInfo.local_macros[name] = value`
+- `` `name' `` substitution → replace before command processing
+- `local name = expression` → evaluate expression (limited: numeric constants, `_N`)
+- `foreach var of local macroname { ... }` → unroll loop body for each value
+- `forvalues i = 1/N { ... }` → unroll loop body for each integer
+- Macro substitution in all commands: `` keep `dimensions' `` → `keep var1 var2 ...`
+- This is the most complex feature — requires a pre-processing pass before tokenization
+- **Test:** local macros from balance.do, foreach from balance.do
+
+### M15: `tempfile`, `preserve`/`restore`
+- `preserve` → push current CTE chain + labels onto a stack in state
+- `restore` → pop the stack, restoring previous chain + labels
+- `tempfile name` → register a named temporary storage slot
+- `save "\`name'", replace` → store current chain in the temp slot (as a CTE snapshot)
+- `use "\`name'", clear` → restore chain from the temp slot
+- State changes: add `vector<ChainSnapshot> preserve_stack` and `map<string, ChainSnapshot> tempfiles` to `StataDoStateInfo`
+- **Test:** preserve/restore from manager-facts.do, tempfile from edgelist.do
+
+### M16: `xtset` + lag/lead operators (`L.`, `F.`)
+- `xtset panelvar timevar` → store panel structure in state
+- `L.varname` → `LAG(varname) OVER (PARTITION BY panelvar ORDER BY timevar)`
+- `F.varname` → `LEAD(varname) OVER (PARTITION BY panelvar ORDER BY timevar)`
+- `L2.varname` → `LAG(varname, 2) OVER (...)`
+- These are used inside `generate`/`replace` expressions
+- Expression translator detects `L.`/`F.` prefix and generates window functions
+- **Test:** L.assets from balance.do, L.someone_exits from ceo-panel.do
+
+### M17: `bysort` prefix with sort order
+- `bysort var1 (var2): generate y = expr` → generate with window function partitioned by var1, ordered by var2
+- `bysort var1 (var2): generate y = sum(x)` → running sum: `SUM(x) OVER (PARTITION BY var1 ORDER BY var2 ROWS UNBOUNDED PRECEDING)`
+- `bysort var1 (var2): generate y = _n` → `ROW_NUMBER() OVER (PARTITION BY var1 ORDER BY var2)`
+- This is a prefix that modifies the next command, not a standalone command
+- Implementation: detect `bysort` prefix, parse the partition/order vars, pass as context to the next command
+- **Test:** bysort from ceo-panel.do, intervals.do
+
+### M18: Polish phase 2
+- `compress` → no-op (DuckDB doesn't need storage type optimization)
+- `display` → `SELECT 'message'` (informational output)
+- `assert` → `SELECT CASE WHEN NOT (expr) THEN error('Assertion failed') END`
+- `set seed N` → `SELECT setseed(N)`
+- Error messages: improve error reporting for unsupported commands
+- **Test:** comprehensive test with real .do file fragments from ceo-value
+
+---
+
 ## Key Design Decisions
 
 1. **CTE chain, not views**: Transformation commands accumulate as CTE steps in per-connection state. Nothing touches the catalog. DuckDB optimizes the full chain when materialized.
