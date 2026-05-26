@@ -1,0 +1,28 @@
+extension:
+  name: stata_do
+  description: Run Stata .do file commands directly in DuckDB
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  maintainers:
+    - korenmiklos
+
+repo:
+  github: codedthinking/duckdb-stata-do
+  ref: main
+
+docs:
+  hello_world: |
+    -- Load a CSV and filter it with Stata syntax
+    use "data/firms.csv", clear;
+    keep if year >= 2020;
+    generate profit = revenue - cost;
+    list;
+  extended_description: |
+    A DuckDB extension that interprets a subset of Stata .do file commands,
+    translating them to SQL via a lazy CTE chain. Supports data manipulation
+    (keep, drop, generate, replace, rename, sort, egen, collapse, reshape),
+    inspection (list, count, summarize, tabulate, describe), and I/O
+    (use, save, append). Run .do files directly with `do "script.do"`.
+    Inspired by Kezdi.jl.
