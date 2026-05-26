@@ -8,6 +8,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 
+#include <fstream>
 #include <regex>
 
 namespace duckdb {
@@ -27,7 +28,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",
                                               "generate",  "replace",   "rename",  "sort",    "order",
                                               "egen",      "collapse",  "count",   "describe", "summarize",
                                               "tabulate",  "head",      "tail",    "save",    "append",
-                                              "mvencode",  "reshape"};
+                                              "mvencode",  "reshape",  "do"};
 
 static bool IsStataCommand(const string &query, string &command_out) {
 	string trimmed = Trim(query);
@@ -267,6 +268,97 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 
 	if (cmd.command == "clear") {
 		state.Clear();
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "do") {
+		// do "script.do" — read and execute a .do file line by line
+		string filename = ExtractQuotedString(cmd.arguments);
+		std::ifstream file(filename);
+		if (!file.is_open()) {
+			throw ParserException("Cannot open file: %s", filename);
+		}
+
+		string line;
+		bool in_block_comment = false;
+		string continued_line;
+
+		while (std::getline(file, line)) {
+			string trimmed = Trim(line);
+
+			// Handle block comments /* ... */
+			if (in_block_comment) {
+				idx_t end_pos = trimmed.find("*/");
+				if (end_pos != string::npos) {
+					in_block_comment = false;
+					trimmed = Trim(trimmed.substr(end_pos + 2));
+				} else {
+					continue;
+				}
+			}
+
+			// Check for block comment start
+			idx_t block_start = trimmed.find("/*");
+			if (block_start != string::npos) {
+				idx_t block_end = trimmed.find("*/", block_start + 2);
+				if (block_end != string::npos) {
+					// Single-line block comment — remove it
+					trimmed = Trim(trimmed.substr(0, block_start) + trimmed.substr(block_end + 2));
+				} else {
+					trimmed = Trim(trimmed.substr(0, block_start));
+					in_block_comment = true;
+				}
+			}
+
+			// Strip // line comments (not inside quotes)
+			idx_t comment_pos = trimmed.find("//");
+			if (comment_pos != string::npos) {
+				// Check it's not /// (line continuation)
+				if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
+					// Line continuation: strip /// and join with next line
+					continued_line += Trim(trimmed.substr(0, comment_pos)) + " ";
+					continue;
+				}
+				trimmed = Trim(trimmed.substr(0, comment_pos));
+			}
+
+			// Strip * line-start comments (Stata convention)
+			if (!trimmed.empty() && trimmed[0] == '*') {
+				continue;
+			}
+
+			// Handle line continuation from previous line
+			if (!continued_line.empty()) {
+				trimmed = continued_line + trimmed;
+				continued_line.clear();
+			}
+
+			// Skip empty lines
+			if (trimmed.empty()) {
+				continue;
+			}
+
+			// Strip trailing semicolons (in case the .do file has them)
+			if (!trimmed.empty() && trimmed.back() == ';') {
+				trimmed.pop_back();
+				trimmed = Trim(trimmed);
+			}
+			if (trimmed.empty()) {
+				continue;
+			}
+
+			// Check if this is a Stata command we know
+			string sub_command;
+			if (!IsStataCommand(trimmed, sub_command)) {
+				// Not a Stata command — skip (could be a Stata command we don't support)
+				continue;
+			}
+
+			// Process the line as a Stata command
+			auto sub_cmd = TokenizeCommand(trimmed);
+			ProcessCommand(sub_cmd, state);
+		}
+
 		return "SELECT 'OK' AS status";
 	}
 

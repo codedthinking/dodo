@@ -197,6 +197,18 @@ These prepend the full `WITH _s0 AS (...), _s1 AS (...), ...` then append their 
 - Special variables `_n`, `_N` (as window functions)
 - **Test:** `egen` with `by()` produces per-group aggregates; `collapse` reduces rows
 
+### M5.5: `do "script.do"` — run .do files without semicolons
+DuckDB requires `;` to terminate statements, but Stata uses newlines. Register a `do "script.do"` command that reads a .do file and processes it line by line.
+
+**Design:**
+- `do` is a Stata command handled by the parser extension like any other
+- `ProcessCommand` reads the file, strips Stata comments (`//`, `*`, `/* */`), handles line continuations (`///`)
+- Calls `ProcessCommand` recursively for each non-empty line
+- Transformation commands update the CTE chain state silently
+- Terminal commands in the script are skipped (user inspects results interactively after `do` finishes, matching Stata behavior)
+- Returns `SELECT 'OK' AS status`
+- **Test:** Write a .do file with transformations, run `do "test.do";`, then `list;` to verify
+
 ### M6: `summarize`, `tabulate` (statistical output)
 - `summarize var` — compute N, mean, sd, min, p25, p50, p75, max
 - `summarize var if cond` — filtered summary

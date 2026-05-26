@@ -408,3 +408,27 @@ count
 
 statement ok
 clear
+
+# ============================================================
+# M5.5: do "script.do"
+# ============================================================
+
+# Run a .do file (no semicolons, with comments)
+statement ok
+do "test/data/clean.do"
+
+# Verify state: 2018 firms sorted by revenue with ln_rev
+query IIRIR
+list
+----
+5	Epsilon	500	2018	6.214608098422191
+2	Beta	2000	2018	7.600902459542082
+4	Delta	3000	2018	8.006367567650246
+
+query I
+count
+----
+3
+
+statement ok
+clear
