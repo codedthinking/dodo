@@ -273,5 +273,138 @@ tabulate year
 2017	2
 2018	3
 
+# ============================================================
+# M5: egen, collapse, _n, _N
+# ============================================================
+
+# egen with by()
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen mean_rev = mean(revenue), by(year)
+
+statement ok
+sort year id
+
+query IIRIR
+list
+----
+1	Acme	1000	2017	1250.0
+3	Gamma	1500	2017	1250.0
+2	Beta	2000	2018	1833.3333333333333
+4	Delta	3000	2018	1833.3333333333333
+5	Epsilon	500	2018	1833.3333333333333
+
+# egen without by() — global aggregate as window
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen max_rev = max(revenue)
+
+query I
+list max_rev
+----
+3000
+3000
+3000
+3000
+3000
+
+# egen with count
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen n_firms = count(id), by(year)
+
+statement ok
+sort year id
+
+query I
+list n_firms
+----
+2
+2
+3
+3
+3
+
+# collapse with (func) syntax
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+collapse (mean) avg_rev = revenue (sum) total_rev = revenue, by(year)
+
+statement ok
+sort year
+
+query IRR
+list
+----
+2017	1250.0	2500
+2018	1833.3333333333333	5500
+
+# collapse without by() — single row
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+collapse (mean) avg = revenue (count) n = id
+
+query RI
+list
+----
+1600.0	5
+
+# collapse with func(x) syntax
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+collapse avg = mean(revenue), by(year)
+
+statement ok
+sort year
+
+query IR
+list
+----
+2017	1250.0
+2018	1833.3333333333333
+
+# _n and _N special variables
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate row = _n
+
+statement ok
+generate total = _N
+
+query II
+list row total
+----
+1	5
+2	5
+3	5
+4	5
+5	5
+
+# _n with keep if (last row)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if _n == _N
+
+query I
+count
+----
+1
+
 statement ok
 clear

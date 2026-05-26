@@ -169,7 +169,72 @@ static string FileReadFunction(const string &filename) {
 	return filename;
 }
 
-static string TranslateExpression(const string &expr) {
+// Parse by(var1, var2) from options string. Returns comma-separated var list or empty.
+static string ParseByOption(const string &options) {
+	string lower = StringUtil::Lower(options);
+	// Find by(...)
+	idx_t pos = lower.find("by(");
+	if (pos == string::npos) {
+		return "";
+	}
+	idx_t start = pos + 3;
+	idx_t end = options.find(')', start);
+	if (end == string::npos) {
+		throw ParserException("Unmatched parenthesis in by() option");
+	}
+	string by_content = Trim(options.substr(start, end - start));
+	// by() content may be space-separated or comma-separated; normalize to comma-separated
+	if (by_content.find(',') == string::npos) {
+		auto vars = StringUtil::Split(by_content, ' ');
+		string result;
+		for (idx_t i = 0; i < vars.size(); i++) {
+			if (i > 0) {
+				result += ", ";
+			}
+			result += Trim(vars[i]);
+		}
+		return result;
+	}
+	return by_content;
+}
+
+// Map Stata aggregate function names to SQL equivalents
+static string TranslateAggFunction(const string &func_name) {
+	string lower = StringUtil::Lower(func_name);
+	if (lower == "mean") return "AVG";
+	if (lower == "sd") return "STDDEV";
+	if (lower == "count") return "COUNT";
+	if (lower == "sum") return "SUM";
+	if (lower == "min") return "MIN";
+	if (lower == "max") return "MAX";
+	if (lower == "median") return "MEDIAN";
+	if (lower == "first") return "FIRST";
+	if (lower == "last") return "LAST";
+	return func_name;  // pass through unknown functions
+}
+
+// Parse a function call like "mean(x)" into {func_name, arg}
+static bool ParseFunctionCall(const string &expr, string &func_name, string &arg) {
+	idx_t paren = expr.find('(');
+	if (paren == string::npos) {
+		return false;
+	}
+	idx_t end = expr.rfind(')');
+	if (end == string::npos || end <= paren) {
+		return false;
+	}
+	func_name = Trim(expr.substr(0, paren));
+	arg = Trim(expr.substr(paren + 1, end - paren - 1));
+	return true;
+}
+
+// Check if expression contains _n or _N (which expand to window functions)
+static bool ExpressionUsesRowVars(const string &expr) {
+	std::regex row_var_re("\\b_[nN]\\b");
+	return std::regex_search(expr, row_var_re);
+}
+
+static string TranslateExpression(const string &expr, const string &by_cols = "") {
 	string result = expr;
 	// log() -> LN()
 	std::regex log_re("\\blog\\s*\\(");
@@ -177,14 +242,13 @@ static string TranslateExpression(const string &expr) {
 	// missing(x) -> (x IS NULL)
 	std::regex missing_re("\\bmissing\\s*\\(([^)]+)\\)");
 	result = std::regex_replace(result, missing_re, "($1 IS NULL)");
-	// & -> AND (standalone, not && which is already valid)
-	// Simple approach: replace & with AND when surrounded by spaces or at word boundaries
-	// DuckDB actually handles & as bitwise AND, but Stata uses it as logical AND
-	// For now, leave & as-is since DuckDB handles it in boolean context
-	// | -> OR: same consideration
-	// ! -> NOT: leave as-is, DuckDB doesn't support ! as NOT in SQL
-	// Actually, let's do simple string replacements for the operators
-	// We'll handle this more carefully later
+	// _n -> ROW_NUMBER() OVER (...)
+	string partition = by_cols.empty() ? "" : "PARTITION BY " + by_cols + " ";
+	std::regex n_re("\\b_n\\b");
+	result = std::regex_replace(result, n_re, "ROW_NUMBER() OVER (" + partition + ")");
+	// _N -> COUNT(*) OVER (...)
+	std::regex N_re("\\b_N\\b");
+	result = std::regex_replace(result, N_re, "COUNT(*) OVER (" + partition + ")");
 	return result;
 }
 
@@ -215,7 +279,15 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 	// --- Transformation commands ---
 	if (cmd.command == "keep") {
 		if (cmd.arguments.empty() && !cmd.condition.empty()) {
-			state.AddStep("SELECT * FROM " + prev + " WHERE " + TranslateExpression(cmd.condition));
+			string cond = TranslateExpression(cmd.condition);
+			if (ExpressionUsesRowVars(cmd.condition)) {
+				// Window functions can't be in WHERE — add intermediate step
+				state.AddStep("SELECT *, (" + cond + ") AS _keep_cond FROM " + prev);
+				prev = state.LatestStep();
+				state.AddStep("SELECT * EXCLUDE (_keep_cond) FROM " + prev + " WHERE _keep_cond");
+			} else {
+				state.AddStep("SELECT * FROM " + prev + " WHERE " + cond);
+			}
 		} else if (!cmd.arguments.empty() && cmd.condition.empty()) {
 			// Space-separated var list -> comma-separated
 			auto vars = StringUtil::Split(cmd.arguments, ' ');
@@ -246,7 +318,14 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 
 	if (cmd.command == "drop") {
 		if (cmd.arguments.empty() && !cmd.condition.empty()) {
-			state.AddStep("SELECT * FROM " + prev + " WHERE NOT (" + TranslateExpression(cmd.condition) + ")");
+			string cond = TranslateExpression(cmd.condition);
+			if (ExpressionUsesRowVars(cmd.condition)) {
+				state.AddStep("SELECT *, (" + cond + ") AS _drop_cond FROM " + prev);
+				prev = state.LatestStep();
+				state.AddStep("SELECT * EXCLUDE (_drop_cond) FROM " + prev + " WHERE NOT _drop_cond");
+			} else {
+				state.AddStep("SELECT * FROM " + prev + " WHERE NOT (" + cond + ")");
+			}
 		} else if (!cmd.arguments.empty() && cmd.condition.empty()) {
 			auto vars = StringUtil::Split(cmd.arguments, ' ');
 			string exclude_list;
@@ -326,6 +405,134 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			order_clause += Trim(vars[i]) + " " + order;
 		}
 		state.AddStep("SELECT * FROM " + prev + " ORDER BY " + order_clause);
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "egen") {
+		// egen y = func(x) [if cond], by(g)
+		// Translates to window function: SELECT *, FUNC(x) OVER (PARTITION BY g) AS y FROM _prev
+		idx_t eq_pos = cmd.arguments.find('=');
+		if (eq_pos == string::npos) {
+			throw ParserException("'egen' requires an assignment: egen varname = function(arg)");
+		}
+		string var_name = Trim(cmd.arguments.substr(0, eq_pos));
+		string rhs = Trim(cmd.arguments.substr(eq_pos + 1));
+
+		string func_name, func_arg;
+		if (!ParseFunctionCall(rhs, func_name, func_arg)) {
+			throw ParserException("'egen' requires a function call on the right side: egen y = mean(x)");
+		}
+
+		string sql_func = TranslateAggFunction(func_name);
+		string by_cols = ParseByOption(cmd.options);
+		string partition = by_cols.empty() ? "" : "PARTITION BY " + by_cols;
+
+		string window_expr = sql_func + "(" + func_arg + ") OVER (" + partition + ")";
+
+		if (!cmd.condition.empty()) {
+			string sql_cond = TranslateExpression(cmd.condition, by_cols);
+			state.AddStep("SELECT *, CASE WHEN " + sql_cond + " THEN " + window_expr +
+			              " ELSE NULL END AS " + var_name + " FROM " + prev);
+		} else {
+			state.AddStep("SELECT *, " + window_expr + " AS " + var_name + " FROM " + prev);
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "collapse") {
+		// collapse (func) y = x [y2 = x2 ...] [if cond], by(g)
+		// Translates to: SELECT g, FUNC(x) AS y, ... FROM _prev [WHERE cond] GROUP BY g
+		string by_cols = ParseByOption(cmd.options);
+
+		// Parse assignments: each is either "y = func(x)" or "(func) y = x"
+		// Stata syntax: collapse (mean) wage = income (sum) hours = workhrs, by(group)
+		// Also supports: collapse mean_wage = mean(income), by(group)
+		string args = cmd.arguments;
+
+		// Build SELECT and GROUP BY
+		string select_exprs;
+		if (!by_cols.empty()) {
+			select_exprs = by_cols + ", ";
+		}
+
+		// Parse the collapse arguments
+		// Support two syntaxes:
+		// 1. collapse (func) y = x (func2) y2 = x2, by(g)
+		// 2. collapse y = func(x) y2 = func2(x2), by(g)
+		string current_func = "mean";  // default aggregate function
+		string remaining = Trim(args);
+		bool first_expr = true;
+
+		while (!remaining.empty()) {
+			// Check for (func) prefix
+			if (remaining[0] == '(') {
+				idx_t close = remaining.find(')');
+				if (close == string::npos) {
+					throw ParserException("Unmatched parenthesis in collapse");
+				}
+				current_func = Trim(remaining.substr(1, close - 1));
+				remaining = Trim(remaining.substr(close + 1));
+				continue;
+			}
+
+			// Find the next assignment: y = x or y = func(x)
+			idx_t eq_pos = remaining.find('=');
+			if (eq_pos == string::npos) {
+				break;
+			}
+			string var_name = Trim(remaining.substr(0, eq_pos));
+			remaining = Trim(remaining.substr(eq_pos + 1));
+
+			// Get the source expression (until next space-letter or end)
+			string source_expr;
+			string func_name_used, func_arg_used;
+
+			// Check if it's func(x) syntax
+			idx_t paren_pos = remaining.find('(');
+			idx_t space_pos = remaining.find(' ');
+			if (paren_pos != string::npos && (space_pos == string::npos || paren_pos < space_pos)) {
+				// func(x) syntax
+				idx_t close_paren = remaining.find(')', paren_pos);
+				if (close_paren == string::npos) {
+					throw ParserException("Unmatched parenthesis in collapse expression");
+				}
+				source_expr = Trim(remaining.substr(0, close_paren + 1));
+				remaining = Trim(remaining.substr(close_paren + 1));
+
+				ParseFunctionCall(source_expr, func_name_used, func_arg_used);
+				string sql_func = TranslateAggFunction(func_name_used);
+				if (!first_expr) {
+					select_exprs += ", ";
+				}
+				select_exprs += sql_func + "(" + func_arg_used + ") AS " + var_name;
+			} else {
+				// Simple variable name, use current_func
+				if (space_pos != string::npos) {
+					source_expr = Trim(remaining.substr(0, space_pos));
+					remaining = Trim(remaining.substr(space_pos + 1));
+				} else {
+					source_expr = Trim(remaining);
+					remaining = "";
+				}
+
+				string sql_func = TranslateAggFunction(current_func);
+				if (!first_expr) {
+					select_exprs += ", ";
+				}
+				select_exprs += sql_func + "(" + source_expr + ") AS " + var_name;
+			}
+			first_expr = false;
+		}
+
+		string sql = "SELECT " + select_exprs + " FROM " + prev;
+		if (!cmd.condition.empty()) {
+			sql += " WHERE " + TranslateExpression(cmd.condition, by_cols);
+		}
+		if (!by_cols.empty()) {
+			sql += " GROUP BY " + by_cols;
+		}
+
+		state.AddStep(sql);
 		return "SELECT 'OK' AS status";
 	}
 
