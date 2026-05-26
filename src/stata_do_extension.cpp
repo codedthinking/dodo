@@ -28,7 +28,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",
                                               "generate",  "replace",   "rename",  "sort",    "order",
                                               "egen",      "collapse",  "count",   "describe", "summarize",
                                               "tabulate",  "head",      "tail",    "save",    "append",
-                                              "mvencode",  "reshape",  "do"};
+                                              "mvencode",  "reshape",  "do",      "label"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -37,7 +37,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",      "clear",
 static bool IsTransformationCommand(const string &command) {
 	static const vector<string> TRANSFORMATION = {"use", "clear", "do", "keep", "drop", "generate", "replace",
 	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
-	                                              "reshape", "append"};
+	                                              "reshape", "append", "label"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -382,6 +382,96 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		}
 
 		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "label") {
+		// label variable varname "label text"
+		// label define labelname val1 "text1" val2 "text2" ...
+		// label values varname labelname
+		string lower_args = StringUtil::Lower(cmd.arguments);
+
+		if (StringUtil::StartsWith(lower_args, "variable ")) {
+			// label variable varname "label text"
+			string rest = Trim(cmd.arguments.substr(9));
+			// First token is the variable name
+			idx_t space = rest.find(' ');
+			if (space == string::npos) {
+				throw ParserException("'label variable' requires: label variable varname \"label text\"");
+			}
+			string varname = Trim(rest.substr(0, space));
+			string label_text = ExtractQuotedString(Trim(rest.substr(space + 1)));
+			state.variable_labels[varname] = label_text;
+			return "SELECT 'OK' AS status";
+		}
+
+		if (StringUtil::StartsWith(lower_args, "define ")) {
+			// label define labelname val1 "text1" val2 "text2" ...
+			string rest = Trim(cmd.arguments.substr(7));
+			// First token is the label name
+			idx_t space = rest.find(' ');
+			if (space == string::npos) {
+				throw ParserException("'label define' requires: label define labelname value \"text\" ...");
+			}
+			string label_name = Trim(rest.substr(0, space));
+			string remaining = Trim(rest.substr(space + 1));
+
+			unordered_map<int, string> mapping;
+			while (!remaining.empty()) {
+				// Parse: integer "text" pairs
+				idx_t sp = remaining.find(' ');
+				if (sp == string::npos) {
+					break;
+				}
+				string val_str = Trim(remaining.substr(0, sp));
+				remaining = Trim(remaining.substr(sp + 1));
+
+				// Parse the quoted text
+				string text;
+				if (!remaining.empty() && remaining[0] == '"') {
+					idx_t end_quote = remaining.find('"', 1);
+					if (end_quote == string::npos) {
+						throw ParserException("Unmatched quote in label define");
+					}
+					text = remaining.substr(1, end_quote - 1);
+					remaining = Trim(remaining.substr(end_quote + 1));
+				} else {
+					// Unquoted text — take until next space
+					idx_t sp2 = remaining.find(' ');
+					if (sp2 != string::npos) {
+						text = Trim(remaining.substr(0, sp2));
+						remaining = Trim(remaining.substr(sp2 + 1));
+					} else {
+						text = Trim(remaining);
+						remaining = "";
+					}
+				}
+
+				int val = std::stoi(val_str);
+				mapping[val] = text;
+			}
+
+			state.value_label_defs[label_name] = mapping;
+			return "SELECT 'OK' AS status";
+		}
+
+		if (StringUtil::StartsWith(lower_args, "values ")) {
+			// label values varname labelname
+			string rest = Trim(cmd.arguments.substr(7));
+			auto parts = StringUtil::Split(rest, ' ');
+			if (parts.size() != 2) {
+				throw ParserException("'label values' requires: label values varname labelname");
+			}
+			string varname = Trim(parts[0]);
+			string label_name = Trim(parts[1]);
+			// Verify the label definition exists
+			if (state.value_label_defs.find(label_name) == state.value_label_defs.end()) {
+				throw ParserException("Value label '%s' not defined. Use 'label define' first.", label_name);
+			}
+			state.column_labels[varname] = label_name;
+			return "SELECT 'OK' AS status";
+		}
+
+		throw ParserException("Unknown label subcommand. Use: label variable, label define, or label values");
 	}
 
 	if (!state.HasData()) {
@@ -741,7 +831,43 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 	}
 
 	if (cmd.command == "describe") {
-		return "SELECT column_name, column_type FROM (DESCRIBE " + state.BuildQuery("SELECT * FROM " + prev) + ")";
+		// Build a query that shows column metadata including labels
+		// Base: column_name, column_type from DESCRIBE
+		// Enhanced: add variable_label and value_label columns from state
+		string base_sql = "SELECT column_name, column_type FROM (DESCRIBE " +
+		                  state.BuildQuery("SELECT * FROM " + prev) + ")";
+
+		if (state.variable_labels.empty() && state.column_labels.empty()) {
+			return base_sql;
+		}
+
+		// Build a CASE expression for variable labels
+		string var_label_expr = "CASE column_name";
+		bool has_var_labels = false;
+		for (auto &[col, label] : state.variable_labels) {
+			string escaped = label;
+			// Escape single quotes
+			size_t pos = 0;
+			while ((pos = escaped.find('\'', pos)) != string::npos) {
+				escaped.replace(pos, 1, "''");
+				pos += 2;
+			}
+			var_label_expr += " WHEN '" + col + "' THEN '" + escaped + "'";
+			has_var_labels = true;
+		}
+		var_label_expr += " ELSE '' END AS variable_label";
+
+		// Build a CASE expression for value label names
+		string val_label_expr = "CASE column_name";
+		bool has_val_labels = false;
+		for (auto &[col, label_name] : state.column_labels) {
+			val_label_expr += " WHEN '" + col + "' THEN '" + label_name + "'";
+			has_val_labels = true;
+		}
+		val_label_expr += " ELSE '' END AS value_label";
+
+		return "SELECT column_name, column_type, " + var_label_expr + ", " + val_label_expr +
+		       " FROM (DESCRIBE " + state.BuildQuery("SELECT * FROM " + prev) + ")";
 	}
 
 	if (cmd.command == "summarize") {
@@ -985,67 +1111,124 @@ static ParserExtensionParseResult stata_do_parse(ParserExtensionInfo *info, cons
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 
+// Check if a single statement needs parser_override (SQL keyword conflict or PIVOT)
+static bool NeedsParserOverride(const string &stmt, StataDoStateInfo &state) {
+	string lower = StringUtil::Lower(stmt);
+	if (state.HasData() || (!state.cte_steps.empty())) {
+		if (StringUtil::StartsWith(lower, "describe") &&
+		    (lower.size() == 8 || lower[8] == ' ')) {
+			return true;
+		}
+		if (StringUtil::StartsWith(lower, "summarize") &&
+		    (lower.size() == 9 || lower[9] == ' ')) {
+			return true;
+		}
+		if (StringUtil::StartsWith(lower, "reshape") && lower.find("wide") != string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //===--------------------------------------------------------------------===//
 // parser_override: handles commands that conflict with SQL keywords
-// (describe, summarize) — called BEFORE the standard parser
+// (describe, summarize, reshape wide) — called BEFORE the standard parser.
+// Must handle full multi-statement strings by splitting on ';'.
 //===--------------------------------------------------------------------===//
 static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, const string &query,
                                                      ParserOptions &options) {
-	string trimmed = Trim(query);
-	if (!trimmed.empty() && trimmed.back() == ';') {
-		trimmed.pop_back();
-		trimmed = Trim(trimmed);
-	}
-	string lower = StringUtil::Lower(trimmed);
-
-	// Only intercept describe/summarize when we have data loaded
 	auto &state = dynamic_cast<StataDoStateInfo &>(*info);
-	if (!state.HasData()) {
-		return ParserOverrideResult();
-	}
 
-	bool is_ours = false;
-	if (StringUtil::StartsWith(lower, "describe") &&
-	    (lower.size() == 8 || lower[8] == ' ' || lower[8] == ';')) {
-		is_ours = true;
-	}
-	if (StringUtil::StartsWith(lower, "summarize") &&
-	    (lower.size() == 9 || lower[9] == ' ' || lower[9] == ';')) {
-		is_ours = true;
-	}
-	// reshape wide needs parser_override because PIVOT generates MULTI statements
-	if (StringUtil::StartsWith(lower, "reshape") && lower.find("wide") != string::npos && state.HasData()) {
-		is_ours = true;
-	}
+	// Split the full query into individual statements by ';'
+	auto statements_str = StringUtil::Split(query, ';');
 
-	if (!is_ours) {
-		return ParserOverrideResult();
-	}
+	// Check if ANY statement needs our override
+	// We must take over the ENTIRE query if any statement is describe/summarize/reshape wide,
+	// because the standard parser would handle those before our parse_function sees them.
+	// We also take over if earlier Stata commands will load data (making later describe valid).
+	bool has_stata_commands = false;
+	bool has_conflict_commands = false;
+	for (auto &s : statements_str) {
+		string trimmed = Trim(s);
+		if (trimmed.empty()) {
+			continue;
+		}
+		string lower = StringUtil::Lower(trimmed);
 
-	try {
-		auto cmd = TokenizeCommand(query);
-		string sql = ProcessCommand(cmd, state);
-
-		// Handle __PIVOT__ marker: CREATE TEMP TABLE + restart chain
-		if (StringUtil::StartsWith(sql, "__PIVOT__:")) {
-			string rest = sql.substr(10);
-			// Split on ||STATE|| marker
-			idx_t state_pos = rest.find("||STATE||");
-			string pivot_sql = rest.substr(0, state_pos);
-			string table_name = rest.substr(state_pos + 9);
-
-			Parser parser;
-			parser.ParseQuery(pivot_sql);
-
-			// Restart chain from the temp table
-			state.AddStep("SELECT * FROM " + table_name);
-
-			return ParserOverrideResult(std::move(parser.statements));
+		// Check for SQL-conflicting commands (describe, summarize, reshape wide)
+		if (StringUtil::StartsWith(lower, "describe") || StringUtil::StartsWith(lower, "summarize")) {
+			has_conflict_commands = true;
+		}
+		if (StringUtil::StartsWith(lower, "reshape") && lower.find("wide") != string::npos) {
+			has_conflict_commands = true;
 		}
 
-		Parser parser;
-		parser.ParseQuery(sql);
-		return ParserOverrideResult(std::move(parser.statements));
+		string cmd_name;
+		if (IsStataCommand(trimmed, cmd_name)) {
+			has_stata_commands = true;
+		}
+	}
+
+	// Take over if there's a SQL-conflicting command AND either Stata commands or existing state.
+	// When we take over, we process ALL statements ourselves (updating state for use/label/etc
+	// before generating SQL for describe/summarize).
+	bool any_needs_override = has_conflict_commands && (has_stata_commands || state.HasData());
+
+	if (!any_needs_override) {
+		return ParserOverrideResult();
+	}
+
+	// Process ALL statements ourselves
+	try {
+		vector<unique_ptr<SQLStatement>> all_statements;
+
+		for (auto &s : statements_str) {
+			string trimmed = Trim(s);
+			if (trimmed.empty()) {
+				continue;
+			}
+
+			// Check if this is a Stata command
+			string cmd_name;
+			if (IsStataCommand(trimmed, cmd_name)) {
+				auto cmd = TokenizeCommand(trimmed);
+				string sql = ProcessCommand(cmd, state);
+
+				// Handle __PIVOT__ marker
+				if (StringUtil::StartsWith(sql, "__PIVOT__:")) {
+					string rest = sql.substr(10);
+					idx_t state_pos = rest.find("||STATE||");
+					string pivot_sql = rest.substr(0, state_pos);
+					string table_name = rest.substr(state_pos + 9);
+
+					Parser parser;
+					parser.ParseQuery(pivot_sql);
+					state.AddStep("SELECT * FROM " + table_name);
+					for (auto &stmt : parser.statements) {
+						all_statements.push_back(std::move(stmt));
+					}
+					continue;
+				}
+
+				Parser parser;
+				parser.ParseQuery(sql);
+				for (auto &stmt : parser.statements) {
+					all_statements.push_back(std::move(stmt));
+				}
+			} else {
+				// Not a Stata command — parse as regular SQL
+				Parser parser;
+				parser.ParseQuery(trimmed);
+				for (auto &stmt : parser.statements) {
+					all_statements.push_back(std::move(stmt));
+				}
+			}
+		}
+
+		if (all_statements.empty()) {
+			return ParserOverrideResult();
+		}
+		return ParserOverrideResult(std::move(all_statements));
 	} catch (std::exception &ex) {
 		return ParserOverrideResult(ex);
 	}

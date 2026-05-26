@@ -4,6 +4,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -48,10 +49,20 @@ struct StataDoStateInfo : public ParserExtensionInfo {
 		return BuildCTEPrefix() + final_select;
 	}
 
+	//! Variable labels: column_name -> label text
+	unordered_map<string, string> variable_labels;
+	//! Value label definitions: label_name -> {value -> text}
+	unordered_map<string, unordered_map<int, string>> value_label_defs;
+	//! Column-to-value-label mapping: column_name -> label_name
+	unordered_map<string, string> column_labels;
+
 	void Clear() {
 		cte_steps.clear();
 		step_counter = 0;
 		current_source.clear();
+		variable_labels.clear();
+		value_label_defs.clear();
+		column_labels.clear();
 	}
 };
 

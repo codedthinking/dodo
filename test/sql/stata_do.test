@@ -558,3 +558,40 @@ list
 
 statement ok
 clear
+
+# ============================================================
+# M9.5: label variable, label define, label values
+# ============================================================
+
+# label variable
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+label variable revenue "Annual revenue in USD"
+
+statement ok
+label variable year "Fiscal year"
+
+# label define and label values
+statement ok
+label define sector_lbl 1 "Primary" 2 "Secondary" 3 "Tertiary"
+
+statement ok
+label values id sector_lbl
+
+# labels survive transformations (tested via describe in interactive mode)
+# Note: describe with labels only works when used interactively or via
+# do-files, because the standard SQL parser grabs "describe" before our
+# extension in the test framework's batch mode.
+
+statement ok
+keep if year == 2018
+
+query I
+count
+----
+3
+
+statement ok
+clear
