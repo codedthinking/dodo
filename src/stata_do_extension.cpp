@@ -1155,7 +1155,13 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 		}
 		string lower = StringUtil::Lower(trimmed);
 
-		// Check for SQL-conflicting commands (describe, summarize, reshape wide)
+		// Check for SQL-conflicting commands:
+		// use "file" — SQL USE schema conflicts
+		// describe, summarize — SQL DESCRIBE/SUMMARIZE conflicts
+		// reshape wide — PIVOT generates MULTI statements
+		if (StringUtil::StartsWith(lower, "use ") && (lower.find('"') != string::npos || lower.find('\'') != string::npos)) {
+			has_conflict_commands = true;
+		}
 		if (StringUtil::StartsWith(lower, "describe") || StringUtil::StartsWith(lower, "summarize")) {
 			has_conflict_commands = true;
 		}
