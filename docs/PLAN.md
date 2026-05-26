@@ -408,22 +408,116 @@ Correspondingly, `use mytable, clear` loads from an in-memory table when no file
 - `preserve; drop name; list; restore; list` — preserve/restore checkpoint
 - `clear` after `save mytable, table` — table is dropped
 
-### M16: `xtset` + lag/lead operators (`L.`, `F.`)
-- `xtset panelvar timevar` → store panel structure in state
-- `L.varname` → `LAG(varname) OVER (PARTITION BY panelvar ORDER BY timevar)`
-- `F.varname` → `LEAD(varname) OVER (PARTITION BY panelvar ORDER BY timevar)`
-- `L2.varname` → `LAG(varname, 2) OVER (...)`
-- These are used inside `generate`/`replace` expressions
-- Expression translator detects `L.`/`F.` prefix and generates window functions
-- **Test:** L.assets from balance.do, L.someone_exits from ceo-panel.do
+### M16: `xtset`/`tsset` + lag/lead operators (`L.`, `F.`, `D.`)
 
-### M17: `bysort` prefix with sort order
-- `bysort var1 (var2): generate y = expr` → generate with window function partitioned by var1, ordered by var2
-- `bysort var1 (var2): generate y = sum(x)` → running sum: `SUM(x) OVER (PARTITION BY var1 ORDER BY var2 ROWS UNBOUNDED PRECEDING)`
-- `bysort var1 (var2): generate y = _n` → `ROW_NUMBER() OVER (PARTITION BY var1 ORDER BY var2)`
-- This is a prefix that modifies the next command, not a standalone command
-- Implementation: detect `bysort` prefix, parse the partition/order vars, pass as context to the next command
-- **Test:** bysort from ceo-panel.do, intervals.do
+Based on research of real-world usage in [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create) and Stata documentation.
+
+**Commands:**
+- `xtset panelvar timevar` → store panel structure in state
+- `tsset timevar` → store time-series structure (no panel var)
+- `tsset panelvar timevar` → same as `xtset` (Stata treats them identically)
+- State: `string panel_var`, `string time_var` in `StataDoStateInfo`
+
+**Time-series operators in expressions:**
+
+| Operator | Meaning | SQL (gap-aware) |
+|---|---|---|
+| `L.x` | Lag (x at t-1) | See below |
+| `L2.x` | 2nd lag (x at t-2) | See below |
+| `F.x` | Lead (x at t+1) | See below |
+| `F2.x` | 2nd lead (x at t+2) | See below |
+| `D.x` | First difference (x - L.x) | Expand to `(x - L.x)` then translate |
+
+**Gap-aware lag/lead (critical):**
+
+Stata respects gaps in the time variable. If `year` goes 2015, 2017 (no 2016), then `L.x` at year 2017 is missing — NOT the 2015 value. Naive `LAG() OVER()` ignores gaps.
+
+Gap-aware SQL translation for `L.x`:
+```sql
+CASE WHEN (year - LAG(year, 1) OVER (PARTITION BY id ORDER BY year)) = 1
+     THEN LAG(x, 1) OVER (PARTITION BY id ORDER BY year)
+     ELSE NULL END
+```
+
+For `L2.x` (2nd lag):
+```sql
+CASE WHEN (year - LAG(year, 2) OVER (PARTITION BY id ORDER BY year)) = 2
+     THEN LAG(x, 2) OVER (PARTITION BY id ORDER BY year)
+     ELSE NULL END
+```
+
+For `F.x` (lead):
+```sql
+CASE WHEN (LEAD(year, 1) OVER (PARTITION BY id ORDER BY year) - year) = 1
+     THEN LEAD(x, 1) OVER (PARTITION BY id ORDER BY year)
+     ELSE NULL END
+```
+
+**Implementation:**
+
+The expression translator (`TranslateExpression`) detects `L.`, `L2.`, `F.`, `F2.`, `D.` prefixes via regex and expands them to gap-aware window function expressions. Requires `panel_var` and `time_var` to be set (throws error if not).
+
+Regex pattern: `\bL(\d*)\.(\w+)` captures the lag count and variable name. Similarly for `F` and `D`.
+
+`D.x` is syntactic sugar: expanded to `(x - L.x)` before translation.
+
+**Real-world usage patterns (from ceo-value):**
+- `generate capital = cond(missing(L.assets), assets - EBITDA, L.assets)` — fallback when lag missing
+- `generate someone_exited = L.someone_exits == 1` — lagged indicator
+- `drop if missing(L.ceo_spell) & missing(F.ceo_spell)` — filter on lag+lead
+- `bysort fake_id (year): replace TFP = rho * TFP[_n-1] + dTFP` — explicit subscript lag (M17)
+
+**`var[_n-1]` subscript syntax:**
+- `x[_n-1]` is equivalent to `L.x` but does NOT respect gaps (raw positional lag)
+- SQL: `LAG(x, 1) OVER (PARTITION BY panel_var ORDER BY time_var)` (no gap check)
+- Used in `bysort` context where the sort order guarantees no gaps
+
+**Test:**
+- `xtset id year; generate lag_rev = L.revenue` — basic lag
+- `generate lead_rev = F.revenue` — basic lead
+- `generate diff_rev = D.revenue` — first difference
+- `generate lag2_rev = L2.revenue` — 2nd lag
+- Gap test: data with year gaps, verify L. produces NULL at gaps
+- `drop if missing(L.x) & missing(F.x)` — filter on lag/lead
+
+### M17: `bysort` prefix and `var[_n-1]` subscript
+
+**`bysort` prefix:**
+
+`bysort` is not a standalone command — it's a prefix that modifies the next command. The syntax `bysort group_vars (sort_vars): command` sets a partition-by and order-by context.
+
+| Stata | SQL window |
+|---|---|
+| `bysort id (year): gen y = _n` | `ROW_NUMBER() OVER (PARTITION BY id ORDER BY year)` |
+| `bysort id (year): gen y = _N` | `COUNT(*) OVER (PARTITION BY id)` |
+| `bysort id (year): gen y = sum(x)` | `SUM(x) OVER (PARTITION BY id ORDER BY year ROWS UNBOUNDED PRECEDING)` |
+| `bysort id (year): gen y = x[_n-1]` | `LAG(x, 1) OVER (PARTITION BY id ORDER BY year)` |
+
+Implementation:
+- Detect `bysort` at start of command line
+- Parse `group_vars (sort_vars):` — group_vars are PARTITION BY, sort_vars (in parens) are ORDER BY
+- Strip the prefix, pass partition/order context to the command handler
+- `_n`, `_N`, `sum()`, and `[_n-1]` all use this context for their window functions
+
+**`var[_n-1]` subscript syntax:**
+- `x[_n-1]` → `LAG(x, 1) OVER (...)` — positional lag, does NOT respect time gaps
+- `x[_n+1]` → `LEAD(x, 1) OVER (...)` — positional lead
+- `x[1]` → first value of x (within group if bysort)
+- Used in `bysort` context where sort order is explicit
+
+Regex: `(\w+)\[_n\s*([+-]\s*\d+)\]` captures variable and offset.
+
+**Real-world usage (from ceo-value):**
+- `bysort frame_id_numeric (year): generate byte ceo_spell = sum(someone_enters | someone_exited)` — running sum
+- `bysort fake_id (year): replace TFP = rho * TFP[_n-1] + dTFP if _n > 1` — AR(1) process
+- `bysort frame_id_numeric person_id spell: generate year = start_year + _n - 1` — sequential year within spell
+- `bysort frame_id_numeric (year): generate byte spell_id = sum(new_spell)` — cumulative indicator
+
+**Test:**
+- `bysort year: generate row = _n` — row number within year
+- `bysort year: generate n = _N` — count within year
+- `bysort id (year): generate cum_rev = sum(revenue)` — running sum
+- `bysort id (year): generate prev_rev = revenue[_n-1]` — positional lag
 
 ### M18: Polish phase 2
 - `compress` → no-op (DuckDB doesn't need storage type optimization)
