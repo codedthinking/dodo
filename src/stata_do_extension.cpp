@@ -30,7 +30,7 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",       "clear"
                                               "tabulate",  "head",       "tail",    "save",    "append",
                                               "mvencode",  "reshape",    "do",      "label",   "codebook",
                                               "duplicates", "expand",    "export",  "import",
-                                              "merge"};
+                                              "merge",     "tempfile",  "preserve", "restore"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -40,7 +40,7 @@ static bool IsTransformationCommand(const string &command) {
 	static const vector<string> TRANSFORMATION = {"use", "clear", "do", "keep", "drop", "generate", "replace",
 	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
 	                                              "reshape", "append", "label", "duplicates", "expand", "import",
-	                                              "merge"};
+	                                              "merge", "tempfile", "preserve", "restore"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -518,7 +518,51 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 	}
 
 	if (cmd.command == "clear") {
-		state.Clear();
+		// Generate cleanup SQL for tracked tables, then clear state
+		string cleanup = state.BuildCleanupSQL();
+		state.ClearAll();
+		if (!cleanup.empty()) {
+			// Return cleanup SQL + OK. Multiple statements separated by ;
+			// will be handled by the parser
+			return cleanup + "SELECT 'OK' AS status";
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "tempfile") {
+		// tempfile name — register a tempfile identifier and ensure schema exists
+		auto names = StringUtil::Split(cmd.arguments, ' ');
+		for (auto &n : names) {
+			string name = Trim(n);
+			if (!name.empty()) {
+				state.tempfile_names.insert(name);
+			}
+		}
+		if (!state.tempfiles_schema_created) {
+			state.tempfiles_schema_created = true;
+			return "CREATE SCHEMA IF NOT EXISTS _tempfiles";
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "preserve") {
+		if (state.preserve_checkpoint >= 0) {
+			throw ParserException("'preserve' called while already preserved. Use 'restore' first.");
+		}
+		state.preserve_checkpoint = static_cast<int>(state.cte_steps.size());
+		state.preserve_step_counter = state.step_counter;
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "restore") {
+		if (state.preserve_checkpoint < 0) {
+			throw ParserException("'restore' called without a prior 'preserve'.");
+		}
+		// Truncate CTE chain back to the checkpoint
+		state.cte_steps.resize(state.preserve_checkpoint);
+		state.step_counter = state.preserve_step_counter;
+		state.preserve_checkpoint = -1;
+		state.preserve_step_counter = -1;
 		return "SELECT 'OK' AS status";
 	}
 
@@ -1488,16 +1532,40 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 	}
 
 	if (cmd.command == "save") {
-		string filename = ExtractQuotedString(cmd.arguments);
-		// Detect format from extension
-		string lower_fn = StringUtil::Lower(filename);
+		string target = ExtractQuotedString(cmd.arguments);
+		string lower_opts = StringUtil::Lower(cmd.options);
+		bool save_as_table = (lower_opts.find("table") != string::npos ||
+		                      lower_opts.find("memory") != string::npos);
+
+		// Check if target is a registered tempfile
+		bool is_tempfile = (state.tempfile_names.find(target) != state.tempfile_names.end());
+
+		if (save_as_table || is_tempfile) {
+			// Save as in-memory table
+			string table_name;
+			string full_query = state.BuildQuery("SELECT * FROM " + prev);
+
+			if (is_tempfile) {
+				// Tempfile → _tempfiles schema (schema created by tempfile command)
+				table_name = "_tempfiles." + target;
+				state.tempfile_tables.push_back(table_name);
+				return "CREATE OR REPLACE TABLE " + table_name + " AS (" + full_query + ")";
+			} else {
+				// Explicit table save — not garbage collected
+				table_name = target;
+				return "CREATE OR REPLACE TABLE " + table_name + " AS (" + full_query + ")";
+			}
+		}
+
+		// Save to disk file
+		string lower_fn = StringUtil::Lower(target);
 		string format_clause;
 		if (StringUtil::EndsWith(lower_fn, ".csv")) {
 			format_clause = " (FORMAT CSV, HEADER)";
 		} else if (StringUtil::EndsWith(lower_fn, ".parquet")) {
 			format_clause = " (FORMAT PARQUET)";
 		}
-		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + filename + "'" + format_clause;
+		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
 	}
 
 	if (cmd.command == "append") {

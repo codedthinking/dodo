@@ -5,6 +5,7 @@
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -56,6 +57,17 @@ struct StataDoStateInfo : public ParserExtensionInfo {
 	//! Column-to-value-label mapping: column_name -> label_name
 	unordered_map<string, string> column_labels;
 
+	//! Tempfile names (registered via tempfile command)
+	unordered_set<string> tempfile_names;
+	//! Whether _tempfiles schema has been created
+	bool tempfiles_schema_created = false;
+	//! Tempfile tables created (for garbage collection on clear)
+	vector<string> tempfile_tables;
+
+	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
+	int preserve_checkpoint = -1;
+	int preserve_step_counter = -1;
+
 	void Clear() {
 		cte_steps.clear();
 		step_counter = 0;
@@ -63,6 +75,27 @@ struct StataDoStateInfo : public ParserExtensionInfo {
 		variable_labels.clear();
 		value_label_defs.clear();
 		column_labels.clear();
+		tempfile_names.clear();
+		preserve_checkpoint = -1;
+		preserve_step_counter = -1;
+	}
+
+	//! Get SQL to drop tempfile tables and schema (called on clear)
+	string BuildCleanupSQL() const {
+		string sql;
+		for (auto &tbl : tempfile_tables) {
+			sql += "DROP TABLE IF EXISTS " + tbl + "; ";
+		}
+		if (tempfiles_schema_created) {
+			sql += "DROP SCHEMA IF EXISTS _tempfiles CASCADE; ";
+		}
+		return sql;
+	}
+
+	void ClearAll() {
+		Clear();
+		tempfile_tables.clear();
+		tempfiles_schema_created = false;
 	}
 };
 

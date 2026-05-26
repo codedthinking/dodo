@@ -940,3 +940,74 @@ list
 
 statement ok
 clear
+
+# ============================================================
+# M15: save table, tempfile, preserve/restore
+# ============================================================
+
+# save as in-memory table
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+save firms_mem, replace table
+
+# use from in-memory table
+statement ok
+use firms_mem, clear
+
+query I
+count
+----
+5
+
+# preserve/restore
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+preserve
+
+statement ok
+keep if year == 2018
+
+query I
+count
+----
+3
+
+statement ok
+restore
+
+query I
+count
+----
+5
+
+# tempfile
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+tempfile subset
+
+statement ok
+save subset, replace
+
+# load full data and merge with tempfile
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+merge m:1 id using "_tempfiles.subset", keep(match) nogen
+
+query I
+count
+----
+3
+
+statement ok
+clear
