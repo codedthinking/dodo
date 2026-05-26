@@ -29,7 +29,8 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",       "clear"
                                               "egen",      "collapse",   "count",   "describe", "summarize",
                                               "tabulate",  "head",       "tail",    "save",    "append",
                                               "mvencode",  "reshape",    "do",      "label",   "codebook",
-                                              "duplicates", "expand",    "export",  "import"};
+                                              "duplicates", "expand",    "export",  "import",
+                                              "merge"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -38,7 +39,8 @@ static const vector<string> STATA_COMMANDS = {"use",       "list",       "clear"
 static bool IsTransformationCommand(const string &command) {
 	static const vector<string> TRANSFORMATION = {"use", "clear", "do", "keep", "drop", "generate", "replace",
 	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
-	                                              "reshape", "append", "label", "duplicates", "expand", "import"};
+	                                              "reshape", "append", "label", "duplicates", "expand", "import",
+	                                              "merge"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -1088,6 +1090,188 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		// Put listed columns first, then all others with COLUMNS(*)
 		// DuckDB supports: SELECT col1, col2, * EXCLUDE (col1, col2) FROM t
 		state.AddStep("SELECT " + col_list + ", * EXCLUDE (" + col_list + ") FROM " + prev);
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "merge") {
+		// merge 1:1 varlist using "file" [, keep(match) keepusing(varlist) nogenerate]
+		// merge m:1 varlist using "file" [, ...]
+		// merge 1:m varlist using "file" [, ...]
+		string args = cmd.arguments;
+		string lower_args = StringUtil::Lower(args);
+
+		// Parse merge type: 1:1, m:1, 1:m
+		string merge_type;
+		if (StringUtil::StartsWith(lower_args, "1:1 ")) {
+			merge_type = "1:1";
+			args = Trim(args.substr(4));
+		} else if (StringUtil::StartsWith(lower_args, "m:1 ")) {
+			merge_type = "m:1";
+			args = Trim(args.substr(4));
+		} else if (StringUtil::StartsWith(lower_args, "1:m ")) {
+			merge_type = "1:m";
+			args = Trim(args.substr(4));
+		} else if (StringUtil::StartsWith(lower_args, "m:m ")) {
+			merge_type = "m:m";
+			args = Trim(args.substr(4));
+		} else {
+			throw ParserException("'merge' requires a type: merge 1:1, m:1, 1:m, or m:m");
+		}
+
+		// Find "using" keyword to split key vars from filename
+		string lower_rest = StringUtil::Lower(args);
+		idx_t using_pos = lower_rest.find(" using ");
+		if (using_pos == string::npos) {
+			throw ParserException("'merge' requires 'using': merge %s varlist using filename", merge_type);
+		}
+		string key_vars_str = Trim(args.substr(0, using_pos));
+		string filename_str = Trim(args.substr(using_pos + 7));
+		string filename = ExtractQuotedString(filename_str);
+		string using_read = FileReadFunction(filename);
+
+		// Parse key variables (space-separated -> comma-separated)
+		auto key_vars = StringUtil::Split(key_vars_str, ' ');
+		string key_cols;
+		for (idx_t i = 0; i < key_vars.size(); i++) {
+			if (i > 0) {
+				key_cols += ", ";
+			}
+			key_cols += Trim(key_vars[i]);
+		}
+
+		// Parse options: keep(), keepusing(), nogenerate
+		string keep_filter;   // empty = keep all
+		string keepusing_cols; // empty = keep all using vars
+		bool nogen = false;
+
+		if (!cmd.options.empty()) {
+			string opts = cmd.options;
+			string lower_opts = StringUtil::Lower(opts);
+
+			// Parse keep()
+			idx_t keep_pos = lower_opts.find("keep(");
+			if (keep_pos != string::npos) {
+				idx_t start = keep_pos + 5;
+				idx_t end = opts.find(')', start);
+				if (end != string::npos) {
+					string keep_str = StringUtil::Lower(Trim(opts.substr(start, end - start)));
+					// Parse keep values: match/master/using or 1/2/3
+					bool keep_master = false, keep_using = false, keep_match = false;
+					if (keep_str.find("master") != string::npos || keep_str.find("1") != string::npos) {
+						keep_master = true;
+					}
+					if (keep_str.find("using") != string::npos || keep_str.find("2") != string::npos) {
+						keep_using = true;
+					}
+					if (keep_str.find("match") != string::npos || keep_str.find("3") != string::npos) {
+						keep_match = true;
+					}
+					// Build filter expression
+					vector<string> conditions;
+					if (keep_master) {
+						conditions.push_back("_merge = 1");
+					}
+					if (keep_using) {
+						conditions.push_back("_merge = 2");
+					}
+					if (keep_match) {
+						conditions.push_back("_merge = 3");
+					}
+					if (!conditions.empty()) {
+						keep_filter = "(";
+						for (idx_t i = 0; i < conditions.size(); i++) {
+							if (i > 0) {
+								keep_filter += " OR ";
+							}
+							keep_filter += conditions[i];
+						}
+						keep_filter += ")";
+					}
+				}
+			}
+
+			// Parse keepusing()
+			idx_t ku_pos = lower_opts.find("keepusing(");
+			if (ku_pos != string::npos) {
+				idx_t start = ku_pos + 10;
+				idx_t end = opts.find(')', start);
+				if (end != string::npos) {
+					string ku_str = Trim(opts.substr(start, end - start));
+					auto ku_vars = StringUtil::Split(ku_str, ' ');
+					for (idx_t i = 0; i < ku_vars.size(); i++) {
+						if (i > 0) {
+							keepusing_cols += ", ";
+						}
+						keepusing_cols += Trim(ku_vars[i]);
+					}
+				}
+			}
+
+			// Parse nogenerate / nogen
+			if (lower_opts.find("nogen") != string::npos) {
+				nogen = true;
+			}
+		}
+
+		// Build the JOIN SQL
+		// Strategy: FULL OUTER JOIN, compute _merge, then filter with keep()
+		// For the using dataset, alias as _using to avoid column name conflicts
+		string using_select;
+		if (keepusing_cols.empty()) {
+			using_select = "SELECT * FROM " + using_read;
+		} else {
+			using_select = "SELECT " + key_cols + ", " + keepusing_cols + " FROM " + using_read;
+		}
+
+		// Build USING clause for the JOIN (key columns)
+		string using_clause;
+		for (idx_t i = 0; i < key_vars.size(); i++) {
+			if (i > 0) {
+				using_clause += ", ";
+			}
+			using_clause += Trim(key_vars[i]);
+		}
+
+		// Determine JOIN type based on keep() option for optimization
+		string join_type;
+		if (keep_filter.find("_merge = 1") == string::npos &&
+		    keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
+			// keep(match) only → INNER JOIN
+			join_type = "INNER JOIN";
+		} else if (keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
+			// keep(master) or keep(master match) → LEFT JOIN
+			join_type = "LEFT JOIN";
+		} else {
+			// Default: keep all → FULL OUTER JOIN
+			join_type = "FULL OUTER JOIN";
+		}
+
+		// Build the _merge column
+		// We need a way to detect which side each row came from
+		// Add a tag column to each side before joining
+		string master_sql = "SELECT *, 1 AS _m_tag FROM " + prev;
+		string using_sql = "SELECT *, 1 AS _u_tag FROM (" + using_select + ")";
+
+		string merge_expr = "CASE WHEN _m_tag IS NOT NULL AND _u_tag IS NOT NULL THEN 3 "
+		                    "WHEN _m_tag IS NOT NULL THEN 1 "
+		                    "ELSE 2 END AS _merge";
+
+		// Build the full join
+		string join_sql = "SELECT * EXCLUDE (_m_tag, _u_tag), " + merge_expr +
+		                  " FROM (" + master_sql + ") AS _master " + join_type +
+		                  " (" + using_sql + ") AS _using USING (" + using_clause + ")";
+
+		// Apply keep() filter
+		if (!keep_filter.empty()) {
+			join_sql = "SELECT * FROM (" + join_sql + ") WHERE " + keep_filter;
+		}
+
+		// Remove _merge if nogenerate
+		if (nogen) {
+			join_sql = "SELECT * EXCLUDE (_merge) FROM (" + join_sql + ")";
+		}
+
+		state.AddStep(join_sql);
 		return "SELECT 'OK' AS status";
 	}
 

@@ -843,3 +843,100 @@ count
 
 statement ok
 clear
+
+# ============================================================
+# M12: merge
+# ============================================================
+
+# merge m:1 with keep(match) nogen
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+merge m:1 year using "test/data/yeargdp.csv", keep(match) nogen
+
+statement ok
+sort id
+
+query IIRII
+list
+----
+1	Acme	1000	2017	500
+2	Beta	2000	2018	550
+3	Gamma	1500	2017	500
+4	Delta	3000	2018	550
+5	Epsilon	500	2018	550
+
+# merge with _merge variable (full outer join, includes using-only)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+merge m:1 year using "test/data/yeargdp.csv"
+
+# 2019 row from using has no match in master
+query I
+count if _merge == 2
+----
+1
+
+query I
+count if _merge == 3
+----
+5
+
+# merge with keep(master match) — drops using-only
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+merge m:1 year using "test/data/yeargdp.csv", keep(master match) nogen
+
+query I
+count
+----
+5
+
+# merge with keepusing() — only bring in specific variables
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+merge m:1 year using "test/data/yeargdp.csv", keep(match) keepusing(gdp) nogen
+
+statement ok
+sort id
+
+query IIRII
+list
+----
+1	Acme	1000	2017	500
+2	Beta	2000	2018	550
+3	Gamma	1500	2017	500
+4	Delta	3000	2018	550
+5	Epsilon	500	2018	550
+
+# merge 1:1
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep id revenue
+
+statement ok
+merge 1:1 id using "test/data/firms.csv", keep(match) keepusing(name year) nogen
+
+statement ok
+sort id
+
+query IIRI
+list
+----
+1	1000	Acme	2017
+2	2000	Beta	2018
+3	1500	Gamma	2017
+4	3000	Delta	2018
+5	500	Epsilon	2018
+
+statement ok
+clear
