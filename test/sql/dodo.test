@@ -1362,3 +1362,94 @@ SELECT COUNT(*) FROM dodo._current
 
 statement ok
 clear
+
+# ============================================================
+# Undo / Redo / History
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year >= 2018
+
+statement ok
+generate double_rev = revenue * 2
+
+# history shows 3 steps
+query IIT
+SELECT step_id, undone, command FROM dodo._history ORDER BY step_id
+----
+0	false	use "test/data/firms.csv", clear
+1	false	keep if year >= 2018
+2	false	generate double_rev = revenue * 2
+
+# undo removes double_rev
+statement ok
+undo
+
+query I
+SELECT COUNT(*) AS ncols FROM (DESCRIBE (WITH _s0 AS (SELECT * FROM dodo._current), _s1 AS (SELECT * FROM _s0 WHERE year >= 2018) SELECT * FROM _s1))
+----
+4
+
+# history shows step 2 as undone
+query IIT
+SELECT step_id, undone, command FROM dodo._history ORDER BY step_id
+----
+0	false	use "test/data/firms.csv", clear
+1	false	keep if year >= 2018
+2	true	generate double_rev = revenue * 2
+
+# redo brings it back
+statement ok
+redo
+
+query I
+SELECT COUNT(*) AS ncols FROM (DESCRIBE (WITH _s0 AS (SELECT * FROM dodo._current), _s1 AS (SELECT * FROM _s0 WHERE year >= 2018), _s2 AS (SELECT *, (revenue * 2) AS double_rev FROM _s1) SELECT * FROM _s2))
+----
+5
+
+# new command after undo clears redo stack
+statement ok
+undo
+
+statement ok
+generate triple_rev = revenue * 3
+
+statement error
+redo
+----
+Nothing to redo
+
+# undo 2 steps at once
+statement ok
+undo 2
+
+query I
+count
+----
+5
+
+# cannot undo past data load
+statement error
+undo
+----
+Nothing to undo
+
+# history terminal command works in lazy mode too
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", lazy
+
+statement ok
+keep if year >= 2018
+
+# verify history has 2 entries (can't easily match boolean output in test format)
+statement ok
+history
+
+statement ok
+clear

@@ -14,8 +14,13 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 struct DodoStateInfo : public ParserExtensionInfo {
 	vector<string> cte_steps;
+	vector<string> cte_commands;  //! Original command text for each step
 	int step_counter = 0;
 	string current_source;
+	string pending_command;  //! Set before ProcessCommand, consumed by AddStep
+
+	//! Redo stack: (command_text, cte_sql) pairs popped by undo
+	vector<pair<string, string>> redo_stack;
 
 	string LatestStep() const {
 		return cte_steps.empty() ? "" : "_s" + to_string(step_counter - 1);
@@ -28,7 +33,10 @@ struct DodoStateInfo : public ParserExtensionInfo {
 	void AddStep(const string &inner_sql) {
 		string step_name = "_s" + to_string(step_counter);
 		cte_steps.push_back(step_name + " AS (" + inner_sql + ")");
+		cte_commands.push_back(pending_command);
 		step_counter++;
+		// New step invalidates redo history
+		redo_stack.clear();
 	}
 
 	string BuildCTEPrefix() const {
@@ -80,8 +88,11 @@ struct DodoStateInfo : public ParserExtensionInfo {
 
 	void Clear() {
 		cte_steps.clear();
+		cte_commands.clear();
+		redo_stack.clear();
 		step_counter = 0;
 		current_source.clear();
+		pending_command.clear();
 		variable_labels.clear();
 		value_label_defs.clear();
 		column_labels.clear();
@@ -101,6 +112,7 @@ struct DodoStateInfo : public ParserExtensionInfo {
 			sql += "DROP SCHEMA IF EXISTS _tempfiles CASCADE; ";
 		}
 		if (materialized) {
+			sql += "DROP TABLE IF EXISTS dodo._history; ";
 			sql += "DROP TABLE IF EXISTS dodo._current; ";
 			sql += "DROP SCHEMA IF EXISTS dodo; ";
 		}

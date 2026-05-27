@@ -41,7 +41,8 @@ static const vector<string> DODO_COMMANDS = {"use",       "list",       "clear",
                                               "mvencode",  "reshape",    "do",      "label",   "codebook",
                                               "duplicates", "expand",    "export",  "import",
                                               "merge",     "tempfile",  "preserve", "restore",
-                                              "xtset",     "tsset",    "bysort",  "by"};
+                                              "xtset",     "tsset",    "bysort",  "by",
+                                              "undo",      "redo",     "history"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -52,7 +53,8 @@ static bool IsTransformationCommand(const string &command) {
 	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
 	                                              "reshape", "append", "label", "duplicates", "expand", "import",
 	                                              "merge", "tempfile", "preserve", "restore",
-	                                              "xtset", "tsset", "bysort", "by"};
+	                                              "xtset", "tsset", "bysort", "by",
+	                                              "undo", "redo"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -64,6 +66,51 @@ static bool IsTransformationCommand(const string &command) {
 // Side-effect commands that produce SQL beyond state updates — must be executed in do-files
 static bool IsSideEffectCommand(const string &command) {
 	return command == "export" || command == "save";
+}
+
+// Build SQL to recreate dodo._history table from in-memory state
+static string BuildHistorySQL(const DodoStateInfo &state) {
+	if (!state.materialized) {
+		return "";
+	}
+	string sql = "CREATE OR REPLACE TABLE dodo._history AS SELECT * FROM (VALUES ";
+	bool first = true;
+	// Active steps
+	for (idx_t i = 0; i < state.cte_commands.size(); i++) {
+		if (!first) {
+			sql += ", ";
+		}
+		string escaped_cmd = state.cte_commands[i];
+		// Escape single quotes
+		size_t pos = 0;
+		while ((pos = escaped_cmd.find('\'', pos)) != string::npos) {
+			escaped_cmd.replace(pos, 1, "''");
+			pos += 2;
+		}
+		sql += "(" + to_string(i) + ", '" + escaped_cmd + "', false)";
+		first = false;
+	}
+	// Undone steps (redo stack, in reverse order so most recently undone has highest step_id)
+	for (idx_t i = 0; i < state.redo_stack.size(); i++) {
+		if (!first) {
+			sql += ", ";
+		}
+		string escaped_cmd = state.redo_stack[state.redo_stack.size() - 1 - i].first;
+		size_t pos = 0;
+		while ((pos = escaped_cmd.find('\'', pos)) != string::npos) {
+			escaped_cmd.replace(pos, 1, "''");
+			pos += 2;
+		}
+		int step_id = static_cast<int>(state.cte_commands.size()) + static_cast<int>(i);
+		sql += "(" + to_string(step_id) + ", '" + escaped_cmd + "', true)";
+		first = false;
+	}
+	if (first) {
+		// No steps at all — create empty table
+		return "CREATE OR REPLACE TABLE dodo._history (step_id INTEGER, command VARCHAR, undone BOOLEAN)";
+	}
+	sql += ") AS t(step_id, command, undone)";
+	return sql;
 }
 
 // Build SQL to create/replace the live view for UI integration
@@ -745,7 +792,9 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 		if (state.materialized) {
 			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
 		}
+		string saved_cmd = state.pending_command;
 		state.Clear();
+		state.pending_command = saved_cmd;
 		string source = ExtractQuotedString(cmd.arguments);
 		string read_expr = FileReadFunction(source);
 		string lower_opts = StringUtil::Lower(cmd.options);
@@ -814,10 +863,67 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 		}
 		// Truncate CTE chain back to the checkpoint
 		state.cte_steps.resize(state.preserve_checkpoint);
+		state.cte_commands.resize(state.preserve_checkpoint);
 		state.step_counter = state.preserve_step_counter;
 		state.preserve_checkpoint = -1;
 		state.preserve_step_counter = -1;
+		state.redo_stack.clear();
 		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "undo") {
+		if (state.cte_steps.size() <= 1) {
+			throw ParserException("Nothing to undo.");
+		}
+		int n = 1;
+		if (!cmd.arguments.empty()) {
+			n = std::stoi(Trim(cmd.arguments));
+		}
+		int max_undo = static_cast<int>(state.cte_steps.size()) - 1;
+		if (n > max_undo) {
+			n = max_undo;
+		}
+		for (int i = 0; i < n; i++) {
+			string cte = state.cte_steps.back();
+			string command_text = state.cte_commands.back();
+			state.redo_stack.push_back({command_text, cte});
+			state.cte_steps.pop_back();
+			state.cte_commands.pop_back();
+			state.step_counter--;
+		}
+		string result = BuildHistorySQL(state);
+		if (!result.empty()) {
+			result += "; ";
+		}
+		result += "SELECT 'OK' AS status";
+		return result;
+	}
+
+	if (cmd.command == "redo") {
+		if (state.redo_stack.empty()) {
+			throw ParserException("Nothing to redo.");
+		}
+		int n = 1;
+		if (!cmd.arguments.empty()) {
+			n = std::stoi(Trim(cmd.arguments));
+		}
+		int max_redo = static_cast<int>(state.redo_stack.size());
+		if (n > max_redo) {
+			n = max_redo;
+		}
+		for (int i = 0; i < n; i++) {
+			auto &entry = state.redo_stack.back();
+			state.cte_commands.push_back(entry.first);
+			state.cte_steps.push_back(entry.second);
+			state.step_counter++;
+			state.redo_stack.pop_back();
+		}
+		string result = BuildHistorySQL(state);
+		if (!result.empty()) {
+			result += "; ";
+		}
+		result += "SELECT 'OK' AS status";
+		return result;
 	}
 
 	if (cmd.command == "xtset" || cmd.command == "tsset") {
@@ -930,6 +1036,7 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 			}
 
 			auto sub_cmd = TokenizeCommand(trimmed);
+			state.pending_command = trimmed;
 			string sql = ProcessCommand(sub_cmd, state);
 
 			// In do-file context, use/import cannot materialize (table creation
@@ -1124,7 +1231,9 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 		if (state.materialized) {
 			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
 		}
+		string saved_cmd = state.pending_command;
 		state.Clear();
+		state.pending_command = saved_cmd;
 
 		string result_sql;
 		if (!lazy) {
@@ -1138,6 +1247,48 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 		state.current_source = filename;
 		result_sql += "SELECT 'OK' AS status";
 		return pre_cleanup + result_sql;
+	}
+
+	if (cmd.command == "history") {
+		// Terminal: show command history
+		if (state.materialized) {
+			return "SELECT * FROM dodo._history ORDER BY step_id";
+		}
+		// In-memory fallback: build VALUES table
+		string sql = "SELECT * FROM (VALUES ";
+		bool first = true;
+		for (idx_t i = 0; i < state.cte_commands.size(); i++) {
+			if (!first) {
+				sql += ", ";
+			}
+			string escaped = state.cte_commands[i];
+			size_t pos = 0;
+			while ((pos = escaped.find('\'', pos)) != string::npos) {
+				escaped.replace(pos, 1, "''");
+				pos += 2;
+			}
+			sql += "(" + to_string(i) + ", '" + escaped + "', false)";
+			first = false;
+		}
+		for (idx_t i = 0; i < state.redo_stack.size(); i++) {
+			if (!first) {
+				sql += ", ";
+			}
+			string escaped = state.redo_stack[state.redo_stack.size() - 1 - i].first;
+			size_t pos = 0;
+			while ((pos = escaped.find('\'', pos)) != string::npos) {
+				escaped.replace(pos, 1, "''");
+				pos += 2;
+			}
+			int step_id = static_cast<int>(state.cte_commands.size()) + static_cast<int>(i);
+			sql += "(" + to_string(step_id) + ", '" + escaped + "', true)";
+			first = false;
+		}
+		if (first) {
+			return "SELECT 'No commands in history' AS message";
+		}
+		sql += ") AS t(step_id, command, undone) ORDER BY step_id";
+		return sql;
 	}
 
 	if (!state.HasData()) {
@@ -2147,7 +2298,7 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 	// before generating SQL for describe/summarize).
 	// Also take over when live_view is enabled and we have known commands (need multi-statement injection).
 	bool any_needs_override = has_conflict_commands && (has_dodo_commands || state.HasData());
-	if (!any_needs_override && state.live_view_enabled && has_dodo_commands) {
+	if (!any_needs_override && (state.live_view_enabled || state.materialized) && has_dodo_commands) {
 		any_needs_override = true;
 	}
 
@@ -2169,6 +2320,7 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 			string cmd_name;
 			if (IsDodoCommand(trimmed, cmd_name)) {
 				auto cmd = TokenizeCommand(trimmed);
+				state.pending_command = trimmed;
 				string sql = ProcessCommand(cmd, state);
 
 				// Handle __PIVOT__ marker
@@ -2202,6 +2354,16 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 						all_statements.push_back(std::move(stmt));
 					}
 				}
+
+				// History table: inject rebuild for UI visibility
+				string history_sql = BuildHistorySQL(state);
+				if (!history_sql.empty()) {
+					Parser hist_parser;
+					hist_parser.ParseQuery(history_sql);
+					for (auto &stmt : hist_parser.statements) {
+						all_statements.push_back(std::move(stmt));
+					}
+				}
 			} else {
 				// Not a known command — parse as regular SQL
 				Parser parser;
@@ -2231,6 +2393,7 @@ static ParserExtensionPlanResult dodo_plan(ParserExtensionInfo *info, ClientCont
 
 	// Generate the SQL from the command
 	auto cmd = TokenizeCommand(dodo_data.raw_query);
+	state.pending_command = dodo_data.raw_query;
 	string sql = ProcessCommand(cmd, state);
 
 	// Parse the generated SQL with DuckDB's parser
