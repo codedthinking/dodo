@@ -119,3 +119,125 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
           generate_release_notes: true
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifacts
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          base="https://github.com/codedthinking/dodo/releases/download/${tag}"
+          for platform in macos-arm64 macos-x86_64 linux-x86_64 linux-arm64; do
+            curl -fsSL -o "dodoc-${platform}.tar.gz" "${base}/dodoc-${platform}.tar.gz"
+          done
+
+      - name: Compute sha256 hashes
+        id: sha
+        run: |
+          echo "macos_arm64=$(sha256sum dodoc-macos-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(sha256sum dodoc-macos-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(sha256sum dodoc-linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum dodoc-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: codedthinking/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+
+      - name: Update formula
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          version="${tag#dodoc-v}"
+          cat > Formula/dodoc.rb << 'FORMULA'
+          class Dodoc < Formula
+            desc "Compile .do files to SQL — standalone dodo compiler"
+            homepage "https://getdodo.dev"
+            license "MIT"
+            version "VERSION_PLACEHOLDER"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_BASE/dodoc-macos-arm64.tar.gz"
+                sha256 "SHA_MACOS_ARM64"
+              else
+                url "URL_BASE/dodoc-macos-x86_64.tar.gz"
+                sha256 "SHA_MACOS_X86_64"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "URL_BASE/dodoc-linux-arm64.tar.gz"
+                sha256 "SHA_LINUX_ARM64"
+              else
+                url "URL_BASE/dodoc-linux-x86_64.tar.gz"
+                sha256 "SHA_LINUX_X86_64"
+              end
+            end
+
+            def install
+              bin.install "dodoc"
+            end
+
+            test do
+              assert_match "dodoc", shell_output("#{bin}/dodoc --version")
+            end
+          end
+          FORMULA
+          url_base="https://github.com/codedthinking/dodo/releases/download/${tag}"
+          sed -i "s|VERSION_PLACEHOLDER|${version}|g" Formula/dodoc.rb
+          sed -i "s|URL_BASE|${url_base}|g" Formula/dodoc.rb
+          sed -i "s|SHA_MACOS_ARM64|${{ steps.sha.outputs.macos_arm64 }}|g" Formula/dodoc.rb
+          sed -i "s|SHA_MACOS_X86_64|${{ steps.sha.outputs.macos_x86_64 }}|g" Formula/dodoc.rb
+          sed -i "s|SHA_LINUX_X86_64|${{ steps.sha.outputs.linux_x86_64 }}|g" Formula/dodoc.rb
+          sed -i "s|SHA_LINUX_ARM64|${{ steps.sha.outputs.linux_arm64 }}|g" Formula/dodoc.rb
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' Formula/dodoc.rb
+
+      - name: Push to tap
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          version="${tag#dodoc-v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/dodoc.rb
+          git commit -m "Update dodoc to ${version}"
+          git push
+
+  update-website:
+    name: Update website version
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout website branch
+        uses: actions/checkout@v4
+        with:
+          ref: website
+
+      - name: Get version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#dodoc-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update version in description.yml
+        run: |
+          sed -i "s/version: .*/version: ${{ steps.version.outputs.version }}/" docs/description.yml
+
+      - name: Push to website
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/description.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Bump version to ${{ steps.version.outputs.version }}"
+          git push origin website
