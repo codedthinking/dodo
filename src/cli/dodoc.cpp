@@ -22,8 +22,8 @@ static void print_usage(const char *prog) {
 }
 
 struct CliOptions {
-	std::string input_file;   // empty = stdin
-	std::string output_file;  // empty = stdout
+	std::string input_file;  // empty = stdin
+	std::string output_file; // empty = stdout
 	bool annotate = false;
 	bool terminal = false;
 };
@@ -57,8 +57,7 @@ static CliOptions parse_args(int argc, char *argv[]) {
 }
 
 // Process lines from an input stream (file or stdin)
-static void process_stream(std::istream &input, dodo::DodoState &state,
-                           std::vector<std::string> &side_effect_sql,
+static void process_stream(std::istream &input, dodo::DodoState &state, std::vector<std::string> &side_effect_sql,
                            const CliOptions &opts) {
 	std::string line;
 	bool in_block_comment = false;

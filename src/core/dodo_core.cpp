@@ -5,12 +5,12 @@
 
 namespace dodo {
 
+using std::pair;
 using std::string;
-using std::vector;
+using std::to_string;
 using std::unordered_map;
 using std::unordered_set;
-using std::pair;
-using std::to_string;
+using std::vector;
 
 // Helper: Trim that returns a new string
 static string Trim(const string &s) {
@@ -24,33 +24,25 @@ static string QuoteIdent(const string &s) {
 	return str::QuoteIdent(s);
 }
 
-
-
 //===--------------------------------------------------------------------===//
 // Command Tokenizer
 //===--------------------------------------------------------------------===//
 
-const vector<string> DODO_COMMANDS = {"use",       "list",       "clear",   "keep",    "drop",
-                                              "generate",  "replace",    "rename",  "sort",    "order",
-                                              "egen",      "collapse",   "count",   "describe", "summarize",
-                                              "tabulate",  "head",       "tail",    "save",    "append",
-                                              "mvencode",  "reshape",    "do",      "label",   "codebook",
-                                              "duplicates", "expand",    "export",  "import",
-                                              "merge",     "tempfile",  "preserve", "restore",
-                                              "xtset",     "tsset",    "bysort",  "by",
-                                              "undo",      "redo",     "history"};
+const vector<string> DODO_COMMANDS = {
+    "use",      "list",     "clear",   "keep",     "drop",      "generate",   "replace", "rename", "sort",   "order",
+    "egen",     "collapse", "count",   "describe", "summarize", "tabulate",   "head",    "tail",   "save",   "append",
+    "mvencode", "reshape",  "do",      "label",    "codebook",  "duplicates", "expand",  "export", "import", "merge",
+    "tempfile", "preserve", "restore", "xtset",    "tsset",     "bysort",     "by",      "undo",   "redo",   "history"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
 // Terminal: materializes the chain, returns the data frame
 // Side-effect: returns a derived result (count, stats, freq table, file write)
 bool IsTransformationCommand(const string &command) {
-	static const vector<string> TRANSFORMATION = {"use", "clear", "do", "keep", "drop", "generate", "replace",
-	                                              "rename", "sort", "order", "egen", "collapse", "mvencode",
-	                                              "reshape", "append", "label", "duplicates", "expand", "import",
-	                                              "merge", "tempfile", "preserve", "restore",
-	                                              "xtset", "tsset", "bysort", "by",
-	                                              "undo", "redo"};
+	static const vector<string> TRANSFORMATION = {
+	    "use",      "clear",    "do",       "keep",    "drop",   "generate", "replace",    "rename", "sort",   "order",
+	    "egen",     "collapse", "mvencode", "reshape", "append", "label",    "duplicates", "expand", "import", "merge",
+	    "tempfile", "preserve", "restore",  "xtset",   "tsset",  "bysort",   "by",         "undo",   "redo"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -63,8 +55,6 @@ bool IsTransformationCommand(const string &command) {
 bool IsSideEffectCommand(const string &command) {
 	return command == "export" || command == "save";
 }
-
-
 
 bool IsDodoCommand(const string &query, string &command_out) {
 	string trimmed = Trim(query);
@@ -83,8 +73,6 @@ bool IsDodoCommand(const string &query, string &command_out) {
 	}
 	return false;
 }
-
-
 
 DodoCommand TokenizeCommand(const string &query) {
 	DodoCommand result;
@@ -179,8 +167,7 @@ DodoCommand TokenizeCommand(const string &query) {
 string ExtractQuotedString(const string &s) {
 	string trimmed = Trim(s);
 	if (trimmed.size() >= 2) {
-		if ((trimmed.front() == '"' && trimmed.back() == '"') ||
-		    (trimmed.front() == '\'' && trimmed.back() == '\'')) {
+		if ((trimmed.front() == '"' && trimmed.back() == '"') || (trimmed.front() == '\'' && trimmed.back() == '\'')) {
 			return trimmed.substr(1, trimmed.size() - 2);
 		}
 	}
@@ -243,16 +230,25 @@ string ParseByOption(const string &options) {
 // Map aggregate function names to SQL equivalents
 string TranslateAggFunction(const string &func_name) {
 	string lower = str::Lower(func_name);
-	if (lower == "mean") return "AVG";
-	if (lower == "sd") return "STDDEV";
-	if (lower == "count") return "COUNT";
-	if (lower == "sum") return "SUM";
-	if (lower == "min") return "MIN";
-	if (lower == "max") return "MAX";
-	if (lower == "median") return "MEDIAN";
-	if (lower == "first" || lower == "firstnm") return "FIRST";
-	if (lower == "last" || lower == "lastnm") return "LAST";
-	return func_name;  // pass through unknown functions
+	if (lower == "mean")
+		return "AVG";
+	if (lower == "sd")
+		return "STDDEV";
+	if (lower == "count")
+		return "COUNT";
+	if (lower == "sum")
+		return "SUM";
+	if (lower == "min")
+		return "MIN";
+	if (lower == "max")
+		return "MAX";
+	if (lower == "median")
+		return "MEDIAN";
+	if (lower == "first" || lower == "firstnm")
+		return "FIRST";
+	if (lower == "last" || lower == "lastnm")
+		return "LAST";
+	return func_name; // pass through unknown functions
 }
 
 // Parse a function call like "mean(x)" into {func_name, arg}
@@ -381,9 +377,8 @@ idx_t FindFunctionArgs(const string &s, idx_t open_paren, string &args_out) {
 	return i;
 }
 
-string TranslateExpression(const string &expr, const string &by_cols,
-                                  const string &panel_var, const string &time_var,
-                                  const string &bysort_order) {
+string TranslateExpression(const string &expr, const string &by_cols, const string &panel_var, const string &time_var,
+                           const string &bysort_order) {
 	string result = expr;
 
 	// missing(x) -> (x IS NULL) — must be done BEFORE L./F./D. so that
@@ -420,9 +415,8 @@ string TranslateExpression(const string &expr, const string &by_cols,
 			int n = n_str.empty() ? 1 : std::stoi(n_str);
 			string var = l_match[2].str();
 			// Gap-aware: check that time difference equals n
-			string lag_expr = "CASE WHEN (" + time_var + " - LAG(" + time_var + ", " +
-			                  to_string(n) + ") " + over + ") = " + to_string(n) +
-			                  " THEN LAG(" + var + ", " + to_string(n) + ") " + over +
+			string lag_expr = "CASE WHEN (" + time_var + " - LAG(" + time_var + ", " + to_string(n) + ") " + over +
+			                  ") = " + to_string(n) + " THEN LAG(" + var + ", " + to_string(n) + ") " + over +
 			                  " ELSE NULL END";
 			l_result = l_match.prefix().str() + lag_expr + l_match.suffix().str();
 		}
@@ -437,9 +431,8 @@ string TranslateExpression(const string &expr, const string &by_cols,
 			int n = n_str.empty() ? 1 : std::stoi(n_str);
 			string var = f_match[2].str();
 			// Gap-aware: check that time difference equals n
-			string lead_expr = "CASE WHEN (LEAD(" + time_var + ", " + to_string(n) + ") " +
-			                   over + " - " + time_var + ") = " + to_string(n) +
-			                   " THEN LEAD(" + var + ", " + to_string(n) + ") " + over +
+			string lead_expr = "CASE WHEN (LEAD(" + time_var + ", " + to_string(n) + ") " + over + " - " + time_var +
+			                   ") = " + to_string(n) + " THEN LEAD(" + var + ", " + to_string(n) + ") " + over +
 			                   " ELSE NULL END";
 			f_result = f_match.prefix().str() + lead_expr + f_match.suffix().str();
 		}
@@ -615,8 +608,7 @@ string TranslateExpression(const string &expr, const string &by_cols,
 		// Detect aggregate functions that should become running windows
 		// sum() in generate context = running sum (cumulative)
 		static const vector<pair<string, string>> running_aggs = {
-		    {"sum", "SUM"}, {"mean", "AVG"}, {"count", "COUNT"}, {"min", "MIN"}, {"max", "MAX"}
-		};
+		    {"sum", "SUM"}, {"mean", "AVG"}, {"count", "COUNT"}, {"min", "MIN"}, {"max", "MAX"}};
 		for (auto &[stata_fn, sql_fn] : running_aggs) {
 			string search = stata_fn + "(";
 			idx_t pos = 0;
@@ -633,7 +625,8 @@ string TranslateExpression(const string &expr, const string &by_cols,
 					pos++;
 					continue;
 				}
-				string replacement = sql_fn + "(" + args + ") OVER (" + partition + order_clause + "ROWS UNBOUNDED PRECEDING)";
+				string replacement =
+				    sql_fn + "(" + args + ") OVER (" + partition + order_clause + "ROWS UNBOUNDED PRECEDING)";
 				result = result.substr(0, pos) + replacement + result.substr(end);
 				pos += replacement.size();
 			}
@@ -1140,8 +1133,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				}
 				col_list += QuoteIdent(Trim(vars[i]));
 			}
-			state.AddStep("SELECT " + col_list + " FROM " + prev + " WHERE " +
-			              TrExpr(cmd.condition));
+			state.AddStep("SELECT " + col_list + " FROM " + prev + " WHERE " + TrExpr(cmd.condition));
 		} else {
 			throw DodoException("Invalid 'keep' syntax");
 		}
@@ -1196,8 +1188,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 		if (!cmd.condition.empty()) {
 			string sql_cond = TrExpr(cmd.condition);
-			state.AddStep("SELECT *, CASE WHEN " + sql_cond + " THEN " + sql_expr + " ELSE NULL END AS " +
-			              var_name + " FROM " + prev);
+			state.AddStep("SELECT *, CASE WHEN " + sql_cond + " THEN " + sql_expr + " ELSE NULL END AS " + var_name +
+			              " FROM " + prev);
 		} else {
 			state.AddStep("SELECT *, (" + sql_expr + ") AS " + var_name + " FROM " + prev);
 		}
@@ -1263,8 +1255,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 		if (!cmd.condition.empty()) {
 			string sql_cond = TrExpr(cmd.condition, by_cols);
-			state.AddStep("SELECT *, CASE WHEN " + sql_cond + " THEN " + window_expr +
-			              " ELSE NULL END AS " + var_name + " FROM " + prev);
+			state.AddStep("SELECT *, CASE WHEN " + sql_cond + " THEN " + window_expr + " ELSE NULL END AS " + var_name +
+			              " FROM " + prev);
 		} else {
 			state.AddStep("SELECT *, " + window_expr + " AS " + var_name + " FROM " + prev);
 		}
@@ -1291,7 +1283,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		// Support two syntaxes:
 		// 1. collapse (func) y = x (func2) y2 = x2, by(g)
 		// 2. collapse y = func(x) y2 = func2(x2), by(g)
-		string current_func = "mean";  // default aggregate function
+		string current_func = "mean"; // default aggregate function
 		string remaining = Trim(args);
 		bool first_expr = true;
 
@@ -1312,8 +1304,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			// Check if there's a ( before the = — if so, the = might be inside func(x)
 			idx_t first_paren = remaining.find('(');
 			// Also check: no = at all, or = comes after a ( — means it's a bare variable name
-			bool has_assignment = (eq_pos != string::npos &&
-			                      (first_paren == string::npos || eq_pos < first_paren));
+			bool has_assignment = (eq_pos != string::npos && (first_paren == string::npos || eq_pos < first_paren));
 
 			if (!has_assignment) {
 				// No assignment: "collapse (mean) var1 var2" — apply current_func to each var
@@ -1464,7 +1455,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 
 		// Parse options: keep(), keepusing(), nogenerate
-		string keep_filter;   // empty = keep all
+		string keep_filter;    // empty = keep all
 		string keepusing_cols; // empty = keep all using vars
 		bool nogen = false;
 
@@ -1558,8 +1549,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 		// Determine JOIN type based on keep() option for optimization
 		string join_type;
-		if (keep_filter.find("_merge = 1") == string::npos &&
-		    keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
+		if (keep_filter.find("_merge = 1") == string::npos && keep_filter.find("_merge = 2") == string::npos &&
+		    !keep_filter.empty()) {
 			// keep(match) only -> INNER JOIN
 			join_type = "INNER JOIN";
 		} else if (keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
@@ -1581,9 +1572,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		                    "ELSE 2 END AS _merge";
 
 		// Build the full join
-		string join_sql = "SELECT * EXCLUDE (_m_tag, _u_tag), " + merge_expr +
-		                  " FROM (" + master_sql + ") AS _master " + join_type +
-		                  " (" + using_sql + ") AS _using USING (" + using_clause + ")";
+		string join_sql = "SELECT * EXCLUDE (_m_tag, _u_tag), " + merge_expr + " FROM (" + master_sql +
+		                  ") AS _master " + join_type + " (" + using_sql + ") AS _using USING (" + using_clause + ")";
 
 		// Apply keep() filter
 		if (!keep_filter.empty()) {
@@ -1621,8 +1611,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			}
 			// Use ROW_NUMBER to keep first row per group
 			state.AddStep("SELECT * EXCLUDE (_dedup_rn) FROM ("
-			              "SELECT *, ROW_NUMBER() OVER (PARTITION BY " + col_list + ") AS _dedup_rn FROM " + prev +
-			              ") WHERE _dedup_rn = 1");
+			              "SELECT *, ROW_NUMBER() OVER (PARTITION BY " +
+			              col_list + ") AS _dedup_rn FROM " + prev + ") WHERE _dedup_rn = 1");
 		}
 		return "SELECT 'OK' AS status";
 	}
@@ -1652,13 +1642,13 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		// If N is a variable, each row can have a different expansion count
 		if (gen_var.empty()) {
 			state.AddStep("SELECT * EXCLUDE (_expand_idx) FROM ("
-			              "SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
-			              " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
+			              "SELECT t.*, g.generate_series AS _expand_idx FROM " +
+			              prev + " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
 		} else {
 			// generate(newvar) — newvar is 0 for original row, 1 for copies
 			state.AddStep("SELECT * EXCLUDE (_expand_idx), "
-			              "CASE WHEN _expand_idx = 1 THEN 0 ELSE 1 END AS " + QuoteIdent(gen_var) +
-			              " FROM (SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
+			              "CASE WHEN _expand_idx = 1 THEN 0 ELSE 1 END AS " +
+			              QuoteIdent(gen_var) + " FROM (SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
 			              " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
 		}
 		return "SELECT 'OK' AS status";
@@ -1716,10 +1706,9 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 	if (cmd.command == "tail") {
 		string n = cmd.arguments.empty() ? "5" : Trim(cmd.arguments);
-		return state.BuildQuery(
-		    "SELECT * EXCLUDE (_rn, _total) FROM ("
-		    "SELECT *, ROW_NUMBER() OVER () AS _rn, COUNT(*) OVER () AS _total FROM " +
-		    prev + ") sub WHERE _rn > _total - " + n);
+		return state.BuildQuery("SELECT * EXCLUDE (_rn, _total) FROM ("
+		                        "SELECT *, ROW_NUMBER() OVER () AS _rn, COUNT(*) OVER () AS _total FROM " +
+		                        prev + ") sub WHERE _rn > _total - " + n);
 	}
 
 	if (cmd.command == "describe" || cmd.command == "codebook") {
@@ -1727,8 +1716,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		// Build a query that shows column metadata including labels
 		// Base: column_name, column_type from DESCRIBE
 		// Enhanced: add variable_label and value_label columns from state
-		string base_sql = "SELECT column_name, column_type FROM (DESCRIBE " +
-		                  state.BuildQuery("SELECT * FROM " + prev) + ")";
+		string base_sql =
+		    "SELECT column_name, column_type FROM (DESCRIBE " + state.BuildQuery("SELECT * FROM " + prev) + ")";
 
 		if (state.variable_labels.empty() && state.column_labels.empty()) {
 			return base_sql;
@@ -1764,9 +1753,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			val_label_expr = "''";
 		}
 
-		return "SELECT column_name, column_type, " + var_label_expr + " AS variable_label, " +
-		       val_label_expr + " AS value_label FROM (DESCRIBE " +
-		       state.BuildQuery("SELECT * FROM " + prev) + ")";
+		return "SELECT column_name, column_type, " + var_label_expr + " AS variable_label, " + val_label_expr +
+		       " AS value_label FROM (DESCRIBE " + state.BuildQuery("SELECT * FROM " + prev) + ")";
 	}
 
 	if (cmd.command == "summarize") {
@@ -1779,15 +1767,32 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			where_clause = " WHERE " + TrExpr(cmd.condition);
 		}
 		string sql = "SELECT "
-		             "COUNT(" + var + ") AS N, "
-		             "AVG(" + var + ") AS mean, "
-		             "STDDEV(" + var + ") AS sd, "
-		             "MIN(" + var + ") AS min, "
-		             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY " + var + ") AS p25, "
-		             "PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY " + var + ") AS p50, "
-		             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY " + var + ") AS p75, "
-		             "MAX(" + var + ") AS max "
-		             "FROM " + prev + where_clause;
+		             "COUNT(" +
+		             var +
+		             ") AS N, "
+		             "AVG(" +
+		             var +
+		             ") AS mean, "
+		             "STDDEV(" +
+		             var +
+		             ") AS sd, "
+		             "MIN(" +
+		             var +
+		             ") AS min, "
+		             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY " +
+		             var +
+		             ") AS p25, "
+		             "PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY " +
+		             var +
+		             ") AS p50, "
+		             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY " +
+		             var +
+		             ") AS p75, "
+		             "MAX(" +
+		             var +
+		             ") AS max "
+		             "FROM " +
+		             prev + where_clause;
 		return state.BuildQuery(sql);
 	}
 
@@ -1814,8 +1819,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	if (cmd.command == "save") {
 		string target = ExtractQuotedString(cmd.arguments);
 		string lower_opts = str::Lower(cmd.options);
-		bool save_as_table = (lower_opts.find("table") != string::npos ||
-		                      lower_opts.find("memory") != string::npos);
+		bool save_as_table = (lower_opts.find("table") != string::npos || lower_opts.find("memory") != string::npos);
 
 		// Check if target is a registered tempfile
 		bool is_tempfile = (state.tempfile_names.find(target) != state.tempfile_names.end());
@@ -1865,7 +1869,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	if (cmd.command == "mvencode") {
 		// mvencode var1 var2 [_all], mv(value)
 		// Replace missing values with a specified value
-		string mv_value = "0";  // default
+		string mv_value = "0"; // default
 		// Parse mv() from options
 		string lower_opts = str::Lower(cmd.options);
 		idx_t mv_pos = lower_opts.find("mv(");
@@ -1963,10 +1967,9 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			if (value_vars.size() == 1) {
 				string stub = Trim(value_vars[0]);
 				string qstub = QuoteIdent(stub);
-				state.AddStep(
-				    "SELECT * REPLACE (REPLACE(" + qj + ", '" + stub + "_', '') AS " + qj +
-				    ") FROM (UNPIVOT " + prev + " ON COLUMNS('" + stub + "_.*') INTO NAME " +
-				    qj + " VALUE " + qstub + ")");
+				state.AddStep("SELECT * REPLACE (REPLACE(" + qj + ", '" + stub + "_', '') AS " + qj +
+				              ") FROM (UNPIVOT " + prev + " ON COLUMNS('" + stub + "_.*') INTO NAME " + qj + " VALUE " +
+				              qstub + ")");
 			} else {
 				// Multiple value vars: each stub becomes a value column
 				// UNPIVOT ON COLUMNS('stub1_.*'), COLUMNS('stub2_.*') INTO NAME j VALUE stub1, stub2
@@ -1983,10 +1986,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				}
 				// Strip all prefixes from j var
 				string replace_expr = "REGEXP_REPLACE(" + qj + ", '^[^_]+_', '') AS " + qj;
-				state.AddStep(
-				    "SELECT * REPLACE (" + replace_expr +
-				    ") FROM (UNPIVOT " + prev + " ON " + on_clause + " INTO NAME " +
-				    qj + " VALUE " + value_names + ")");
+				state.AddStep("SELECT * REPLACE (" + replace_expr + ") FROM (UNPIVOT " + prev + " ON " + on_clause +
+				              " INTO NAME " + qj + " VALUE " + value_names + ")");
 			}
 		} else {
 			// PIVOT: long -> wide
@@ -2013,10 +2014,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			string subquery = "(" + state.BuildQuery("SELECT * FROM " + prev) + ")";
 			state.Clear();
 			// __PIVOT__ marker tells plan_function/parser_override to handle specially
-			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _dodo_pivot AS (PIVOT " +
-			       subquery + " ON " + qj + " USING FIRST(" + QuoteIdent(value_var) +
-			       ") GROUP BY " + i_cols + ");" +
-			       "||STATE||_dodo_pivot";
+			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _dodo_pivot AS (PIVOT " + subquery + " ON " + qj +
+			       " USING FIRST(" + QuoteIdent(value_var) + ") GROUP BY " + i_cols + ");" + "||STATE||_dodo_pivot";
 		}
 		return "SELECT 'OK' AS status";
 	}

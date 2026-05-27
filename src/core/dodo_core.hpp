@@ -18,7 +18,7 @@ struct DodoCommand {
 	std::string arguments;
 	std::string condition;
 	std::string options;
-	std::string bysort_partition;  // PARTITION BY vars, comma-separated
+	std::string bysort_partition; // PARTITION BY vars, comma-separated
 	std::string bysort_order;     // ORDER BY vars, comma-separated
 };
 
@@ -27,10 +27,10 @@ struct DodoCommand {
 //===--------------------------------------------------------------------===//
 struct DodoState {
 	std::vector<std::string> cte_steps;
-	std::vector<std::string> cte_commands;  //! Original command text for each step
+	std::vector<std::string> cte_commands; //! Original command text for each step
 	int step_counter = 0;
 	std::string current_source;
-	std::string pending_command;  //! Set before ProcessCommand, consumed by AddStep
+	std::string pending_command; //! Set before ProcessCommand, consumed by AddStep
 
 	//! Redo stack: (command_text, cte_sql) pairs popped by undo
 	std::vector<std::pair<std::string, std::string>> redo_stack;
@@ -50,8 +50,8 @@ struct DodoState {
 	std::vector<std::string> tempfile_tables;
 
 	//! Panel structure (set by xtset/tsset)
-	std::string panel_var;  // empty if pure time-series
-	std::string time_var;   // empty if not set
+	std::string panel_var; // empty if pure time-series
+	std::string time_var;  // empty if not set
 
 	//! Whether dodo._current table exists (materialized use)
 	bool materialized = false;
