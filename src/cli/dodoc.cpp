@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+static const char *DODOC_VERSION = "0.2.0";
+
 static void print_usage(const char *prog) {
 	std::cerr << "Usage: " << prog << " [OPTIONS] [INPUT_FILE]\n"
 	          << "\n"
@@ -18,6 +20,7 @@ static void print_usage(const char *prog) {
 	          << "  -o, --output FILE    Write SQL to FILE (default: stdout)\n"
 	          << "  --annotate           Emit original .do command as SQL comment\n"
 	          << "  --terminal           Also emit SQL for terminal commands\n"
+	          << "  -v, --version        Show version\n"
 	          << "  -h, --help           Show this help message\n";
 }
 
@@ -34,6 +37,9 @@ static CliOptions parse_args(int argc, char *argv[]) {
 		std::string arg = argv[i];
 		if (arg == "-h" || arg == "--help") {
 			print_usage(argv[0]);
+			std::exit(0);
+		} else if (arg == "-v" || arg == "--version") {
+			std::cout << "dodoc " << DODOC_VERSION << "\n";
 			std::exit(0);
 		} else if (arg == "-o" || arg == "--output") {
 			if (i + 1 >= argc) {

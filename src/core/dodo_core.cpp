@@ -25,6 +25,152 @@ static string QuoteIdent(const string &s) {
 }
 
 //===--------------------------------------------------------------------===//
+// SQL Formatting
+//===--------------------------------------------------------------------===//
+
+// Format a SQL string with line breaks at major clause keywords.
+// Only breaks at top-level (paren_depth 0), preserving subquery structure.
+static string FormatInnerSQL(const string &sql, const string &indent) {
+	if (sql.empty()) {
+		return sql;
+	}
+
+	string result;
+	idx_t len = sql.size();
+	idx_t i = 0;
+	int paren_depth = 0;
+	bool in_quote = false;
+	bool first_clause = true;
+
+	// Clause keywords that trigger new lines (longest match first)
+	static const vector<string> CLAUSE_KW = {
+	    "UNION ALL BY NAME ", "UNION ALL ",
+	    "SELECT DISTINCT ",   "SELECT ",
+	    "FULL OUTER JOIN ",   "LEFT JOIN ",
+	    "INNER JOIN ",        "FROM ",
+	    "WHERE ",             "GROUP BY ",
+	    "ORDER BY ",          "HAVING ",
+	    "LIMIT ",             "USING "};
+
+	while (i < len) {
+		char c = sql[i];
+
+		// Track single quotes (handle escaped '' too)
+		if (c == '\'') {
+			if (!in_quote) {
+				in_quote = true;
+			} else if (i + 1 < len && sql[i + 1] == '\'') {
+				result += c;
+				i++;
+			} else {
+				in_quote = false;
+			}
+			result += c;
+			i++;
+			continue;
+		}
+		if (in_quote) {
+			result += c;
+			i++;
+			continue;
+		}
+
+		// Track parens
+		if (c == '(') {
+			paren_depth++;
+			result += c;
+			i++;
+			continue;
+		}
+		if (c == ')') {
+			paren_depth--;
+			result += c;
+			i++;
+			continue;
+		}
+
+		// Only match keywords at paren depth 0 and word boundary
+		if (paren_depth == 0 && (i == 0 || sql[i - 1] == ' ' || sql[i - 1] == '\n')) {
+			bool matched = false;
+			for (auto &kw : CLAUSE_KW) {
+				if (i + kw.size() <= len) {
+					bool kw_match = true;
+					for (idx_t j = 0; j < kw.size(); j++) {
+						if (toupper(sql[i + j]) != kw[j]) {
+							kw_match = false;
+							break;
+						}
+					}
+					if (kw_match) {
+						if (!first_clause) {
+							// Trim trailing whitespace
+							while (!result.empty() && result.back() == ' ') {
+								result.pop_back();
+							}
+							result += "\n" + indent;
+						}
+						result += kw;
+						i += kw.size();
+						first_clause = false;
+						matched = true;
+						break;
+					}
+				}
+			}
+			if (matched) {
+				continue;
+			}
+		}
+
+		result += c;
+		i++;
+	}
+
+	return result;
+}
+
+// DodoState::BuildCTEPrefix — format-aware CTE assembly
+string DodoState::BuildCTEPrefix() const {
+	if (cte_steps.empty()) {
+		return "";
+	}
+	if (format_sql) {
+		string result = "WITH\n";
+		for (idx_t i = 0; i < cte_steps.size(); i++) {
+			if (i > 0) {
+				result += ",\n";
+			}
+			if (sql_comments && i < cte_commands.size() && !cte_commands[i].empty()) {
+				result += "  -- [source] " + cte_commands[i] + "\n";
+			}
+			result += "  _s" + to_string(i) + " AS (\n";
+			result += "    " + FormatInnerSQL(cte_steps[i], "    ") + "\n";
+			result += "  )";
+		}
+		result += "\n";
+		return result;
+	}
+	// Unformatted (compact)
+	string result = "WITH ";
+	for (idx_t i = 0; i < cte_steps.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += "_s" + to_string(i) + " AS (" + cte_steps[i] + ")";
+	}
+	result += " ";
+	return result;
+}
+
+// DodoState::BuildQuery — CTE prefix + formatted final SELECT
+string DodoState::BuildQuery(const string &final_select) const {
+	if (format_sql) {
+		return BuildCTEPrefix() + FormatInnerSQL(final_select, "");
+	}
+	return BuildCTEPrefix() + final_select;
+}
+
+//===--------------------------------------------------------------------===//
 // Command Tokenizer
 //===--------------------------------------------------------------------===//
 
@@ -32,7 +178,8 @@ const vector<string> DODO_COMMANDS = {
     "use",      "list",     "clear",   "keep",     "drop",      "generate",   "replace", "rename", "sort",   "order",
     "egen",     "collapse", "count",   "describe", "summarize", "tabulate",   "head",    "tail",   "save",   "append",
     "mvencode", "reshape",  "do",      "label",    "codebook",  "duplicates", "expand",  "export", "import", "merge",
-    "tempfile", "preserve", "restore", "xtset",    "tsset",     "bysort",     "by",      "undo",   "redo",   "history"};
+    "tempfile", "preserve", "restore", "xtset",    "tsset",     "bysort",     "by",      "undo",   "redo",   "history",
+    "show"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -1093,6 +1240,34 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		sql += ") AS t(step_id, command, undone) ORDER BY step_id";
 		return sql;
+	}
+
+	if (cmd.command == "show") {
+		// show sql — return the formatted SQL as text
+		string lower_args = str::Lower(Trim(cmd.arguments));
+		if (lower_args != "sql" && lower_args != "query") {
+			throw DodoException("'show' supports: show sql");
+		}
+		if (!state.HasData()) {
+			throw DodoException("No dataset in memory. Use 'use' to load data first.");
+		}
+		string prev_step = state.LatestStep();
+		// Temporarily force formatting for show sql output
+		bool saved_format = state.format_sql;
+		bool saved_comments = state.sql_comments;
+		state.format_sql = true;
+		state.sql_comments = true;
+		string full_sql = state.BuildQuery("SELECT * FROM " + prev_step);
+		state.format_sql = saved_format;
+		state.sql_comments = saved_comments;
+		// Escape single quotes for SQL string literal
+		string escaped = full_sql;
+		size_t pos = 0;
+		while ((pos = escaped.find('\'', pos)) != string::npos) {
+			escaped.replace(pos, 1, "''");
+			pos += 2;
+		}
+		return "SELECT '" + escaped + "' AS sql";
 	}
 
 	if (!state.HasData()) {

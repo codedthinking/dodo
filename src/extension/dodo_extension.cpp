@@ -109,6 +109,10 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 		if (StringUtil::StartsWith(trimmed, "reshape") && trimmed.find("wide") != string::npos) {
 			has_conflict_commands = true;
 		}
+		// show — SQL SHOW keyword conflicts
+		if (StringUtil::StartsWith(trimmed, "show") && (trimmed.size() == 4 || trimmed[4] == ' ')) {
+			has_conflict_commands = true;
+		}
 
 		std::string cmd_name;
 		// Need original (non-lowered) string for IsDodoCommand
@@ -278,6 +282,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    if (g_dodo_state) {
 			    g_dodo_state->live_view_enabled = parameter.GetValue<bool>();
 			    g_dodo_state->core.live_view_enabled = parameter.GetValue<bool>();
+		    }
+	    });
+
+	config.AddExtensionOption(
+	    "dodo_format_sql", "Format generated SQL with indentation and line breaks (default: true)",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (g_dodo_state) {
+			    g_dodo_state->core.format_sql = parameter.GetValue<bool>();
+		    }
+	    });
+
+	config.AddExtensionOption(
+	    "dodo_sql_comments", "Add source command comments to generated SQL CTEs (default: true)",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (g_dodo_state) {
+			    g_dodo_state->core.sql_comments = parameter.GetValue<bool>();
 		    }
 	    });
 }

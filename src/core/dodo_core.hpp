@@ -26,13 +26,17 @@ struct DodoCommand {
 // DodoState — CTE chain state for .do file to SQL translation
 //===--------------------------------------------------------------------===//
 struct DodoState {
-	std::vector<std::string> cte_steps;
-	std::vector<std::string> cte_commands; //! Original command text for each step
+	std::vector<std::string> cte_steps;        //! Inner SQL for each CTE step (without _sN AS wrapper)
+	std::vector<std::string> cte_commands;     //! Original command text for each step
 	int step_counter = 0;
 	std::string current_source;
 	std::string pending_command; //! Set before ProcessCommand, consumed by AddStep
 
-	//! Redo stack: (command_text, cte_sql) pairs popped by undo
+	//! SQL formatting options
+	bool format_sql = true;
+	bool sql_comments = true;
+
+	//! Redo stack: (command_text, inner_sql) pairs popped by undo
 	std::vector<std::pair<std::string, std::string>> redo_stack;
 
 	//! Variable labels: column_name -> label text
@@ -72,32 +76,17 @@ struct DodoState {
 	}
 
 	void AddStep(const std::string &inner_sql) {
-		std::string step_name = "_s" + std::to_string(step_counter);
-		cte_steps.push_back(step_name + " AS (" + inner_sql + ")");
+		cte_steps.push_back(inner_sql);
 		cte_commands.push_back(pending_command);
 		step_counter++;
 		// New step invalidates redo history
 		redo_stack.clear();
 	}
 
-	std::string BuildCTEPrefix() const {
-		if (cte_steps.empty()) {
-			return "";
-		}
-		std::string result = "WITH ";
-		for (idx_t i = 0; i < cte_steps.size(); i++) {
-			if (i > 0) {
-				result += ", ";
-			}
-			result += cte_steps[i];
-		}
-		result += " ";
-		return result;
-	}
-
-	std::string BuildQuery(const std::string &final_select) const {
-		return BuildCTEPrefix() + final_select;
-	}
+	//! Build WITH ... AS ... prefix (defined in .cpp for formatting support)
+	std::string BuildCTEPrefix() const;
+	//! Build full query: CTE prefix + final SELECT
+	std::string BuildQuery(const std::string &final_select) const;
 
 	//! Get SQL to drop tempfile tables, materialized table, and schemas
 	std::string BuildCleanupSQL() const {
