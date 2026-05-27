@@ -1,6 +1,6 @@
 extension:
-  name: stata_do
-  description: Run Stata .do file commands directly in DuckDB
+  name: dodo
+  description: "Dodo: run .do file commands in DuckDB"
   version: 0.1.1
   language: C++
   build: cmake

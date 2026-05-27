@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "stata_do_extension.hpp"
+#include "dodo_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -8,10 +8,15 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 
+#include "duckdb/parser/keyword_helper.hpp"
+
 #include <fstream>
 #include <regex>
 
 namespace duckdb {
+
+// Global pointer to shared state, used by the live_view option callback
+static DodoStateInfo *g_dodo_state = nullptr;
 
 // Helper: Trim that returns a new string
 static string Trim(const string &s) {
@@ -20,11 +25,16 @@ static string Trim(const string &s) {
 	return result;
 }
 
+// Helper: quote an identifier if it's a SQL keyword or needs quoting
+static string QuoteIdent(const string &s) {
+	return KeywordHelper::WriteOptionallyQuoted(s);
+}
+
 //===--------------------------------------------------------------------===//
-// Stata Command Tokenizer
+// Command Tokenizer
 //===--------------------------------------------------------------------===//
 
-static const vector<string> STATA_COMMANDS = {"use",       "list",       "clear",   "keep",    "drop",
+static const vector<string> DODO_COMMANDS = {"use",       "list",       "clear",   "keep",    "drop",
                                               "generate",  "replace",    "rename",  "sort",    "order",
                                               "egen",      "collapse",   "count",   "describe", "summarize",
                                               "tabulate",  "head",       "tail",    "save",    "append",
@@ -56,14 +66,23 @@ static bool IsSideEffectCommand(const string &command) {
 	return command == "export" || command == "save";
 }
 
-static bool IsStataCommand(const string &query, string &command_out) {
+// Build SQL to create/replace the live view for UI integration
+static string BuildLiveViewSQL(const DodoStateInfo &state) {
+	if (!state.live_view_enabled || !state.HasData()) {
+		return "";
+	}
+	return "CREATE OR REPLACE VIEW _dodo_data AS (" +
+	       state.BuildQuery("SELECT * FROM " + state.LatestStep()) + ")";
+}
+
+static bool IsDodoCommand(const string &query, string &command_out) {
 	string trimmed = Trim(query);
 	if (!trimmed.empty() && trimmed.back() == ';') {
 		trimmed.pop_back();
 		trimmed = Trim(trimmed);
 	}
 	string lower = StringUtil::Lower(trimmed);
-	for (auto &cmd : STATA_COMMANDS) {
+	for (auto &cmd : DODO_COMMANDS) {
 		if (StringUtil::StartsWith(lower, cmd)) {
 			if (lower.size() == cmd.size() || lower[cmd.size()] == ' ' || lower[cmd.size()] == ',') {
 				command_out = cmd;
@@ -74,7 +93,7 @@ static bool IsStataCommand(const string &query, string &command_out) {
 	return false;
 }
 
-struct StataCommand {
+struct DodoCommand {
 	string command;
 	string arguments;
 	string condition;
@@ -84,8 +103,8 @@ struct StataCommand {
 	string bysort_order;      // ORDER BY vars (comma-separated), empty if none
 };
 
-static StataCommand TokenizeCommand(const string &query) {
-	StataCommand result;
+static DodoCommand TokenizeCommand(const string &query) {
+	DodoCommand result;
 	string trimmed = Trim(query);
 	if (!trimmed.empty() && trimmed.back() == ';') {
 		trimmed.pop_back();
@@ -93,7 +112,7 @@ static StataCommand TokenizeCommand(const string &query) {
 	}
 
 	string lower = StringUtil::Lower(trimmed);
-	for (auto &cmd : STATA_COMMANDS) {
+	for (auto &cmd : DODO_COMMANDS) {
 		if (StringUtil::StartsWith(lower, cmd) &&
 		    (lower.size() == cmd.size() || lower[cmd.size()] == ' ' || lower[cmd.size()] == ',')) {
 			result.command = cmd;
@@ -214,6 +233,7 @@ static string ParseByOption(const string &options) {
 	}
 	string by_content = Trim(options.substr(start, end - start));
 	// by() content may be space-separated or comma-separated; normalize to comma-separated
+	// Quote each variable name to handle SQL keyword conflicts
 	if (by_content.find(',') == string::npos) {
 		auto vars = StringUtil::Split(by_content, ' ');
 		string result;
@@ -221,14 +241,23 @@ static string ParseByOption(const string &options) {
 			if (i > 0) {
 				result += ", ";
 			}
-			result += Trim(vars[i]);
+			result += QuoteIdent(Trim(vars[i]));
 		}
 		return result;
 	}
-	return by_content;
+	// Comma-separated: quote each part
+	auto vars = StringUtil::Split(by_content, ',');
+	string result;
+	for (idx_t i = 0; i < vars.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += QuoteIdent(Trim(vars[i]));
+	}
+	return result;
 }
 
-// Map Stata aggregate function names to SQL equivalents
+// Map aggregate function names to SQL equivalents
 static string TranslateAggFunction(const string &func_name) {
 	string lower = StringUtil::Lower(func_name);
 	if (lower == "mean") return "AVG";
@@ -548,7 +577,7 @@ static string TranslateExpression(const string &expr, const string &by_cols = ""
 	// round(x) and round(x, d) — DuckDB supports ROUND natively, pass through
 	// abs(x) — DuckDB supports ABS natively, pass through
 
-	// Convert double-quoted strings to single-quoted (Stata uses " for strings, SQL uses ')
+	// Convert double-quoted strings to single-quoted (do-file syntax uses " for strings, SQL uses ')
 	// But be careful not to convert column name references — only convert within expressions
 	{
 		string out;
@@ -568,8 +597,8 @@ static string TranslateExpression(const string &expr, const string &by_cols = ""
 	string partition = by_cols.empty() ? "" : "PARTITION BY " + by_cols + " ";
 	string order_clause = bysort_order.empty() ? "" : "ORDER BY " + bysort_order + " ";
 
-	// var[_n-1] → LAG(var, 1) OVER (...) — MUST be before _n expansion
-	// var[_n+1] → LEAD(var, 1) OVER (...)
+	// var[_n-1] -> LAG(var, 1) OVER (...) — MUST be before _n expansion
+	// var[_n+1] -> LEAD(var, 1) OVER (...)
 	{
 		std::regex subscript_re("(\\w+)\\[_n\\s*([+-])\\s*(\\d+)\\]");
 		std::smatch m;
@@ -596,7 +625,7 @@ static string TranslateExpression(const string &expr, const string &by_cols = ""
 	result = std::regex_replace(result, N_re, "COUNT(*) OVER (" + partition + ")");
 
 	// Running aggregate functions in bysort context:
-	// sum(x) with by_cols → SUM(x) OVER (PARTITION BY ... ORDER BY ... ROWS UNBOUNDED PRECEDING)
+	// sum(x) with by_cols -> SUM(x) OVER (PARTITION BY ... ORDER BY ... ROWS UNBOUNDED PRECEDING)
 	// This only triggers when partition context exists (from bysort)
 	// Note: for egen, the OVER() is added separately; this handles generate's running sums
 	if (!partition.empty()) {
@@ -634,7 +663,7 @@ static string TranslateExpression(const string &expr, const string &by_cols = ""
 //===--------------------------------------------------------------------===//
 // Process command: update state, return SQL
 //===--------------------------------------------------------------------===//
-static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
+static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 	// Helper: translate expression with panel/time and bysort context
 	auto TrExpr = [&state, &cmd](const string &expr, const string &by_cols = "") {
 		// bysort context overrides by_cols for _n, _N, [_n-1] etc.
@@ -685,7 +714,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				partition_cols += ", ";
 			}
-			partition_cols += Trim(gvars[i]);
+			partition_cols += QuoteIdent(Trim(gvars[i]));
 		}
 		string order_cols;
 		if (!sort_vars_str.empty()) {
@@ -694,7 +723,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					order_cols += ", ";
 				}
-				order_cols += Trim(svars[i]);
+				order_cols += QuoteIdent(Trim(svars[i]));
 			}
 		}
 
@@ -722,6 +751,9 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 	if (cmd.command == "clear") {
 		// Generate cleanup SQL for tracked tables, then clear state
 		string cleanup = state.BuildCleanupSQL();
+		if (state.live_view_enabled) {
+			cleanup += "DROP VIEW IF EXISTS _dodo_data; ";
+		}
 		state.ClearAll();
 		if (!cleanup.empty()) {
 			// Return cleanup SQL + OK. Multiple statements separated by ;
@@ -838,7 +870,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				trimmed = Trim(trimmed.substr(0, comment_pos));
 			}
 
-			// Strip * line-start comments (Stata convention)
+			// Strip * line-start comments (do-file convention)
 			if (!trimmed.empty() && trimmed[0] == '*') {
 				continue;
 			}
@@ -863,10 +895,10 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				continue;
 			}
 
-			// Check if this is a Stata command we know
+			// Check if this is a command we know
 			string sub_command;
-			if (!IsStataCommand(trimmed, sub_command)) {
-				// Not a Stata command — skip
+			if (!IsDodoCommand(trimmed, sub_command)) {
+				// Not a known command — skip
 				continue;
 			}
 
@@ -1080,7 +1112,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					col_list += ", ";
 				}
-				col_list += Trim(vars[i]);
+				col_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT " + col_list + " FROM " + prev);
 		} else if (!cmd.arguments.empty() && !cmd.condition.empty()) {
@@ -1090,7 +1122,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					col_list += ", ";
 				}
-				col_list += Trim(vars[i]);
+				col_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT " + col_list + " FROM " + prev + " WHERE " +
 			              TrExpr(cmd.condition));
@@ -1117,7 +1149,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					exclude_list += ", ";
 				}
-				exclude_list += Trim(vars[i]);
+				exclude_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT * EXCLUDE (" + exclude_list + ") FROM " + prev);
 		} else {
@@ -1131,8 +1163,8 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		if (parts.size() != 2) {
 			throw ParserException("'rename' requires exactly two arguments: rename oldname newname");
 		}
-		string old_name = Trim(parts[0]);
-		string new_name = Trim(parts[1]);
+		string old_name = QuoteIdent(Trim(parts[0]));
+		string new_name = QuoteIdent(Trim(parts[1]));
 		state.AddStep("SELECT * EXCLUDE (" + old_name + "), " + old_name + " AS " + new_name + " FROM " + prev);
 		return "SELECT 'OK' AS status";
 	}
@@ -1142,7 +1174,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		if (eq_pos == string::npos) {
 			throw ParserException("'generate' requires an assignment: generate varname = expression");
 		}
-		string var_name = Trim(cmd.arguments.substr(0, eq_pos));
+		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -1161,7 +1193,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		if (eq_pos == string::npos) {
 			throw ParserException("'replace' requires an assignment: replace varname = expression");
 		}
-		string var_name = Trim(cmd.arguments.substr(0, eq_pos));
+		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -1186,7 +1218,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				order_clause += ", ";
 			}
-			order_clause += Trim(vars[i]) + " " + order;
+			order_clause += QuoteIdent(Trim(vars[i])) + " " + order;
 		}
 		state.AddStep("SELECT * FROM " + prev + " ORDER BY " + order_clause);
 		return "SELECT 'OK' AS status";
@@ -1199,7 +1231,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		if (eq_pos == string::npos) {
 			throw ParserException("'egen' requires an assignment: egen varname = function(arg)");
 		}
-		string var_name = Trim(cmd.arguments.substr(0, eq_pos));
+		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
 		string rhs = Trim(cmd.arguments.substr(eq_pos + 1));
 
 		string func_name, func_arg;
@@ -1211,7 +1243,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		string by_cols = ParseByOption(cmd.options);
 		string partition = by_cols.empty() ? "" : "PARTITION BY " + by_cols;
 
-		string window_expr = sql_func + "(" + func_arg + ") OVER (" + partition + ")";
+		string window_expr = sql_func + "(" + QuoteIdent(func_arg) + ") OVER (" + partition + ")";
 
 		if (!cmd.condition.empty()) {
 			string sql_cond = TrExpr(cmd.condition, by_cols);
@@ -1229,7 +1261,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		string by_cols = ParseByOption(cmd.options);
 
 		// Parse assignments: each is either "y = func(x)" or "(func) y = x"
-		// Stata syntax: collapse (mean) wage = income (sum) hours = workhrs, by(group)
+		// Syntax: collapse (mean) wage = income (sum) hours = workhrs, by(group)
 		// Also supports: collapse mean_wage = mean(income), by(group)
 		string args = cmd.arguments;
 
@@ -1287,13 +1319,13 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 					if (!first_expr) {
 						select_exprs += ", ";
 					}
-					select_exprs += sql_func + "(" + var + ") AS " + var;
+					select_exprs += sql_func + "(" + QuoteIdent(var) + ") AS " + QuoteIdent(var);
 					first_expr = false;
 				}
 				continue;
 			}
 
-			string var_name = Trim(remaining.substr(0, eq_pos));
+			string var_name = QuoteIdent(Trim(remaining.substr(0, eq_pos)));
 			remaining = Trim(remaining.substr(eq_pos + 1));
 
 			// Get the source expression
@@ -1317,7 +1349,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (!first_expr) {
 					select_exprs += ", ";
 				}
-				select_exprs += sql_func + "(" + func_arg_used + ") AS " + var_name;
+				select_exprs += sql_func + "(" + QuoteIdent(func_arg_used) + ") AS " + var_name;
 			} else {
 				// Simple variable name, use current_func
 				if (space_pos != string::npos) {
@@ -1332,7 +1364,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (!first_expr) {
 					select_exprs += ", ";
 				}
-				select_exprs += sql_func + "(" + source_expr + ") AS " + var_name;
+				select_exprs += sql_func + "(" + QuoteIdent(source_expr) + ") AS " + var_name;
 			}
 			first_expr = false;
 		}
@@ -1361,7 +1393,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				col_list += ", ";
 			}
-			col_list += Trim(vars[i]);
+			col_list += QuoteIdent(Trim(vars[i]));
 		}
 		// Put listed columns first, then all others with COLUMNS(*)
 		// DuckDB supports: SELECT col1, col2, * EXCLUDE (col1, col2) FROM t
@@ -1412,7 +1444,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				key_cols += ", ";
 			}
-			key_cols += Trim(key_vars[i]);
+			key_cols += QuoteIdent(Trim(key_vars[i]));
 		}
 
 		// Parse options: keep(), keepusing(), nogenerate
@@ -1478,7 +1510,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 						if (i > 0) {
 							keepusing_cols += ", ";
 						}
-						keepusing_cols += Trim(ku_vars[i]);
+						keepusing_cols += QuoteIdent(Trim(ku_vars[i]));
 					}
 				}
 			}
@@ -1505,20 +1537,20 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				using_clause += ", ";
 			}
-			using_clause += Trim(key_vars[i]);
+			using_clause += QuoteIdent(Trim(key_vars[i]));
 		}
 
 		// Determine JOIN type based on keep() option for optimization
 		string join_type;
 		if (keep_filter.find("_merge = 1") == string::npos &&
 		    keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
-			// keep(match) only → INNER JOIN
+			// keep(match) only -> INNER JOIN
 			join_type = "INNER JOIN";
 		} else if (keep_filter.find("_merge = 2") == string::npos && !keep_filter.empty()) {
-			// keep(master) or keep(master match) → LEFT JOIN
+			// keep(master) or keep(master match) -> LEFT JOIN
 			join_type = "LEFT JOIN";
 		} else {
-			// Default: keep all → FULL OUTER JOIN
+			// Default: keep all -> FULL OUTER JOIN
 			join_type = "FULL OUTER JOIN";
 		}
 
@@ -1569,7 +1601,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					col_list += ", ";
 				}
-				col_list += Trim(vars[i]);
+				col_list += QuoteIdent(Trim(vars[i]));
 			}
 			// Use ROW_NUMBER to keep first row per group
 			state.AddStep("SELECT * EXCLUDE (_dedup_rn) FROM ("
@@ -1609,7 +1641,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		} else {
 			// generate(newvar) — newvar is 0 for original row, 1 for copies
 			state.AddStep("SELECT * EXCLUDE (_expand_idx), "
-			              "CASE WHEN _expand_idx = 1 THEN 0 ELSE 1 END AS " + gen_var +
+			              "CASE WHEN _expand_idx = 1 THEN 0 ELSE 1 END AS " + QuoteIdent(gen_var) +
 			              " FROM (SELECT t.*, g.generate_series AS _expand_idx FROM " + prev +
 			              " t, LATERAL GENERATE_SERIES(1, " + n_expr + ") g)");
 		}
@@ -1643,7 +1675,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					cols += ", ";
 				}
-				cols += Trim(vars[i]);
+				cols += QuoteIdent(Trim(vars[i]));
 			}
 		}
 		string sql = "SELECT " + cols + " FROM " + prev;
@@ -1725,7 +1757,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		if (cmd.arguments.empty()) {
 			throw ParserException("'summarize' requires at least one variable name");
 		}
-		string var = Trim(cmd.arguments);
+		string var = QuoteIdent(Trim(cmd.arguments));
 		string where_clause;
 		if (!cmd.condition.empty()) {
 			where_clause = " WHERE " + TrExpr(cmd.condition);
@@ -1753,7 +1785,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				group_cols += ", ";
 			}
-			group_cols += Trim(vars[i]);
+			group_cols += QuoteIdent(Trim(vars[i]));
 		}
 		string where_clause;
 		if (!cmd.condition.empty()) {
@@ -1778,7 +1810,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			string full_query = state.BuildQuery("SELECT * FROM " + prev);
 
 			if (is_tempfile) {
-				// Tempfile → _tempfiles schema (schema created by tempfile command)
+				// Tempfile -> _tempfiles schema (schema created by tempfile command)
 				table_name = "_tempfiles." + target;
 				state.tempfile_tables.push_back(table_name);
 				return "CREATE OR REPLACE TABLE " + table_name + " AS (" + full_query + ")";
@@ -1857,7 +1889,8 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			if (i > 0) {
 				replace_list += ", ";
 			}
-			replace_list += "COALESCE(" + var + ", " + mv_value + ") AS " + var;
+			string qvar = QuoteIdent(var);
+			replace_list += "COALESCE(" + qvar + ", " + mv_value + ") AS " + qvar;
 		}
 		state.AddStep("SELECT * REPLACE (" + replace_list + ") FROM " + prev);
 		return "SELECT 'OK' AS status";
@@ -1904,23 +1937,25 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 			throw ParserException("'reshape' requires j(varname) option");
 		}
 
+		string qj = QuoteIdent(j_var);
+
 		if (is_long) {
-			// UNPIVOT: wide → long
-			// Stata convention: "reshape long revenue, i(id) j(year)" means
+			// UNPIVOT: wide -> long
+			// do-file convention: "reshape long revenue, i(id) j(year)" means
 			// unpivot columns matching revenue_* pattern, strip the prefix from j values
 			// Use COLUMNS('stub_.*') regex to match, then strip prefix from j var
 			if (value_vars.size() == 1) {
 				string stub = Trim(value_vars[0]);
+				string qstub = QuoteIdent(stub);
 				state.AddStep(
-				    "SELECT * REPLACE (REPLACE(" + j_var + ", '" + stub + "_', '') AS " + j_var +
+				    "SELECT * REPLACE (REPLACE(" + qj + ", '" + stub + "_', '') AS " + qj +
 				    ") FROM (UNPIVOT " + prev + " ON COLUMNS('" + stub + "_.*') INTO NAME " +
-				    j_var + " VALUE " + stub + ")");
+				    qj + " VALUE " + qstub + ")");
 			} else {
 				// Multiple value vars: each stub becomes a value column
 				// UNPIVOT ON COLUMNS('stub1_.*'), COLUMNS('stub2_.*') INTO NAME j VALUE stub1, stub2
 				string on_clause;
 				string value_names;
-				string replace_expr = "REPLACE(" + j_var;
 				for (idx_t i = 0; i < value_vars.size(); i++) {
 					string stub = Trim(value_vars[i]);
 					if (i > 0) {
@@ -1928,18 +1963,17 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 						value_names += ", ";
 					}
 					on_clause += "COLUMNS('" + stub + "_.*')";
-					value_names += stub;
-					replace_expr += ", '" + stub + "_', ''";
+					value_names += QuoteIdent(stub);
 				}
 				// Strip all prefixes from j var
-				replace_expr = "REGEXP_REPLACE(" + j_var + ", '^[^_]+_', '') AS " + j_var;
+				string replace_expr = "REGEXP_REPLACE(" + qj + ", '^[^_]+_', '') AS " + qj;
 				state.AddStep(
 				    "SELECT * REPLACE (" + replace_expr +
 				    ") FROM (UNPIVOT " + prev + " ON " + on_clause + " INTO NAME " +
-				    j_var + " VALUE " + value_names + ")");
+				    qj + " VALUE " + value_names + ")");
 			}
 		} else {
-			// PIVOT: long → wide
+			// PIVOT: long -> wide
 			// DuckDB PIVOT internally expands to multiple statements, so it can't live
 			// inside a CTE. We create a temp table from the current chain, PIVOT it,
 			// then restart the chain from the temp table.
@@ -1956,38 +1990,38 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				if (i > 0) {
 					i_cols += ", ";
 				}
-				i_cols += Trim(i_var_list[i]);
+				i_cols += QuoteIdent(Trim(i_var_list[i]));
 			}
 			// PIVOT generates MULTI statements that can't live in CTEs.
 			// Strategy: create temp table via PIVOT, restart chain from it.
 			string subquery = "(" + state.BuildQuery("SELECT * FROM " + prev) + ")";
 			state.Clear();
 			// __PIVOT__ marker tells plan_function/parser_override to handle specially
-			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _stata_pivot AS (PIVOT " +
-			       subquery + " ON " + j_var + " USING FIRST(" + value_var +
+			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _dodo_pivot AS (PIVOT " +
+			       subquery + " ON " + qj + " USING FIRST(" + QuoteIdent(value_var) +
 			       ") GROUP BY " + i_cols + ");" +
-			       "||STATE||_stata_pivot";
+			       "||STATE||_dodo_pivot";
 		}
 		return "SELECT 'OK' AS status";
 	}
 
-	throw ParserException("Unimplemented Stata command: " + cmd.command);
+	throw ParserException("Unimplemented command: " + cmd.command);
 }
 
 //===--------------------------------------------------------------------===//
-// parse_function: detect Stata commands (called when standard parser fails)
+// parse_function: detect commands (called when standard parser fails)
 //===--------------------------------------------------------------------===//
-static ParserExtensionParseResult stata_do_parse(ParserExtensionInfo *info, const string &query) {
+static ParserExtensionParseResult dodo_parse(ParserExtensionInfo *info, const string &query) {
 	string command;
-	if (!IsStataCommand(query, command)) {
+	if (!IsDodoCommand(query, command)) {
 		return ParserExtensionParseResult();
 	}
-	auto parse_data = make_uniq<StataDoParseData>(query);
+	auto parse_data = make_uniq<DodoParseData>(query);
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 
 // Check if a single statement needs parser_override (SQL keyword conflict or PIVOT)
-static bool NeedsParserOverride(const string &stmt, StataDoStateInfo &state) {
+static bool NeedsParserOverride(const string &stmt, DodoStateInfo &state) {
 	string lower = StringUtil::Lower(stmt);
 	if (state.HasData() || (!state.cte_steps.empty())) {
 		if (StringUtil::StartsWith(lower, "describe") &&
@@ -2010,9 +2044,9 @@ static bool NeedsParserOverride(const string &stmt, StataDoStateInfo &state) {
 // (describe, summarize, reshape wide) — called BEFORE the standard parser.
 // Must handle full multi-statement strings by splitting on ';'.
 //===--------------------------------------------------------------------===//
-static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, const string &query,
+static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, const string &query,
                                                      ParserOptions &options) {
-	auto &state = dynamic_cast<StataDoStateInfo &>(*info);
+	auto &state = dynamic_cast<DodoStateInfo &>(*info);
 
 	// Split the full query into individual statements by ';'
 	auto statements_str = StringUtil::Split(query, ';');
@@ -2020,8 +2054,8 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 	// Check if ANY statement needs our override
 	// We must take over the ENTIRE query if any statement is describe/summarize/reshape wide,
 	// because the standard parser would handle those before our parse_function sees them.
-	// We also take over if earlier Stata commands will load data (making later describe valid).
-	bool has_stata_commands = false;
+	// We also take over if earlier commands will load data (making later describe valid).
+	bool has_dodo_commands = false;
 	bool has_conflict_commands = false;
 	for (auto &s : statements_str) {
 		string trimmed = Trim(s);
@@ -2049,15 +2083,19 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 		}
 
 		string cmd_name;
-		if (IsStataCommand(trimmed, cmd_name)) {
-			has_stata_commands = true;
+		if (IsDodoCommand(trimmed, cmd_name)) {
+			has_dodo_commands = true;
 		}
 	}
 
-	// Take over if there's a SQL-conflicting command AND either Stata commands or existing state.
+	// Take over if there's a SQL-conflicting command AND either known commands or existing state.
 	// When we take over, we process ALL statements ourselves (updating state for use/label/etc
 	// before generating SQL for describe/summarize).
-	bool any_needs_override = has_conflict_commands && (has_stata_commands || state.HasData());
+	// Also take over when live_view is enabled and we have known commands (need multi-statement injection).
+	bool any_needs_override = has_conflict_commands && (has_dodo_commands || state.HasData());
+	if (!any_needs_override && state.live_view_enabled && has_dodo_commands) {
+		any_needs_override = true;
+	}
 
 	if (!any_needs_override) {
 		return ParserOverrideResult();
@@ -2073,9 +2111,9 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 				continue;
 			}
 
-			// Check if this is a Stata command
+			// Check if this is a known command
 			string cmd_name;
-			if (IsStataCommand(trimmed, cmd_name)) {
+			if (IsDodoCommand(trimmed, cmd_name)) {
 				auto cmd = TokenizeCommand(trimmed);
 				string sql = ProcessCommand(cmd, state);
 
@@ -2100,8 +2138,18 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 				for (auto &stmt : parser.statements) {
 					all_statements.push_back(std::move(stmt));
 				}
+
+				// Live view: inject view creation for UI data panel
+				string view_sql = BuildLiveViewSQL(state);
+				if (!view_sql.empty()) {
+					Parser view_parser;
+					view_parser.ParseQuery(view_sql);
+					for (auto &stmt : view_parser.statements) {
+						all_statements.push_back(std::move(stmt));
+					}
+				}
 			} else {
-				// Not a Stata command — parse as regular SQL
+				// Not a known command — parse as regular SQL
 				Parser parser;
 				parser.ParseQuery(trimmed);
 				for (auto &stmt : parser.statements) {
@@ -2122,13 +2170,13 @@ static ParserOverrideResult stata_do_parser_override(ParserExtensionInfo *info, 
 //===--------------------------------------------------------------------===//
 // plan_function: generate SQL, store parsed statement, throw to redirect
 //===--------------------------------------------------------------------===//
-static ParserExtensionPlanResult stata_do_plan(ParserExtensionInfo *info, ClientContext &context,
+static ParserExtensionPlanResult dodo_plan(ParserExtensionInfo *info, ClientContext &context,
                                                unique_ptr<ParserExtensionParseData> parse_data) {
-	auto &stata_data = dynamic_cast<StataDoParseData &>(*parse_data);
-	auto &state = dynamic_cast<StataDoStateInfo &>(*info);
+	auto &dodo_data = dynamic_cast<DodoParseData &>(*parse_data);
+	auto &state = dynamic_cast<DodoStateInfo &>(*info);
 
-	// Generate the SQL from the Stata command
-	auto cmd = TokenizeCommand(stata_data.raw_query);
+	// Generate the SQL from the command
+	auto cmd = TokenizeCommand(dodo_data.raw_query);
 	string sql = ProcessCommand(cmd, state);
 
 	// Parse the generated SQL with DuckDB's parser
@@ -2136,28 +2184,28 @@ static ParserExtensionPlanResult stata_do_plan(ParserExtensionInfo *info, Client
 	try {
 		parser.ParseQuery(sql);
 	} catch (std::exception &ex) {
-		throw BinderException("stata_do: failed to parse generated SQL: %s\nSQL: %s", ex.what(), sql);
+		throw BinderException("dodo: failed to parse generated SQL: %s\nSQL: %s", ex.what(), sql);
 	}
 	if (parser.statements.empty()) {
-		throw BinderException("stata_do: generated SQL produced no statements");
+		throw BinderException("dodo: generated SQL produced no statements");
 	}
 
 	// Store the parsed statement in client context state
-	auto bind_state = make_shared_ptr<StataDoBindState>(std::move(parser.statements[0]));
-	context.registered_state->Remove("stata_do_bind");
-	context.registered_state->Insert("stata_do_bind", bind_state);
+	auto bind_state = make_shared_ptr<DodoBindState>(std::move(parser.statements[0]));
+	context.registered_state->Remove("dodo_bind");
+	context.registered_state->Insert("dodo_bind", bind_state);
 
 	// Throw a BinderException to redirect to OperatorExtension::Bind
-	throw BinderException("stata_do redirect to operator bind");
+	throw BinderException("dodo redirect to operator bind");
 }
 
 //===--------------------------------------------------------------------===//
 // OperatorExtension::Bind — picks up stored statement and binds it
 //===--------------------------------------------------------------------===//
-BoundStatement stata_do_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
+BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
                              SQLStatement &statement) {
 	// Check if we have a stored statement from plan_function
-	auto bind_state = context.registered_state->Get<StataDoBindState>("stata_do_bind");
+	auto bind_state = context.registered_state->Get<DodoBindState>("dodo_bind");
 	if (!bind_state || !bind_state->statement) {
 		// Not our statement — return empty to let other extensions try
 		return BoundStatement();
@@ -2168,7 +2216,7 @@ BoundStatement stata_do_bind(ClientContext &context, Binder &binder, OperatorExt
 	auto result = sql_binder->Bind(*bind_state->statement);
 
 	// Clear the bind state
-	context.registered_state->Remove("stata_do_bind");
+	context.registered_state->Remove("dodo_bind");
 
 	return result;
 }
@@ -2182,13 +2230,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(instance);
 
 	// Shared state for all parser paths
-	auto shared_state = make_shared_ptr<StataDoStateInfo>();
+	auto shared_state = make_shared_ptr<DodoStateInfo>();
+	g_dodo_state = shared_state.get();
 
 	// Register parser extension (parse_function for most commands, parser_override for SQL-conflicting ones)
 	ParserExtension parser_ext;
-	parser_ext.parse_function = stata_do_parse;
-	parser_ext.plan_function = stata_do_plan;
-	parser_ext.parser_override = stata_do_parser_override;
+	parser_ext.parse_function = dodo_parse;
+	parser_ext.plan_function = dodo_plan;
+	parser_ext.parser_override = dodo_parser_override;
 	parser_ext.parser_info = shared_state;
 	ParserExtension::Register(config, parser_ext);
 
@@ -2196,21 +2245,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.SetOptionByName("allow_parser_override_extension", Value("fallback"));
 
 	// Register operator extension for the bind redirect
-	auto operator_ext = make_shared_ptr<StataDoOperatorExtension>();
+	auto operator_ext = make_shared_ptr<DodoOperatorExtension>();
 	OperatorExtension::Register(config, operator_ext);
+
+	// Register dodo_live_view option: SET dodo_live_view = true
+	config.AddExtensionOption(
+	    "dodo_live_view",
+	    "Create/replace _dodo_data view after each transformation (for DuckDB UI)",
+	    LogicalType::BOOLEAN,
+	    Value::BOOLEAN(false),
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+	        if (g_dodo_state) {
+	            g_dodo_state->live_view_enabled = parameter.GetValue<bool>();
+	        }
+	    });
 }
 
-void StataDoExtension::Load(ExtensionLoader &loader) {
+void DodoExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
-std::string StataDoExtension::Name() {
-	return "stata_do";
+std::string DodoExtension::Name() {
+	return "dodo";
 }
 
-std::string StataDoExtension::Version() const {
-#ifdef EXT_VERSION_STATA_DO
-	return EXT_VERSION_STATA_DO;
+std::string DodoExtension::Version() const {
+#ifdef EXT_VERSION_DODO
+	return EXT_VERSION_DODO;
 #else
 	return "";
 #endif
@@ -2220,7 +2281,7 @@ std::string StataDoExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(stata_do, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(dodo, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

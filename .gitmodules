@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "duckdb-ui"]
+	path = duckdb-ui
+	url = https://github.com/duckdb/duckdb-ui.git

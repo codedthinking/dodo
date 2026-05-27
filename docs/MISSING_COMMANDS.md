@@ -1,6 +1,6 @@
-# Missing Stata Commands
+# Missing Stata Commands in Dodo
 
-Inventory of Stata commands used in [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create) but not yet implemented in this extension.
+Inventory of Stata commands used in [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create) but not yet implemented in the Dodo extension.
 
 ## Critical (used in nearly every file)
 

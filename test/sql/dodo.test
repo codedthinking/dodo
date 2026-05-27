@@ -1,8 +1,8 @@
-# name: test/sql/stata_do.test
-# description: test stata_do extension
+# name: test/sql/dodo.test
+# description: test dodo extension
 # group: [sql]
 
-require stata_do
+require dodo
 
 # ============================================================
 # M0: Extension loads, standard SQL still works
@@ -1219,6 +1219,77 @@ list id year spell_year
 2	2016	1
 2	2017	2
 2	2018	3
+
+statement ok
+clear
+
+# ============================================================
+# Live view for DuckDB UI integration
+# ============================================================
+
+# default: no view created
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_dodo_data'
+----
+0
+
+statement ok
+clear
+
+# enable live view
+statement ok
+SET dodo_live_view = true
+
+# use creates the view
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+SELECT COUNT(*) FROM _dodo_data
+----
+5
+
+# keep updates the view
+statement ok
+keep if year >= 2018
+
+query I
+SELECT COUNT(*) FROM _dodo_data
+----
+3
+
+# generate updates the view with new column
+statement ok
+generate double_revenue = revenue * 2
+
+query IIIII
+SELECT * FROM _dodo_data ORDER BY id LIMIT 1
+----
+2	Beta	2000	2018	4000
+
+# clear drops the view
+statement ok
+clear
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_dodo_data'
+----
+0
+
+# disable live view
+statement ok
+SET dodo_live_view = false
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_dodo_data'
+----
+0
 
 statement ok
 clear
