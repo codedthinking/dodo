@@ -119,8 +119,8 @@ use "data/input.parquet", clear
 ## Building
 
 ```bash
-git clone --recurse-submodules https://github.com/codedthinking/duckdb-stata-do.git
-cd duckdb-stata-do
+git clone --recurse-submodules https://github.com/codedthinking/dodo.git
+cd dodo
 make release
 ./build/release/duckdb
 ```

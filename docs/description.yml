@@ -9,7 +9,7 @@ extension:
     - korenmiklos
 
 repo:
-  github: codedthinking/duckdb-stata-do
+  github: codedthinking/dodo
   ref: main
 
 docs:
