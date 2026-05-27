@@ -91,14 +91,17 @@ list;
 
 `dodoc` compiles `.do` files to SQL without DuckDB. No dependencies, single binary.
 
-### Install from release
-
-Download the binary for your platform from [GitHub Releases](https://github.com/codedthinking/dodo/releases), then:
+### Install
 
 ```bash
-tar xzf dodoc-macos-arm64.tar.gz
-sudo install dodoc /usr/local/bin/
+# one-liner (macOS / Linux)
+curl -fsSL https://getdodo.dev/install.sh | sh
+
+# or via Homebrew
+brew install codedthinking/tap/dodoc
 ```
+
+Or download manually from [GitHub Releases](https://github.com/codedthinking/dodo/releases).
 
 ### Build from source
 
