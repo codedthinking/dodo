@@ -51,6 +51,11 @@ static bool IsTransformationCommand(const string &command) {
 	return false;
 }
 
+// Side-effect commands that write files — must be executed in do-files
+static bool IsSideEffectCommand(const string &command) {
+	return command == "export" || command == "save";
+}
+
 static bool IsStataCommand(const string &query, string &command_out) {
 	string trimmed = Trim(query);
 	if (!trimmed.empty() && trimmed.back() == ';') {
@@ -792,6 +797,7 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 		string line;
 		bool in_block_comment = false;
 		string continued_line;
+		vector<string> side_effect_sql;
 
 		while (std::getline(file, line)) {
 			string trimmed = Trim(line);
@@ -864,18 +870,29 @@ static string ProcessCommand(const StataCommand &cmd, StataDoStateInfo &state) {
 				continue;
 			}
 
-			// In do-file execution, only run transformation commands
-			// Terminal (list, head, tail, describe) and side-effect (count, summarize,
-			// tabulate, save) commands are skipped — user runs them interactively after
-			if (!IsTransformationCommand(sub_command)) {
+			// In do-file execution, run transformation and side-effect commands
+			// Terminal (list, head, tail, describe) and query commands (count,
+			// summarize, tabulate) are skipped — user runs them interactively after
+			if (!IsTransformationCommand(sub_command) && !IsSideEffectCommand(sub_command)) {
 				continue;
 			}
 
 			auto sub_cmd = TokenizeCommand(trimmed);
-			ProcessCommand(sub_cmd, state);
+			string sql = ProcessCommand(sub_cmd, state);
+
+			// Side-effect commands (export, save) return SQL that must be executed
+			if (IsSideEffectCommand(sub_command)) {
+				side_effect_sql.push_back(sql);
+			}
 		}
 
-		return "SELECT 'OK' AS status";
+		// Return side-effect SQL followed by status
+		string result;
+		for (auto &sql : side_effect_sql) {
+			result += sql + "; ";
+		}
+		result += "SELECT 'OK' AS status";
+		return result;
 	}
 
 	if (cmd.command == "label") {
