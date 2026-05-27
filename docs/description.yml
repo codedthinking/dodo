@@ -26,3 +26,16 @@ docs:
     summarize, tabulate, describe, history), state management (undo, redo,
     preserve, restore), and I/O (use, save, append, import/export delimited).
     Run .do files directly with `do "script.do"`. Inspired by Kezdi.jl.
+
+compiler:
+  name: dodoc
+  description: "Standalone .do-to-SQL compiler — no DuckDB required"
+  install:
+    curl: "curl -fsSL https://getdodo.dev/install.sh | sh"
+    brew: "brew install codedthinking/tap/dodoc"
+  platforms:
+    - macos-arm64
+    - macos-x86_64
+    - linux-x86_64
+    - linux-arm64
+    - windows-x86_64
