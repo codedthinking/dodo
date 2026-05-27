@@ -18,8 +18,12 @@ struct DodoStateInfo : public ParserExtensionInfo {
 	bool live_view_enabled = false;
 
 	// Convenience forwarders for the extension glue
-	bool HasData() const { return core.HasData(); }
-	std::string LatestStep() const { return core.LatestStep(); }
+	bool HasData() const {
+		return core.HasData();
+	}
+	std::string LatestStep() const {
+		return core.LatestStep();
+	}
 };
 
 //===--------------------------------------------------------------------===//
@@ -45,8 +49,7 @@ struct DodoParseData : public ParserExtensionParseData {
 //===--------------------------------------------------------------------===//
 class DodoBindState : public ClientContextState {
 public:
-	explicit DodoBindState(unique_ptr<SQLStatement> stmt)
-	    : statement(std::move(stmt)) {
+	explicit DodoBindState(unique_ptr<SQLStatement> stmt) : statement(std::move(stmt)) {
 	}
 
 	void QueryEnd() override {
@@ -59,8 +62,7 @@ public:
 //===--------------------------------------------------------------------===//
 // Operator Extension
 //===--------------------------------------------------------------------===//
-BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
-                         SQLStatement &statement);
+BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info, SQLStatement &statement);
 
 class DodoOperatorExtension : public OperatorExtension {
 public:

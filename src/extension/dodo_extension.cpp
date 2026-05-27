@@ -81,7 +81,7 @@ static ParserExtensionParseResult dodo_parse(ParserExtensionInfo *info, const st
 // parser_override: handles commands that conflict with SQL keywords
 //===--------------------------------------------------------------------===//
 static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, const string &query,
-                                                     ParserOptions &options) {
+                                                 ParserOptions &options) {
 	auto &state = dynamic_cast<DodoStateInfo &>(*info);
 
 	// Split the full query into individual statements by ';'
@@ -96,7 +96,8 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 			continue;
 		}
 
-		if (StringUtil::StartsWith(trimmed, "use ") && (trimmed.find('"') != string::npos || trimmed.find('\'') != string::npos)) {
+		if (StringUtil::StartsWith(trimmed, "use ") &&
+		    (trimmed.find('"') != string::npos || trimmed.find('\'') != string::npos)) {
 			has_conflict_commands = true;
 		}
 		if (StringUtil::StartsWith(trimmed, "import ")) {
@@ -206,7 +207,7 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 // plan_function: generate SQL, store parsed statement, throw to redirect
 //===--------------------------------------------------------------------===//
 static ParserExtensionPlanResult dodo_plan(ParserExtensionInfo *info, ClientContext &context,
-                                               unique_ptr<ParserExtensionParseData> parse_data) {
+                                           unique_ptr<ParserExtensionParseData> parse_data) {
 	auto &dodo_data = dynamic_cast<DodoParseData &>(*parse_data);
 	auto &state = dynamic_cast<DodoStateInfo &>(*info);
 
@@ -234,8 +235,7 @@ static ParserExtensionPlanResult dodo_plan(ParserExtensionInfo *info, ClientCont
 //===--------------------------------------------------------------------===//
 // OperatorExtension::Bind — picks up stored statement and binds it
 //===--------------------------------------------------------------------===//
-BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
-                             SQLStatement &statement) {
+BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info, SQLStatement &statement) {
 	auto bind_state = context.registered_state->Get<DodoBindState>("dodo_bind");
 	if (!bind_state || !bind_state->statement) {
 		return BoundStatement();
@@ -273,15 +273,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OperatorExtension::Register(config, operator_ext);
 
 	config.AddExtensionOption(
-	    "dodo_live_view",
-	    "Create/replace _dodo_data view after each transformation (for DuckDB UI)",
-	    LogicalType::BOOLEAN,
-	    Value::BOOLEAN(false),
-	    [](ClientContext &context, SetScope scope, Value &parameter) {
-	        if (g_dodo_state) {
-	            g_dodo_state->live_view_enabled = parameter.GetValue<bool>();
-	            g_dodo_state->core.live_view_enabled = parameter.GetValue<bool>();
-	        }
+	    "dodo_live_view", "Create/replace _dodo_data view after each transformation (for DuckDB UI)",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (g_dodo_state) {
+			    g_dodo_state->live_view_enabled = parameter.GetValue<bool>();
+			    g_dodo_state->core.live_view_enabled = parameter.GetValue<bool>();
+		    }
 	    });
 }
 
