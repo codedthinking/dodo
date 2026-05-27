@@ -1293,3 +1293,72 @@ SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_dodo_data'
 
 statement ok
 clear
+
+# ============================================================
+# Materialized use (default) vs lazy
+# ============================================================
+
+# default: use materializes into dodo._current
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'dodo' AND table_name = '_current'
+----
+1
+
+query I
+SELECT COUNT(*) FROM dodo._current
+----
+5
+
+# transformations still work on top of materialized table
+statement ok
+keep if year >= 2018
+
+query I
+count
+----
+3
+
+# clear drops the materialized table
+statement ok
+clear
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'dodo' AND table_name = '_current'
+----
+0
+
+# lazy mode: no table created
+statement ok
+use "test/data/firms.csv", lazy
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'dodo' AND table_name = '_current'
+----
+0
+
+# data still accessible via CTE
+query I
+count
+----
+5
+
+statement ok
+clear
+
+# sequential use: second use drops first table
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+SELECT COUNT(*) FROM dodo._current
+----
+5
+
+statement ok
+clear

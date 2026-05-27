@@ -71,6 +71,9 @@ struct DodoStateInfo : public ParserExtensionInfo {
 	//! Live view: CREATE OR REPLACE VIEW _dodo_data after each transformation
 	bool live_view_enabled = false;
 
+	//! Whether dodo._current table exists (materialized use)
+	bool materialized = false;
+
 	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
 	int preserve_checkpoint = -1;
 	int preserve_step_counter = -1;
@@ -85,9 +88,10 @@ struct DodoStateInfo : public ParserExtensionInfo {
 		tempfile_names.clear();
 		preserve_checkpoint = -1;
 		preserve_step_counter = -1;
+		materialized = false;
 	}
 
-	//! Get SQL to drop tempfile tables and schema (called on clear)
+	//! Get SQL to drop tempfile tables, materialized table, and schemas (called on clear)
 	string BuildCleanupSQL() const {
 		string sql;
 		for (auto &tbl : tempfile_tables) {
@@ -95,6 +99,10 @@ struct DodoStateInfo : public ParserExtensionInfo {
 		}
 		if (tempfiles_schema_created) {
 			sql += "DROP SCHEMA IF EXISTS _tempfiles CASCADE; ";
+		}
+		if (materialized) {
+			sql += "DROP TABLE IF EXISTS dodo._current; ";
+			sql += "DROP SCHEMA IF EXISTS dodo; ";
 		}
 		return sql;
 	}

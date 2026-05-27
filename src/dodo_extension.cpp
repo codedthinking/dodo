@@ -61,7 +61,7 @@ static bool IsTransformationCommand(const string &command) {
 	return false;
 }
 
-// Side-effect commands that write files — must be executed in do-files
+// Side-effect commands that produce SQL beyond state updates — must be executed in do-files
 static bool IsSideEffectCommand(const string &command) {
 	return command == "export" || command == "save";
 }
@@ -740,12 +740,32 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 	}
 
 	if (cmd.command == "use") {
+		// Drop previous materialized table if switching datasets
+		string pre_cleanup;
+		if (state.materialized) {
+			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
+		}
 		state.Clear();
 		string source = ExtractQuotedString(cmd.arguments);
 		string read_expr = FileReadFunction(source);
-		state.AddStep("SELECT * FROM " + read_expr);
+		string lower_opts = StringUtil::Lower(cmd.options);
+		bool lazy = (lower_opts.find("lazy") != string::npos);
+		bool is_file = (read_expr != source);
+
+		string result_sql;
+		if (!lazy && is_file) {
+			// Materialize: create table, reference it in CTE chain
+			result_sql = "CREATE SCHEMA IF NOT EXISTS dodo; ";
+			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM " + read_expr + "; ";
+			state.AddStep("SELECT * FROM dodo._current");
+			state.materialized = true;
+		} else {
+			// Lazy mode or existing table: reference directly
+			state.AddStep("SELECT * FROM " + read_expr);
+		}
 		state.current_source = cmd.arguments;
-		return "SELECT 'OK' AS status";
+		result_sql += "SELECT 'OK' AS status";
+		return pre_cleanup + result_sql;
 	}
 
 	if (cmd.command == "clear") {
@@ -911,6 +931,22 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 
 			auto sub_cmd = TokenizeCommand(trimmed);
 			string sql = ProcessCommand(sub_cmd, state);
+
+			// In do-file context, use/import cannot materialize (table creation
+			// SQL can't execute mid-script). Rewrite to lazy if needed.
+			if ((sub_command == "use" || sub_command == "import") && state.materialized) {
+				// Undo materialization: replace dodo._current reference with direct file read
+				string source = ExtractQuotedString(sub_cmd.arguments);
+				string read_expr = FileReadFunction(source);
+				if (sub_command == "import") {
+					string rest = Trim(sub_cmd.arguments.substr(10));
+					read_expr = "read_csv('" + ExtractQuotedString(rest) + "')";
+				}
+				state.cte_steps.clear();
+				state.step_counter = 0;
+				state.AddStep("SELECT * FROM " + read_expr);
+				state.materialized = false;
+			}
 
 			// Side-effect commands (export, save) return SQL that must be executed
 			if (IsSideEffectCommand(sub_command)) {
@@ -1080,10 +1116,28 @@ static string ProcessCommand(const DodoCommand &cmd, DodoStateInfo &state) {
 		}
 		string rest = Trim(cmd.arguments.substr(10));
 		string filename = ExtractQuotedString(rest);
+		string lower_opts = StringUtil::Lower(cmd.options);
+		bool lazy = (lower_opts.find("lazy") != string::npos);
+
+		// Drop previous materialized table if switching datasets
+		string pre_cleanup;
+		if (state.materialized) {
+			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
+		}
 		state.Clear();
-		state.AddStep("SELECT * FROM read_csv('" + filename + "')");
+
+		string result_sql;
+		if (!lazy) {
+			result_sql = "CREATE SCHEMA IF NOT EXISTS dodo; ";
+			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM read_csv('" + filename + "'); ";
+			state.AddStep("SELECT * FROM dodo._current");
+			state.materialized = true;
+		} else {
+			state.AddStep("SELECT * FROM read_csv('" + filename + "')");
+		}
 		state.current_source = filename;
-		return "SELECT 'OK' AS status";
+		result_sql += "SELECT 'OK' AS status";
+		return pre_cleanup + result_sql;
 	}
 
 	if (!state.HasData()) {
