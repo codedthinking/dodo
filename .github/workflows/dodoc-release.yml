@@ -45,7 +45,7 @@ jobs:
             CXXFLAGS="$CXXFLAGS -static"
           fi
           mkdir -p build/dodoc
-          $CXX $CXXFLAGS -Isrc/core -o build/dodoc/dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
+          c++ $CXXFLAGS -Isrc/core -o build/dodoc/dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
           strip build/dodoc/dodoc || true
 
       - name: Smoke test
