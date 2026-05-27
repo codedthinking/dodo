@@ -66,6 +66,11 @@ main() {
 
     tar xzf "$tmpdir/${artifact}.tar.gz" -C "$tmpdir"
 
+    # Remove macOS quarantine attribute (blocks unsigned binaries)
+    if [ "$os" = "Darwin" ]; then
+        xattr -d com.apple.quarantine "$tmpdir/$BINARY" 2>/dev/null || true
+    fi
+
     # Install — try /usr/local/bin, fall back to ~/.local/bin
     install_dir="/usr/local/bin"
     if [ -w "$install_dir" ]; then
