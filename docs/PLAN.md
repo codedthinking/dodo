@@ -90,6 +90,8 @@ Each command adds a new `_sN AS (...)` referencing the previous `_sN-1`. Shown b
 | `reshape long y, i(id) j(t)` | `UNPIVOT _prev ON ... INTO NAME t VALUE y` |
 | `reshape wide y, i(id) j(t)` | `PIVOT _prev ON t USING FIRST(y) GROUP BY id` |
 | `clear` | Clears the chain entirely (resets state) |
+| `undo [N]` | Remove last N steps (default 1), push to redo stack |
+| `redo [N]` | Re-apply last N undone steps (default 1) |
 
 ### Terminal Commands (materialize the CTE chain + final SELECT)
 
@@ -107,6 +109,7 @@ These prepend the full `WITH _s0 AS (...), _s1 AS (...), ...` then append their 
 | `describe` | Special: `WITH ... SELECT * FROM _sN LIMIT 0` then use result metadata, or `DESCRIBE (WITH ... SELECT * FROM _sN)` |
 | `head [n]` | `SELECT * FROM _sN LIMIT n` |
 | `tail [n]` | `SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _rn, COUNT(*) OVER () AS _total FROM _sN) WHERE _rn > _total - n` |
+| `history` | `SELECT step_id, command, undone, ts FROM dodo._history` |
 | `save "file.csv", replace` | `COPY (WITH ... SELECT * FROM _sN) TO 'file.csv'` |
 | `save "file.parquet", replace` | `COPY (WITH ... SELECT * FROM _sN) TO 'file.parquet'` |
 | `regress y x1 x2` | Stretch goal — needs stats extension or custom implementation |
@@ -519,7 +522,116 @@ Regex: `(\w+)\[_n\s*([+-]\s*\d+)\]` captures variable and offset.
 - `bysort id (year): generate cum_rev = sum(revenue)` — running sum
 - `bysort id (year): generate prev_rev = revenue[_n-1]` — positional lag
 
-### M18: Polish phase 2
+### M18: `undo` / `redo` and structured command history
+
+**Problem:** Interactive data exploration involves trial and error. A wrong `drop` or `keep` currently requires reloading the data and replaying all commands. `preserve`/`restore` only provides a single checkpoint.
+
+**Commands:**
+
+| Command | Behavior |
+|---|---|
+| `undo` | Remove the last transformation step, push it to redo stack |
+| `undo N` | Remove the last N steps |
+| `redo` | Re-apply the last undone step |
+| `redo N` | Re-apply the last N undone steps |
+| `history` | Terminal command: show the command history table |
+
+**Implementation — structured history table:**
+
+Replace the in-memory `vector<string> cte_steps` with a persistent table in the `dodo` schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS dodo._history (
+    step_id   INTEGER PRIMARY KEY,
+    command   VARCHAR,     -- original dodo command text (e.g., 'keep if year >= 2020')
+    cte_sql   VARCHAR,     -- generated CTE inner SQL (e.g., 'SELECT * FROM _s0 WHERE year >= 2020')
+    undone    BOOLEAN DEFAULT false,  -- true if this step has been undone
+    ts        TIMESTAMP DEFAULT current_timestamp
+)
+```
+
+The `dodo._history` table lives in the same schema as `dodo._current`. It is created on the first `use` command (alongside the schema).
+
+**State changes to `DodoStateInfo`:**
+
+```cpp
+struct DodoStateInfo : public ParserExtensionInfo {
+    // ... existing fields ...
+
+    // Replace cte_steps vector with history-backed chain
+    // The active chain is: all rows in dodo._history WHERE NOT undone, ordered by step_id
+    // For BuildCTEPrefix(), read from the table (or keep an in-memory cache synced)
+
+    // In-memory cache (mirrors dodo._history WHERE NOT undone)
+    vector<string> cte_steps;      // CTE SQL strings (active only)
+    vector<string> cte_commands;   // original command text (for display)
+    int step_counter = 0;          // next step_id to assign
+
+    // Redo stack: steps that were undone (popped from cte_steps)
+    vector<pair<string, string>> redo_stack;  // (command, cte_sql) pairs
+};
+```
+
+**How `undo` works:**
+
+1. Pop the last entry from `cte_steps` and `cte_commands`
+2. Push it onto `redo_stack`
+3. Decrement active step count
+4. Update `dodo._history`: `UPDATE dodo._history SET undone = true WHERE step_id = <last>`
+5. Refresh `_dodo_data` view if live_view enabled
+6. Return `SELECT 'OK' AS status`
+
+**How `redo` works:**
+
+1. Pop from `redo_stack`
+2. Push back onto `cte_steps` and `cte_commands`
+3. Update `dodo._history`: `UPDATE dodo._history SET undone = false WHERE step_id = <step>`
+4. Refresh live view
+5. Return `SELECT 'OK' AS status`
+
+**Redo invalidation:** Any new transformation command clears the redo stack (standard undo/redo semantics). Delete undone rows: `DELETE FROM dodo._history WHERE undone = true`.
+
+**`history` terminal command:**
+
+```sql
+SELECT step_id, command, undone, ts FROM dodo._history ORDER BY step_id
+```
+
+Shows the full history including undone steps, so users can see what happened.
+
+**Why a table instead of just in-memory vectors:**
+
+1. **Visible in the UI** — the DuckDB UI data panel shows `dodo._history` alongside `dodo._current`, making the command history browsable
+2. **Queryable** — `SELECT * FROM dodo._history WHERE command LIKE '%revenue%'` to find when a column was transformed
+3. **Survives within session** — even if the extension state is somehow reset, the history persists
+4. **Foundation for future features** — branching, named checkpoints, session replay
+
+**Interaction with existing features:**
+
+- `clear` → drops `dodo._history` along with `dodo._current`
+- `preserve`/`restore` → works as before (index into active steps), orthogonal to undo
+- `use "file", clear` → drops and recreates `dodo._history`
+- `.do` files → no undo support (forced lazy, no history table)
+- `BuildCTEPrefix()` → reads from in-memory `cte_steps` cache (unchanged performance)
+- Live view → refreshed after undo/redo same as any transformation
+
+**Edge cases:**
+
+- `undo` with no steps → error: "Nothing to undo"
+- `redo` with empty redo stack → error: "Nothing to redo"
+- `undo` after `use` (only _s0 remains) → error: "Cannot undo past data load"
+- `undo N` where N > available steps → undo all available, warn
+
+**Test plan:**
+
+- `use; keep if x > 0; undo; list` — data shows all rows again
+- `use; keep; generate; undo; undo; redo; list` — back to keep-only state
+- `use; keep; undo; drop if y < 0; redo` → error (redo stack cleared)
+- `history` — shows step_id, command, undone status
+- `clear` — history table dropped
+- `SELECT * FROM dodo._history` — queryable from SQL
+
+### M19: Polish phase 2
 - `compress` → no-op (DuckDB doesn't need storage type optimization)
 - `display` → `SELECT 'message'` (informational output)
 - `assert` → `SELECT CASE WHEN NOT (expr) THEN error('Assertion failed') END`
@@ -543,7 +655,7 @@ Regex: `(\w+)\[_n\s*([+-]\s*\d+)\]` captures variable and offset.
 
 6. **Error on empty chain**: If no `use` has been called and user tries `keep`/`drop`/etc., throw a clear error: "No dataset in memory. Use 'use' to load data."
 
-7. **No catalog side effects**: The extension never creates tables, views, or other persistent objects. Everything lives in the CTE chain in memory.
+7. **Structured state in `dodo` schema**: The extension stores its state in `dodo._current` (materialized data) and `dodo._history` (command history). This makes state visible in the DuckDB UI and queryable from SQL. `clear` drops everything.
 
 ---
 
