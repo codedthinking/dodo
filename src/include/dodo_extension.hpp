@@ -12,7 +12,7 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // CTE Chain State — stored in ParserExtensionInfo (per database)
 //===--------------------------------------------------------------------===//
-struct StataDoStateInfo : public ParserExtensionInfo {
+struct DodoStateInfo : public ParserExtensionInfo {
 	vector<string> cte_steps;
 	int step_counter = 0;
 	string current_source;
@@ -68,6 +68,9 @@ struct StataDoStateInfo : public ParserExtensionInfo {
 	string panel_var;  // empty if pure time-series
 	string time_var;   // empty if not set
 
+	//! Live view: CREATE OR REPLACE VIEW _dodo_data after each transformation
+	bool live_view_enabled = false;
+
 	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
 	int preserve_checkpoint = -1;
 	int preserve_step_counter = -1;
@@ -106,14 +109,14 @@ struct StataDoStateInfo : public ParserExtensionInfo {
 //===--------------------------------------------------------------------===//
 // Parse Data
 //===--------------------------------------------------------------------===//
-struct StataDoParseData : public ParserExtensionParseData {
+struct DodoParseData : public ParserExtensionParseData {
 	string raw_query;
 
-	explicit StataDoParseData(string query) : raw_query(std::move(query)) {
+	explicit DodoParseData(string query) : raw_query(std::move(query)) {
 	}
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
-		return make_uniq<StataDoParseData>(raw_query);
+		return make_uniq<DodoParseData>(raw_query);
 	}
 
 	string ToString() const override {
@@ -124,9 +127,9 @@ struct StataDoParseData : public ParserExtensionParseData {
 //===--------------------------------------------------------------------===//
 // Bind state — passes the generated SQL statement between plan and bind
 //===--------------------------------------------------------------------===//
-class StataDoBindState : public ClientContextState {
+class DodoBindState : public ClientContextState {
 public:
-	explicit StataDoBindState(unique_ptr<SQLStatement> stmt)
+	explicit DodoBindState(unique_ptr<SQLStatement> stmt)
 	    : statement(std::move(stmt)) {
 	}
 
@@ -140,28 +143,28 @@ public:
 //===--------------------------------------------------------------------===//
 // Operator Extension
 //===--------------------------------------------------------------------===//
-BoundStatement stata_do_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
-                             SQLStatement &statement);
+BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
+                         SQLStatement &statement);
 
-class StataDoOperatorExtension : public OperatorExtension {
+class DodoOperatorExtension : public OperatorExtension {
 public:
-	StataDoOperatorExtension() {
-		Bind = stata_do_bind;
+	DodoOperatorExtension() {
+		Bind = dodo_bind;
 	}
 
 	std::string GetName() override {
-		return "stata_do";
+		return "dodo";
 	}
 
 	unique_ptr<LogicalExtensionOperator> Deserialize(Deserializer &deserializer) override {
-		throw InternalException("stata_do operator should not be serialized");
+		throw InternalException("dodo operator should not be serialized");
 	}
 };
 
 //===--------------------------------------------------------------------===//
 // Extension class
 //===--------------------------------------------------------------------===//
-class StataDoExtension : public Extension {
+class DodoExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;

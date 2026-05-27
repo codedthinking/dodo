@@ -1,8 +1,8 @@
-# DuckDB Stata `.do` Extension — Implementation Plan
+# Dodo — Implementation Plan
 
 ## Context
 
-We are building a DuckDB community extension called **`stata_do`** (working name) that lets users write a subset of Stata `.do` file commands directly inside DuckDB. The extension implements the same commands as [Kezdi.jl](https://github.com/codedthinking/Kezdi.jl), translating them to SQL under the hood.
+We are building a DuckDB community extension called **`dodo`** that lets users write a subset of Stata `.do` file commands directly inside DuckDB. The extension implements the same commands as [Kezdi.jl](https://github.com/codedthinking/Kezdi.jl), translating them to SQL under the hood.
 
 **Key design principle:** Commands do NOT mutate any table. Instead, each command appends a SQL transformation (CTE step) to a running query chain. The chain is only materialized when a "terminal" command (`list`, `summarize`, `tabulate`, `count`, `save`, `regress`) is executed. Terminal commands do NOT consume or reset the chain — you can keep transforming after a `list`. This aligns perfectly with DuckDB's lazy evaluation model.
 
@@ -40,7 +40,7 @@ Follow the **duckdb-prql pattern**:
 ### State (per connection via `ClientContextState`)
 
 ```cpp
-class StataDoState : public ClientContextState {
+class DodoState : public ClientContextState {
     vector<string> cte_chain;       // each entry: "_sN AS (SELECT ... FROM _sN-1)"
     int step_counter = 0;           // incremented per transformation command
     string current_source;          // original table/file for debugging
@@ -149,12 +149,12 @@ These prepend the full `WITH _s0 AS (...), _s1 AS (...), ...` then append their 
 ## Milestones
 
 ### M0: Scaffolding (rename template, build infrastructure)
-- Rename `waddle` → `stata_do` everywhere (CMakeLists.txt, extension_config.cmake, Makefile, source files, headers)
+- Rename `waddle` → `dodo` everywhere (CMakeLists.txt, extension_config.cmake, Makefile, source files, headers)
 - Remove OpenSSL dependency
-- Set up `StataDoParserExtension` + `StataDoOperatorExtension` skeleton (following prql pattern)
-- Set up `StataDoState` as `ClientContextState`
+- Set up `DodoParserExtension` + `DodoOperatorExtension` skeleton (following prql pattern)
+- Set up `DodoState` as `ClientContextState`
 - Verify it builds and loads (empty extension, no commands yet)
-- **Test:** `LOAD stata_do; SELECT 1;` works
+- **Test:** `LOAD dodo; SELECT 1;` works
 
 ### M1: `use` and `list` (the minimal loop)
 - Implement Stata command tokenizer: split input into `(command, arguments, condition, options)`
@@ -248,17 +248,17 @@ Stata has rich column metadata: variable labels (describing what a column is) an
 **Commands to implement:**
 
 1. **`label variable varname "label text"`**
-   - Store in per-connection state: `StataDoStateInfo.variable_labels[varname] = label`
+   - Store in per-connection state: `DodoStateInfo.variable_labels[varname] = label`
    - When `save` is called to a DuckLake catalog, emit `COMMENT ON COLUMN`
    - In the CTE chain: labels are metadata-only, no SQL step needed
    - Returns `SELECT 'OK'`
 
 2. **`label define labelname value1 "text1" value2 "text2" ...`**
-   - Store in state: `StataDoStateInfo.value_label_defs[labelname] = {val: text, ...}`
+   - Store in state: `DodoStateInfo.value_label_defs[labelname] = {val: text, ...}`
    - These define the mapping but don't attach it to a column yet
 
 3. **`label values varname labelname`**
-   - Store in state: `StataDoStateInfo.column_labels[varname] = labelname`
+   - Store in state: `DodoStateInfo.column_labels[varname] = labelname`
    - Attaches a value label definition to a specific column
 
 4. **`describe` (enhanced)**
@@ -275,9 +275,9 @@ Stata has rich column metadata: variable labels (describing what a column is) an
    - SQL: join with the value label definition
    - `generate decoded_var = decode(labelname, varname)` or automatic via the lookup
 
-**State changes to `StataDoStateInfo`:**
+**State changes to `DodoStateInfo`:**
 ```cpp
-struct StataDoStateInfo : public ParserExtensionInfo {
+struct DodoStateInfo : public ParserExtensionInfo {
     // ... existing CTE chain fields ...
 
     // Variable labels: column_name -> label text
@@ -347,7 +347,7 @@ Based on commands used in [korenmiklos/ceo-value](https://github.com/korenmiklos
 - **Test:** duplicates drop from edgelist.do, expand from ceo-panel.do
 
 ### M14: Local macros and loops
-- `local name value` → store in `StataDoStateInfo.local_macros[name] = value`
+- `local name value` → store in `DodoStateInfo.local_macros[name] = value`
 - `` `name' `` substitution → replace before command processing
 - `local name = expression` → evaluate expression (limited: numeric constants, `_N`)
 - `foreach var of local macroname { ... }` → unroll loop body for each value
@@ -416,7 +416,7 @@ Based on research of real-world usage in [korenmiklos/ceo-value](https://github.
 - `xtset panelvar timevar` → store panel structure in state
 - `tsset timevar` → store time-series structure (no panel var)
 - `tsset panelvar timevar` → same as `xtset` (Stata treats them identically)
-- State: `string panel_var`, `string time_var` in `StataDoStateInfo`
+- State: `string panel_var`, `string time_var` in `DodoStateInfo`
 
 **Time-series operators in expressions:**
 
@@ -551,14 +551,14 @@ Regex: `(\w+)\[_n\s*([+-]\s*\d+)\]` captures variable and offset.
 
 | File | Action |
 |---|---|
-| `CMakeLists.txt` | Rename to `stata_do`, remove OpenSSL |
-| `extension_config.cmake` | Rename to `stata_do` |
+| `CMakeLists.txt` | Rename to `dodo`, remove OpenSSL |
+| `extension_config.cmake` | Rename to `dodo` |
 | `Makefile` | Rename `EXT_NAME` |
-| `src/include/stata_do_extension.hpp` | Extension class + StataDoState + parser structs |
-| `src/stata_do_extension.cpp` | Extension registration (parser + operator) |
-| `src/stata_do_parser.cpp` | Stata command tokenizer and SQL generator |
-| `src/include/stata_do_parser.hpp` | Parser declarations |
-| `test/sql/stata_do.test` | Main test file |
+| `src/include/dodo_extension.hpp` | Extension class + DodoState + parser structs |
+| `src/dodo_extension.cpp` | Extension registration (parser + operator) |
+| `src/dodo_parser.cpp` | Stata command tokenizer and SQL generator |
+| `src/include/dodo_parser.hpp` | Parser declarations |
+| `test/sql/dodo.test` | Main test file |
 | `vcpkg.json` | Remove OpenSSL dependency |
 
 ---
@@ -569,7 +569,7 @@ Regex: `(\w+)\[_n\s*([+-]\s*\d+)\]` captures variable and offset.
 2. `make test` — all sqllogictest tests pass
 3. Manual test sequence:
    ```sql
-   LOAD stata_do;
+   LOAD dodo;
    use "test/data/firms.csv", clear;
    describe;
    keep if year == 2018;

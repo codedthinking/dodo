@@ -1,6 +1,6 @@
-# stata_do
+# dodo
 
-A DuckDB extension that lets you write Stata `.do` file commands directly in DuckDB. Commands are translated to SQL under the hood using a lazy CTE chain — nothing executes until you ask for results.
+Dodo is a DuckDB extension that lets you write Stata `.do` file commands directly in DuckDB. Commands are translated to SQL under the hood using a lazy CTE chain — nothing executes until you ask for results.
 
 Inspired by [Kezdi.jl](https://github.com/codedthinking/Kezdi.jl).
 
@@ -119,7 +119,7 @@ use "data/input.parquet", clear
 ## Building
 
 ```bash
-git clone --recurse-submodules https://github.com/korenmiklos/duckdb-stata-do.git
+git clone --recurse-submodules https://github.com/codedthinking/duckdb-stata-do.git
 cd duckdb-stata-do
 make release
 ./build/release/duckdb
