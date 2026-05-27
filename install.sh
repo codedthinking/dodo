@@ -77,14 +77,15 @@ main() {
         install_dir="$HOME/.local/bin"
         mkdir -p "$install_dir"
         install "$tmpdir/$BINARY" "$install_dir/$BINARY"
-        case ":$PATH:" in
-            *":$install_dir:"*) ;;
-            *) echo "note: add $install_dir to your PATH" ;;
-        esac
     fi
 
     echo "installed: $("$install_dir/$BINARY" --help 2>&1 | head -1)"
     echo "dodoc is ready at $install_dir/$BINARY"
+
+    case ":$PATH:" in
+        *":$install_dir:"*) ;;
+        *) echo "note: $install_dir is not in your PATH — add it to your shell profile" ;;
+    esac
 }
 
 main
