@@ -903,14 +903,14 @@ h1.doc-h1 .mono {
             <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="m9 6 6 6-6 6"/></svg>
           </summary>
           <ul class="sidebar__list">
-            <li><a href="#" onclick="return false">list</a></li>
-            <li><a href="#" onclick="return false">count</a></li>
-            <li><a href="#" onclick="return false">head / tail</a></li>
-            <li><a href="#" onclick="return false">describe</a></li>
-            <li><a href="#" onclick="return false">summarize</a></li>
-            <li><a href="#" onclick="return false">tabulate</a></li>
-            <li><a href="#" onclick="return false">history</a></li>
-            <li><a href="#" onclick="return false">show sql</a></li>
+            <li><a href="#list" data-page="list">list</a></li>
+            <li><a href="#count" data-page="count">count</a></li>
+            <li><a href="#head-tail" data-page="head-tail">head / tail</a></li>
+            <li><a href="#describe" data-page="describe">describe</a></li>
+            <li><a href="#summarize" data-page="summarize">summarize</a></li>
+            <li><a href="#tabulate" data-page="tabulate">tabulate</a></li>
+            <li><a href="#history" data-page="history">history</a></li>
+            <li><a href="#show-sql" data-page="show-sql">show sql</a></li>
           </ul>
         </details>
 
@@ -920,11 +920,11 @@ h1.doc-h1 .mono {
             <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="m9 6 6 6-6 6"/></svg>
           </summary>
           <ul class="sidebar__list">
-            <li><a href="#" onclick="return false">undo / redo</a></li>
-            <li><a href="#" onclick="return false">preserve / restore</a></li>
-            <li><a href="#" onclick="return false">tempfile</a></li>
-            <li><a href="#" onclick="return false">xtset / tsset</a></li>
-            <li><a href="#" onclick="return false">label</a></li>
+            <li><a href="#undo-redo" data-page="undo-redo">undo / redo</a></li>
+            <li><a href="#preserve-restore" data-page="preserve-restore">preserve / restore</a></li>
+            <li><a href="#tempfile" data-page="tempfile">tempfile</a></li>
+            <li><a href="#xtset-tsset" data-page="xtset-tsset">xtset / tsset</a></li>
+            <li><a href="#label" data-page="label">label</a></li>
           </ul>
         </details>
 
@@ -934,7 +934,7 @@ h1.doc-h1 .mono {
             <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="m9 6 6 6-6 6"/></svg>
           </summary>
           <ul class="sidebar__list">
-            <li><a href="#" onclick="return false">bysort / by</a></li>
+            <li><a href="#bysort" data-page="bysort">bysort / by</a></li>
           </ul>
         </details>
       </div>
@@ -2011,6 +2011,146 @@ _sN <span class="tok-kw">AS</span> (
         <div class="syntax"><span class="cmd">expand</span> <span class="req">n | count_col</span> [, <span class="opt">generate(</span><span class="req">indicator</span><span class="opt">)</span>]</div>
         <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">expand</span> <span class="tok-num">3</span>;                          <span class="tok-com">// triple every row</span>
 <span class="tok-cmd">expand</span> count, generate(copy);     <span class="tok-com">// variable expansion + indicator</span></code></pre></div>
+      </article>
+
+      <!-- ---------- page: list ---------- -->
+      <article class="page" id="page-list" data-screen-label="list command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">list</span></div>
+        <h1 class="doc-h1"><span class="mono">list</span></h1>
+        <p class="doc-lede">Show data. With no arguments, displays all rows and columns.</p>
+        <div class="syntax"><span class="cmd">list</span> [<span class="req">varlist</span>] [<span class="opt">if</span> <span class="req">condition</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">list</span>;
+<span class="tok-cmd">list</span> id revenue <span class="tok-kw">if</span> year <span class="tok-op">>=</span> <span class="tok-num">2020</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: count ---------- -->
+      <article class="page" id="page-count" data-screen-label="count command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">count</span></div>
+        <h1 class="doc-h1"><span class="mono">count</span></h1>
+        <p class="doc-lede">Count the number of rows, optionally restricted by a condition.</p>
+        <div class="syntax"><span class="cmd">count</span> [<span class="opt">if</span> <span class="req">condition</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">count</span>;
+<span class="tok-cmd">count</span> <span class="tok-kw">if</span> revenue <span class="tok-op">></span> <span class="tok-num">1000</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: head-tail ---------- -->
+      <article class="page" id="page-head-tail" data-screen-label="head / tail commands">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">head / tail</span></div>
+        <h1 class="doc-h1"><span class="mono">head</span> / <span class="mono">tail</span></h1>
+        <p class="doc-lede">Show the first or last N rows. Defaults to 10 if N is omitted.</p>
+        <div class="syntax"><span class="cmd">head</span> [<span class="req">n</span>]<br/><span class="cmd">tail</span> [<span class="req">n</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">head</span> <span class="tok-num">10</span>;
+<span class="tok-cmd">tail</span> <span class="tok-num">5</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: describe ---------- -->
+      <article class="page" id="page-describe" data-screen-label="describe command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">describe</span></div>
+        <h1 class="doc-h1"><span class="mono">describe</span></h1>
+        <p class="doc-lede">Show column names and types. Alias: <code>codebook</code>.</p>
+        <div class="syntax"><span class="cmd">describe</span><br/><span class="cmd">codebook</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">describe</span>;
+<span class="tok-cmd">codebook</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: summarize ---------- -->
+      <article class="page" id="page-summarize" data-screen-label="summarize command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">summarize</span></div>
+        <h1 class="doc-h1"><span class="mono">summarize</span></h1>
+        <p class="doc-lede">Compute summary statistics: N, mean, sd, min, p25, p50, p75, max.</p>
+        <div class="syntax"><span class="cmd">summarize</span> <span class="req">varname</span> [<span class="opt">if</span> <span class="req">condition</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">summarize</span> revenue;
+<span class="tok-cmd">summarize</span> revenue <span class="tok-kw">if</span> year <span class="tok-op">>=</span> <span class="tok-num">2020</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: tabulate ---------- -->
+      <article class="page" id="page-tabulate" data-screen-label="tabulate command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">tabulate</span></div>
+        <h1 class="doc-h1"><span class="mono">tabulate</span></h1>
+        <p class="doc-lede">Frequency table for one variable, or cross-tabulation for two.</p>
+        <div class="syntax"><span class="cmd">tabulate</span> <span class="req">var1</span> [<span class="req">var2</span>] [<span class="opt">if</span> <span class="req">condition</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">tabulate</span> sector;
+<span class="tok-cmd">tabulate</span> sector year;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: history ---------- -->
+      <article class="page" id="page-history" data-screen-label="history command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">history</span></div>
+        <h1 class="doc-h1"><span class="mono">history</span></h1>
+        <p class="doc-lede">Show the list of commands executed in the current session. Also queryable as <code>SELECT * FROM dodo._history</code>.</p>
+        <div class="syntax"><span class="cmd">history</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">history</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: undo-redo ---------- -->
+      <article class="page" id="page-undo-redo" data-screen-label="undo / redo commands">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">undo / redo</span></div>
+        <h1 class="doc-h1"><span class="mono">undo</span> / <span class="mono">redo</span></h1>
+        <p class="doc-lede">Roll back or re-apply transformations. A new transformation after <code>undo</code> clears the redo stack.</p>
+        <div class="syntax"><span class="cmd">undo</span> [<span class="req">n</span>]<br/><span class="cmd">redo</span> [<span class="req">n</span>]</div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">use</span> <span class="tok-str">"firms.csv"</span>, clear;
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> year <span class="tok-op">>=</span> <span class="tok-num">2020</span>;
+<span class="tok-cmd">generate</span> profit <span class="tok-op">=</span> revenue <span class="tok-op">-</span> cost;
+<span class="tok-cmd">undo</span>;        <span class="tok-com">// removes generate</span>
+<span class="tok-cmd">redo</span>;        <span class="tok-com">// restores generate</span>
+<span class="tok-cmd">undo</span> <span class="tok-num">2</span>;      <span class="tok-com">// rolls back two steps</span></code></pre></div>
+      </article>
+
+      <!-- ---------- page: preserve-restore ---------- -->
+      <article class="page" id="page-preserve-restore" data-screen-label="preserve / restore commands">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">preserve / restore</span></div>
+        <h1 class="doc-h1"><span class="mono">preserve</span> / <span class="mono">restore</span></h1>
+        <p class="doc-lede">Save a checkpoint of the current dataset and restore it later.</p>
+        <div class="syntax"><span class="cmd">preserve</span><br/><span class="cmd">restore</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">preserve</span>;
+<span class="tok-cmd">drop</span> <span class="tok-kw">if</span> revenue <span class="tok-op"><</span> <span class="tok-num">100</span>;
+<span class="tok-cmd">list</span>;
+<span class="tok-cmd">restore</span>;
+<span class="tok-cmd">list</span>;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: tempfile ---------- -->
+      <article class="page" id="page-tempfile" data-screen-label="tempfile command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">tempfile</span></div>
+        <h1 class="doc-h1"><span class="mono">tempfile</span></h1>
+        <p class="doc-lede">Register a name for temporary in-memory storage. Use with <code>save</code> and <code>use</code> to stash and retrieve intermediate datasets.</p>
+        <div class="syntax"><span class="cmd">tempfile</span> <span class="req">name</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">tempfile</span> cleaned;
+<span class="tok-cmd">save</span> cleaned, replace;
+<span class="tok-com">// ... other work ...</span>
+<span class="tok-cmd">use</span> cleaned, clear;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: xtset-tsset ---------- -->
+      <article class="page" id="page-xtset-tsset" data-screen-label="xtset / tsset commands">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">xtset / tsset</span></div>
+        <h1 class="doc-h1"><span class="mono">xtset</span> / <span class="mono">tsset</span></h1>
+        <p class="doc-lede">Declare panel or time-series structure to enable <code>L.</code>, <code>F.</code>, and <code>D.</code> lag/lead/difference operators.</p>
+        <div class="syntax"><span class="cmd">xtset</span> <span class="req">panelvar</span> <span class="req">timevar</span><br/><span class="cmd">tsset</span> <span class="req">timevar</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">xtset</span> firm_id year;
+<span class="tok-cmd">generate</span> lag_rev <span class="tok-op">=</span> L.revenue;
+<span class="tok-cmd">generate</span> diff <span class="tok-op">=</span> D.revenue;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: label ---------- -->
+      <article class="page" id="page-label" data-screen-label="label command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">label</span></div>
+        <h1 class="doc-h1"><span class="mono">label</span></h1>
+        <p class="doc-lede">Attach metadata to columns and values.</p>
+        <div class="syntax"><span class="cmd">label variable</span> <span class="req">varname</span> <span class="req">"text"</span><br/><span class="cmd">label define</span> <span class="req">name</span> <span class="req">val</span> <span class="req">"text"</span> ...<br/><span class="cmd">label values</span> <span class="req">var</span> <span class="req">labelname</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">label variable</span> revenue <span class="tok-str">"Annual revenue (USD)"</span>;
+<span class="tok-cmd">label define</span> sector_lbl <span class="tok-num">1</span> <span class="tok-str">"Manufacturing"</span> <span class="tok-num">2</span> <span class="tok-str">"Services"</span>;
+<span class="tok-cmd">label values</span> sector sector_lbl;</code></pre></div>
+      </article>
+
+      <!-- ---------- page: bysort ---------- -->
+      <article class="page" id="page-bysort" data-screen-label="bysort / by command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><span class="cur">bysort / by</span></div>
+        <h1 class="doc-h1"><span class="mono">bysort</span> / <span class="mono">by</span></h1>
+        <p class="doc-lede">Run a command within groups defined by one or more variables.</p>
+        <div class="syntax"><span class="cmd">bysort</span> <span class="req">vars</span> [(<span class="req">sort_vars</span>)]: <span class="req">command</span><br/><span class="cmd">by</span> <span class="req">vars</span>: <span class="req">command</span></div>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div><pre><code><span class="tok-cmd">bysort</span> sector (year): <span class="tok-cmd">generate</span> row <span class="tok-op">=</span> _n;
+<span class="tok-cmd">bysort</span> firm_id (year): <span class="tok-cmd">generate</span> cum_rev <span class="tok-op">=</span> <span class="tok-fn">sum</span>(revenue);</code></pre></div>
       </article>
 
       <!-- ---------- page: show-sql ---------- -->
