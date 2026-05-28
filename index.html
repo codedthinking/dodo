@@ -945,19 +945,19 @@ h1.doc-h1 .mono {
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
           expression translation
         </a>
-        <a class="sidebar__direct" href="#" onclick="return false">
+        <a class="sidebar__direct" href="#do-files" data-page="do-files">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
           running .do files
         </a>
-        <a class="sidebar__direct" href="#" onclick="return false">
+        <a class="sidebar__direct" href="#ui-integration" data-page="ui-integration">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><rect x="3" y="3" width="18" height="18" rx="0"/><path d="M9 9h6v6H9z"/></svg>
           duckdb ui integration
         </a>
-        <a class="sidebar__direct" href="#" onclick="return false">
+        <a class="sidebar__direct" href="#migration" data-page="migration">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="M3 12h6l3 8 3-16 3 8h3"/></svg>
-          migrating from stata
+          migration guide
         </a>
-        <a class="sidebar__direct" href="#" onclick="return false">
+        <a class="sidebar__direct" href="#limitations" data-page="limitations">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
           known limitations
         </a>
@@ -1758,6 +1758,135 @@ _sN <span class="tok-kw">AS</span> (
             <span class="ttl">merge</span>
           </a>
         </div>
+      </article>
+
+      <!-- ---------- page: do-files ---------- -->
+      <article class="page" id="page-do-files" data-screen-label="running .do files">
+        <div class="crumbs">
+          <a href="#getting-started" data-page="getting-started">docs</a>
+          <span class="sep">/</span>
+          <a href="#" onclick="return false">guides</a>
+          <span class="sep">/</span>
+          <span class="cur">running .do files</span>
+        </div>
+
+        <h1 class="doc-h1">Running .do files</h1>
+        <p class="doc-lede"><code>.do</code> files use newlines instead of semicolons. Each line is one command. All standard comment styles work.</p>
+
+        <h2 id="df-comments">comments and continuation</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span><span class="codeblock__title">// analysis/clean.do</span></div>
+<pre><code><span class="tok-com">* This is a line comment</span>
+<span class="tok-com">// This is also a comment</span>
+<span class="tok-com">/* This is a
+   block comment */</span>
+
+<span class="tok-cmd">use</span> <span class="tok-str">"data.csv"</span>, clear
+
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> year <span class="tok-op">>=</span> <span class="tok-num">2020</span>   <span class="tok-com">// inline comment</span>
+<span class="tok-cmd">generate</span> profit <span class="tok-op">=</span> <span class="tok-com">///</span>
+    revenue <span class="tok-op">-</span> cost     <span class="tok-com">// line continuation with ///</span></code></pre></div>
+
+        <h2 id="df-run">running a script</h2>
+        <p>From any DuckDB session:</p>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">sql</span></div>
+<pre><code><span class="tok-cmd">do</span> <span class="tok-str">"analysis/clean.do"</span>;
+<span class="tok-cmd">list</span>;    <span class="tok-com">-- inspect results after the script runs</span></code></pre></div>
+
+        <h2 id="df-terminal">terminal commands are skipped</h2>
+        <p>Inside <code>.do</code> files, terminal commands like <code>list</code>, <code>count</code>, <code>summarize</code>, and <code>tabulate</code> are skipped. They are meant for interactive use &mdash; run them after the script finishes. Transformation and side-effect commands (<code>keep</code>, <code>generate</code>, <code>save</code>, <code>export</code>) execute normally.</p>
+
+        <h2 id="df-dodoc">standalone compilation</h2>
+        <p>The <a href="#dodoc-overview" data-page="dodoc-overview" style="color:var(--accent-deep);font-weight:600;">dodoc compiler</a> translates <code>.do</code> files to SQL without DuckDB. Pipe from stdin or pass a file:</p>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">bash</span></div>
+<pre><code>dodoc analysis/clean.do <span class="tok-op">></span> clean.sql
+cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-o</span> clean.sql</code></pre></div>
+      </article>
+
+      <!-- ---------- page: ui-integration ---------- -->
+      <article class="page" id="page-ui-integration" data-screen-label="DuckDB UI integration">
+        <div class="crumbs">
+          <a href="#getting-started" data-page="getting-started">docs</a>
+          <span class="sep">/</span>
+          <a href="#" onclick="return false">guides</a>
+          <span class="sep">/</span>
+          <span class="cur">DuckDB UI integration</span>
+        </div>
+
+        <h1 class="doc-h1">DuckDB UI integration</h1>
+        <p class="doc-lede">dodo can push live data into the DuckDB UI so you see results update as you type commands.</p>
+
+        <h2 id="ui-live">live view</h2>
+        <p>Enable the live view and dodo creates a <code>_dodo_data</code> view after each transformation. The DuckDB UI data panel auto-refreshes when this view changes.</p>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">sql</span></div>
+<pre><code><span class="tok-kw">SET</span> dodo_live_view <span class="tok-op">=</span> <span class="tok-kw">true</span>;
+<span class="tok-cmd">use</span> <span class="tok-str">"firms.csv"</span>, clear;
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> year <span class="tok-op">>=</span> <span class="tok-num">2020</span>;   <span class="tok-com">-- _dodo_data updates automatically</span></code></pre></div>
+
+        <h2 id="ui-history">history table</h2>
+        <p>When data is materialized, <code>dodo._history</code> records every command and its undo status. Query it directly or view it in the UI sidebar.</p>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">sql</span></div>
+<pre><code><span class="tok-kw">SELECT</span> <span class="tok-op">*</span> <span class="tok-kw">FROM</span> dodo._history;</code></pre></div>
+
+        <h2 id="ui-show">inspecting generated SQL</h2>
+        <p>Use <code>show sql</code> to see the full formatted query with <code>-- [source]</code> comments. Control formatting with <code>SET dodo_format_sql</code> and <code>SET dodo_sql_comments</code>.</p>
+      </article>
+
+      <!-- ---------- page: migration ---------- -->
+      <article class="page" id="page-migration" data-screen-label="migration guide">
+        <div class="crumbs">
+          <a href="#getting-started" data-page="getting-started">docs</a>
+          <span class="sep">/</span>
+          <a href="#" onclick="return false">guides</a>
+          <span class="sep">/</span>
+          <span class="cur">migration guide</span>
+        </div>
+
+        <h1 class="doc-h1">Migration guide</h1>
+        <p class="doc-lede">Moving an existing <code>.do</code> workflow to dodo. Most scripts work with minor adjustments.</p>
+
+        <h2 id="mig-compat">what works</h2>
+        <p>The core data-manipulation verbs &mdash; <code>use</code>, <code>keep</code>, <code>drop</code>, <code>generate</code>, <code>replace</code>, <code>rename</code>, <code>sort</code>, <code>egen</code>, <code>collapse</code>, <code>reshape</code>, <code>merge</code>, <code>append</code> &mdash; use the same syntax. Expression functions like <code>log()</code>, <code>missing()</code>, <code>cond()</code>, <code>inrange()</code>, and time-series operators (<code>L.</code>, <code>F.</code>, <code>D.</code>) translate directly. See <a href="#expressions" data-page="expressions" style="color:var(--accent-deep);font-weight:600;">expression translation</a> for the full mapping.</p>
+
+        <h2 id="mig-semicolons">semicolons</h2>
+        <p>In the DuckDB REPL, every statement needs a trailing semicolon. Inside <code>.do</code> files, semicolons are optional &mdash; newlines delimit commands, just like the original.</p>
+
+        <h2 id="mig-data">data formats</h2>
+        <p>dodo reads CSV, Parquet, and JSON natively. For <code>.dta</code> files, install the <code>stata_scanner</code> DuckDB extension &mdash; dodo will use <code>st_read()</code> automatically when it sees a <code>.dta</code> extension.</p>
+
+        <h2 id="mig-programs">unsupported features</h2>
+        <p>dodo does not support user-defined programs (<code>program define</code>), macros (<code>local</code>/<code>global</code>), loops (<code>forvalues</code>, <code>foreach</code>), or matrix operations (<code>mata</code>). These are programming constructs with no SQL equivalent. If your script uses them, refactor the logic into SQL or a host language (Python, R) and use dodo for the data-manipulation parts.</p>
+
+        <h2 id="mig-keywords">keyword conflicts</h2>
+        <p><code>describe</code> and <code>summarize</code> are also SQL keywords. dodo handles the conflict automatically when data is loaded &mdash; the commands route to dodo, not to DuckDB's <code>DESCRIBE</code>/<code>SUMMARIZE</code>. Use <code>codebook</code> as an unambiguous alias for <code>describe</code> if you prefer.</p>
+      </article>
+
+      <!-- ---------- page: limitations ---------- -->
+      <article class="page" id="page-limitations" data-screen-label="known limitations">
+        <div class="crumbs">
+          <a href="#getting-started" data-page="getting-started">docs</a>
+          <span class="sep">/</span>
+          <a href="#" onclick="return false">guides</a>
+          <span class="sep">/</span>
+          <span class="cur">known limitations</span>
+        </div>
+
+        <h1 class="doc-h1">Known limitations</h1>
+        <p class="doc-lede">dodo covers the most common data-manipulation commands. Here is what it does not do yet.</p>
+
+        <h2 id="lim-lang">programming constructs</h2>
+        <p>No support for <code>local</code>/<code>global</code> macros, <code>forvalues</code>/<code>foreach</code> loops, <code>program define</code>, <code>if</code>/<code>else</code> control flow, or <code>mata</code>. These have no SQL equivalent. Use a host language for scripting and dodo for data steps.</p>
+
+        <h2 id="lim-dta">.dta files</h2>
+        <p>Reading <code>.dta</code> files requires the <code>stata_scanner</code> DuckDB community extension. Install it with <code>INSTALL stata_scanner FROM community;</code>. dodo detects the <code>.dta</code> extension and calls <code>st_read()</code> automatically.</p>
+
+        <h2 id="lim-mvencode">mvencode _all</h2>
+        <p><code>mvencode _all, mv(0)</code> is not yet supported. List column names explicitly instead.</p>
+
+        <h2 id="lim-reshape">reshape wide</h2>
+        <p><code>reshape wide</code> currently supports one value variable. Multiple value variables in a single <code>reshape wide</code> are not yet implemented. As a workaround, reshape one variable at a time and merge.</p>
+
+        <h2 id="lim-keyword">keyword conflicts</h2>
+        <p><code>describe</code> and <code>summarize</code> are SQL keywords. dodo intercepts them when data is loaded, but if no dataset is in memory, they fall through to DuckDB's native behavior. Use <code>codebook</code> instead of <code>describe</code> for an unambiguous alternative.</p>
       </article>
 
       <!-- ---------- pages: save / append / import / export / do / clear / drop / etc — stub redirect to getting-started ---------- -->
