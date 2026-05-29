@@ -1,46 +1,48 @@
-# Missing Stata Commands in Dodo
+# Missing Commands in dodo
 
-Inventory of Stata commands used in [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create) but not yet implemented in the Dodo extension.
+Inventory based on [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create). Updated May 2026 for v0.2.0.
 
-## Critical (used in nearly every file)
+## Implemented (v0.2.0)
+
+These were previously listed as missing but are now complete:
+
+- `merge` (1:1, m:1, 1:m, m:m) with `keep()`, `keepusing()`, `nogenerate`
+- `bysort`/`by` prefix with partition and sort vars
+- `xtset`/`tsset` + `L.`/`F.`/`D.` gap-aware lag/lead operators
+- `tempfile`, `preserve`/`restore`
+- `duplicates drop` (all columns or by varlist)
+- `expand` with optional `generate()`
+- `import delimited`, `export delimited`
+- `inrange()`, `inlist()`, `cond()`, `substr()`, `real()`, `int()`
+- `strlower()`, `strupper()`, `strtrim()`, `strlen()`
+- Running `sum()` in `bysort:` context
+- `label variable`, `label define`, `label values`, `label list`
+- `reshape long` and `reshape wide`
+- `mvencode`
+- `undo`/`redo`, `history`
+- `show sql`
+- `var[_n-1]` subscript syntax (positional lag/lead)
+
+## Still missing
+
+### Critical
 
 | Gap | Usage | SQL mapping |
 |---|---|---|
-| `merge` (1:1, m:1, m:m) | Joins between datasets | DuckDB JOIN |
 | Local macros (`local x = ...`, `` `x' ``) | Variable substitution | String replacement in parser |
 | `foreach` / `forvalues` loops | Repeated operations | Unroll in parser |
-| `tempfile` + `preserve`/`restore` | Intermediate data stacks | Stack of CTE chains in state |
-| `bysort var1 (var2):` prefix | Sort-within-group for generate | `OVER (PARTITION BY var1 ORDER BY var2)` |
-| `xtset` + `L.`/`F.` lag/lead | Panel data operators | `LAG()/LEAD() OVER (PARTITION BY id ORDER BY t)` |
 
-## Important (used in multiple files)
+These are programming constructs, not data commands. They require a pre-processing pass before command tokenization.
 
-| Gap | Usage | SQL mapping |
+### Nice to have
+
+| Gap | Usage | Notes |
 |---|---|---|
-| `duplicates drop` | Dedup rows | `SELECT DISTINCT` |
-| `expand N` | Replicate rows | `GENERATE_SERIES` + cross join |
-| `joinby` | Many-to-many merge | `CROSS JOIN` or unrestricted `JOIN` |
-| `export delimited` | Write CSV | `COPY ... TO` (like `save`) |
-| `import delimited` | Read CSV | Already works via `use` |
-| `inrange()`, `inlist()` | Filter expressions | `BETWEEN` and `IN` |
-| `cond()` | Ternary expression | `CASE WHEN` |
-| `substr()`, `real()` | String functions | `SUBSTRING`, `CAST` |
-| Running `sum()` in `bysort:` | Cumulative sum | `SUM() OVER (ORDER BY ...)` |
-
-## Nice to have (specialized)
-
-| Gap | Usage |
-|---|---|
-| `reghdfe` | High-dimensional FE regression (third-party) |
-| `scalar`, `display`, `assert` | Scripting/debugging |
-| `recode` | Value recoding |
-| `set seed`, `set obs` | Simulation setup |
-| `args`, `confirm` | Script arguments |
-| `compress` | No-op in DuckDB (no storage types to optimize) |
-
-## Already partially working
-
-- `cond()` — planned but not yet in expression translator
-- `collapse (firstnm)/(count)/(min)/(max)` — count/min/max work, firstnm needs adding
-- `label define` with many pairs — already works
-- `reshape wide` with `j()` — already works
+| `joinby` | Many-to-many merge | Could use `CROSS JOIN` or unrestricted `JOIN` |
+| `reghdfe` / `regress` | Regression | Needs stats extension or custom implementation |
+| `recode` | Value recoding | `CASE WHEN` chains |
+| `scalar`, `display`, `assert` | Scripting/debugging | Low priority |
+| `set seed` | Simulation setup | `SELECT setseed(N)` |
+| `compress` | No-op | DuckDB doesn't need this |
+| `mvencode _all` | Replace all missing | Needs column introspection at runtime |
+| `reshape wide` with multiple value vars | Multi-var pivot | Currently supports one value variable |

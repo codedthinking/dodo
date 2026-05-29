@@ -22,7 +22,10 @@ docs:
   extended_description: |
     dodo reads .do file commands and executes them on DuckDB's analytical
     engine. Supports data manipulation (keep, drop, generate, replace,
-    rename, sort, egen, collapse, reshape, merge), inspection (list, count,
-    summarize, tabulate, describe, history), state management (undo, redo,
-    preserve, restore), and I/O (use, save, append, import/export delimited).
-    Run .do files directly with `do "script.do"`. Inspired by Kezdi.jl.
+    rename, sort, egen, collapse, reshape, merge, duplicates, expand),
+    inspection (list, count, summarize, tabulate, describe, history, show sql),
+    state management (undo, redo, preserve, restore, tempfile), panel data
+    (xtset, tsset, L./F./D. operators), and I/O (use, save, append,
+    import/export delimited). Run .do files with `do "script.do"`.
+    The standalone `dodoc` compiler translates .do files to formatted SQL
+    without requiring DuckDB. Inspired by Kezdi.jl.

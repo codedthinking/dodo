@@ -659,33 +659,78 @@ Shows the full history including undone steps, so users can see what happened.
 
 ---
 
-## Files to Create/Modify
+## Current Source Structure (v0.2.0)
 
-| File | Action |
-|---|---|
-| `CMakeLists.txt` | Rename to `dodo`, remove OpenSSL |
-| `extension_config.cmake` | Rename to `dodo` |
-| `Makefile` | Rename `EXT_NAME` |
-| `src/include/dodo_extension.hpp` | Extension class + DodoState + parser structs |
-| `src/dodo_extension.cpp` | Extension registration (parser + operator) |
-| `src/dodo_parser.cpp` | Stata command tokenizer and SQL generator |
-| `src/include/dodo_parser.hpp` | Parser declarations |
-| `test/sql/dodo.test` | Main test file |
-| `vcpkg.json` | Remove OpenSSL dependency |
+The codebase is split into three modules:
+
+| Directory | Purpose | DuckDB dependency? |
+|---|---|---|
+| `src/core/` | Compiler: tokenizer, expression translator, command processor, SQL formatter, state | No |
+| `src/extension/` | DuckDB glue: parser hooks, planner redirect, option registration | Yes |
+| `src/cli/` | `dodoc` standalone compiler (reads stdin/.do files, writes SQL to stdout) | No |
+| `src/include/` | Copies of headers for build system compatibility | — |
+
+Key files:
+- `src/core/dodo_core.hpp` — `DodoState`, `DodoCommand`, free function declarations
+- `src/core/dodo_core.cpp` — all command processing, expression translation, SQL formatting
+- `src/core/string_utils.hpp` — standalone string utilities (no DuckDB dependency)
+- `src/extension/dodo_extension.hpp` — `DodoStateInfo` (wraps `DodoState` with DuckDB interfaces)
+- `src/extension/dodo_extension.cpp` — parser/planner/operator registration, live view, history table
+- `src/cli/dodoc.cpp` — CLI compiler entry point
+- `test/sql/dodo.test` — sqllogictest suite (920+ assertions)
+
+## Milestone Status
+
+| Milestone | Description | Status |
+|---|---|---|
+| M0 | Scaffolding | Done |
+| M1 | `use` and `list` | Done |
+| M2 | `keep`, `drop`, `rename` | Done |
+| M3 | `generate`, `replace`, expressions | Done |
+| M4 | `sort`, `order`, `count`, `describe`, `head`, `tail` | Done |
+| M5 | `egen`, `collapse` with `by()` | Done |
+| M5.5 | `do "script.do"` | Done |
+| M6 | `summarize`, `tabulate` | Done |
+| M7 | `save`, `append`, `mvencode` | Done |
+| M8 | `reshape` (long + wide) | Done |
+| M9 | `regress` | Not started (stretch goal) |
+| M9.5 | Labels and `describe` | Done |
+| M10 | Polish, community extension, CI | Done |
+| M11 | Expression functions (`cond`, `inrange`, `inlist`, etc.) | Done |
+| M12 | `merge` | Done |
+| M13 | `duplicates drop`, `expand`, `export`/`import delimited` | Done |
+| M14 | Local macros and loops | **Not started** |
+| M15 | `save` to tables, `tempfile`, `preserve`/`restore` | Done |
+| M16 | `xtset`/`tsset` + `L.`/`F.`/`D.` | Done |
+| M17 | `bysort` prefix, `var[_n-1]` | Done |
+| M18 | `undo`/`redo`, `history` | Done |
+| M19 | Polish phase 2 | Partial |
+
+### Added in v0.2.0 (not in original plan)
+
+- **`dodoc` standalone compiler** (`src/cli/`) — translates .do to SQL without DuckDB
+- **SQL formatting** — formatted output with indentation and `-- [source]` comments
+- **`show sql` command** — displays the generated SQL for the current CTE chain
+- **Settings**: `dodo_format_sql`, `dodo_sql_comments`, `dodo_live_view`
+- **Core/extension/cli module split** — compiler is DuckDB-independent
+
+## Next: Pipeline Execution Model
+
+See `docs/DBT_RESEARCH.md` for research on bipartite DAG execution, build system taxonomy, and materialization strategies. This is the foundation for dodo Studio's pipeline features (Benefit 4 in `docs/BENEFITS.md`).
 
 ---
 
 ## Verification
 
 1. `make` — builds successfully
-2. `make test` — all sqllogictest tests pass
-3. Manual test sequence:
+2. `./build/release/test/unittest --test-dir . "test/sql/dodo.test"` — 920+ assertions pass
+3. `echo 'use "data.csv", clear' | ./build/release/extension/dodo/dodoc` — compiler works
+4. Manual test:
    ```sql
    LOAD dodo;
    use "test/data/firms.csv", clear;
-   describe;
-   keep if year == 2018;
-   generate ln_rev = log(revenue);
-   summarize ln_rev;
+   keep if year >= 2018;
+   generate ln_revenue = log(revenue);
+   show sql;
    list;
    ```
