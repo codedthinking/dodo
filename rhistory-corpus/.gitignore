@@ -1,0 +1,5 @@
+data/raw_rhistory/
+data/*.jsonl
+.env
+__pycache__/
+*.pyc
