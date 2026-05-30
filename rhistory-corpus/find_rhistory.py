@@ -107,37 +107,30 @@ def search_code(
 
 def fetch_file_content(
     token: str | None,
+    git_url: str,
     owner: str,
     repo: str,
     path: str,
-    ref: str,
 ) -> tuple[str | None, dict[str, Any]]:
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+    # Use the git blob URL from the search result — it works even when the
+    # file has been removed from the default branch since indexing.
     try:
-        data = gh_get(url, token, {"ref": ref})
-    except HTTPError as e:
-        print(f"  Could not fetch {owner}/{repo}/{path}: HTTP {e.code}", file=sys.stderr)
+        data = gh_get(git_url, token)
+    except (HTTPError, Exception) as e:
+        code = getattr(e, "code", type(e).__name__)
+        print(f"  Could not fetch {owner}/{repo}/{path}: {code}", file=sys.stderr)
         return None, {}
 
     if not isinstance(data, dict):
         return None, {}
 
     content_b64 = data.get("content")
-    if content_b64:
+    encoding = data.get("encoding", "")
+    if content_b64 and encoding == "base64":
+        # blob content may contain newlines within the base64
         raw_bytes = base64.b64decode(content_b64)
         text = raw_bytes.decode("utf-8", errors="replace")
         return text, data
-
-    download_url = data.get("download_url")
-    if download_url:
-        req = Request(download_url, headers=_headers(token))
-        try:
-            with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                raw_bytes = resp.read()
-                text = raw_bytes.decode("utf-8", errors="replace")
-                return text, data
-        except HTTPError:
-            pass
 
     return None, data
 
@@ -201,6 +194,12 @@ def main() -> None:
         help="Results per page (default: 100)",
     )
     parser.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="First page to fetch (default: 1)",
+    )
+    parser.add_argument(
         "--query-extra",
         default="",
         help="Extra GitHub search qualifiers",
@@ -240,8 +239,8 @@ def main() -> None:
     checked = 0
     kept = 0
 
-    with open(out_path, "w", encoding="utf-8") as fout:
-        for page in range(1, args.max_pages + 1):
+    with open(out_path, "a", encoding="utf-8") as fout:
+        for page in range(args.start_page, args.start_page + args.max_pages):
             print(f"Searching page {page}: {query}", file=sys.stderr)
             items = search_code(token, query, page, args.per_page)
 
@@ -262,7 +261,11 @@ def main() -> None:
 
                 checked += 1
 
-                text, content_obj = fetch_file_content(token, owner, repo_name, path, sha)
+                git_url = item.get("git_url", "")
+                if not git_url:
+                    continue
+
+                text, content_obj = fetch_file_content(token, git_url, owner, repo_name, path)
 
                 if text is None:
                     continue
@@ -284,7 +287,7 @@ def main() -> None:
                     "path": path,
                     "sha": sha,
                     "html_url": item["html_url"],
-                    "git_url": content_obj.get("git_url", ""),
+                    "git_url": git_url,
                     "size_bytes": len(text.encode("utf-8")),
                     "line_count": len(lines),
                     "nonblank_line_count": sum(1 for l in lines if l.strip()),
