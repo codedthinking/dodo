@@ -1,5 +1,6 @@
 data/raw_rhistory/
 data/*.jsonl
+data/*.csv
 .env
 __pycache__/
 *.pyc

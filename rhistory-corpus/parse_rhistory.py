@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Parse .Rhistory files into per-command JSONL records.
+"""Parse .Rhistory files into normalized CSV tables.
 
 Steps:
   1. Strip comments.
   2. Join continuation lines (unclosed parens/brackets/braces, trailing
      pipes, trailing operators).
-  3. Split compound statements (semicolons, braces at statement boundaries).
+  3. Split compound statements (semicolons at statement boundaries).
   4. Extract every function call from each logical line.
-  5. Write one JSONL record per source file.
+  5. Write three CSV files:
+       files.csv          - one row per .Rhistory file
+       commands.csv       - one row per command invocation (FK: file_id)
+       function_calls.csv - one row per function call    (FK: file_id, command_index)
 
 Usage:
-  python parse_rhistory.py --raw-dir data/raw_rhistory --out data/parsed.jsonl
+  python parse_rhistory.py --raw-dir data/raw_rhistory --out-dir data
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -311,7 +315,7 @@ def parse_rhistory(text: str) -> list[dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Parse .Rhistory files into per-command JSONL records."
+        description="Parse .Rhistory files into normalized CSV tables."
     )
     parser.add_argument(
         "--raw-dir",
@@ -319,9 +323,9 @@ def main() -> None:
         help="Directory containing raw .Rhistory files",
     )
     parser.add_argument(
-        "--out",
-        default="parsed.jsonl",
-        help="Output JSONL path (default: parsed.jsonl)",
+        "--out-dir",
+        default=".",
+        help="Output directory for CSV files (default: current directory)",
     )
     parser.add_argument(
         "--index",
@@ -331,8 +335,8 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_dir = Path(args.raw_dir)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load index if provided, keyed by raw_file.
     index_map: dict[str, dict[str, Any]] = {}
@@ -344,12 +348,37 @@ def main() -> None:
                 if rf:
                     index_map[rf] = rec
 
-    files = sorted(raw_dir.glob("*.Rhistory"))
+    files_path = out_dir / "files.csv"
+    commands_path = out_dir / "commands.csv"
+    calls_path = out_dir / "function_calls.csv"
+
+    files_sorted = sorted(raw_dir.glob("*.Rhistory"))
     total_commands = 0
+    total_calls = 0
     total_files = 0
 
-    with open(out_path, "w", encoding="utf-8") as fout:
-        for fpath in files:
+    with (
+        open(files_path, "w", newline="", encoding="utf-8") as f_files,
+        open(commands_path, "w", newline="", encoding="utf-8") as f_cmds,
+        open(calls_path, "w", newline="", encoding="utf-8") as f_calls,
+    ):
+        w_files = csv.writer(f_files)
+        w_cmds = csv.writer(f_cmds)
+        w_calls = csv.writer(f_calls)
+
+        w_files.writerow([
+            "file_id", "source_file", "owner", "repo", "repo_full_name",
+        ])
+        w_cmds.writerow([
+            "file_id", "command_index", "primary_function",
+            "has_pipe", "pipe_type", "has_assignment", "assignment_target",
+        ])
+        w_calls.writerow([
+            "file_id", "command_index", "call_order", "function_name",
+        ])
+
+        file_id = 0
+        for fpath in files_sorted:
             text = fpath.read_text(encoding="utf-8", errors="replace")
             commands = parse_rhistory(text)
             if not commands:
@@ -358,28 +387,49 @@ def main() -> None:
             source_id = fpath.name
             meta = index_map.get(source_id, {})
 
-            record = {
-                "source_file": source_id,
-                "owner": meta.get("owner", ""),
-                "repo": meta.get("repo", ""),
-                "repo_full_name": meta.get("repo_full_name", ""),
-                "command_count": len(commands),
-                "commands": commands,
-            }
-            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+            w_files.writerow([
+                file_id,
+                source_id,
+                meta.get("owner", ""),
+                meta.get("repo", ""),
+                meta.get("repo_full_name", ""),
+            ])
+
+            for cmd in commands:
+                cmd_idx = cmd["command_index"]
+                w_cmds.writerow([
+                    file_id,
+                    cmd_idx,
+                    cmd.get("primary_function", ""),
+                    cmd["has_pipe"],
+                    cmd.get("pipe_type", ""),
+                    cmd["has_assignment"],
+                    cmd.get("assignment_target", ""),
+                ])
+                for call_order, fn_name in enumerate(cmd["functions"]):
+                    w_calls.writerow([file_id, cmd_idx, call_order, fn_name])
+                    total_calls += 1
+
+                total_commands += 1
+
             total_files += 1
-            total_commands += len(commands)
+            file_id += 1
 
             if total_files % 100 == 0:
                 print(
-                    f"Processed {total_files} files, {total_commands} commands",
+                    f"Processed {total_files} files, {total_commands} commands, "
+                    f"{total_calls} function calls",
                     file=sys.stderr,
                 )
 
     print(
-        f"Done. {total_files} files, {total_commands} commands. Output: {out_path}",
+        f"Done. {total_files} files, {total_commands} commands, "
+        f"{total_calls} function calls.",
         file=sys.stderr,
     )
+    print(f"  {files_path}", file=sys.stderr)
+    print(f"  {commands_path}", file=sys.stderr)
+    print(f"  {calls_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
