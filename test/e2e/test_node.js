@@ -1,11 +1,11 @@
-// E2E test: Node.js duckdb client with dodo extension
-const duckdb = require("duckdb");
+// E2E test: Node.js @duckdb/node-api client with dodo extension
+const { DuckDBInstance } = require("@duckdb/node-api");
 const path = require("path");
 const fs = require("fs");
 const yaml = require("js-yaml");
 
 const PROJECT_DIR = path.resolve(__dirname, "..", "..");
-const EXT_PATH = path.join(
+const EXT_PATH = process.env.DODO_EXT_PATH || path.join(
   PROJECT_DIR, "build", "release", "extension", "dodo", "dodo.duckdb_extension",
 );
 const DATA_DIR = path.join(PROJECT_DIR, "test", "data");
@@ -16,35 +16,30 @@ if (!fs.existsSync(EXT_PATH)) {
   process.exit(1);
 }
 
-function freshConn() {
-  return new Promise((resolve, reject) => {
-    const db = new duckdb.Database(":memory:", {
-      allow_unsigned_extensions: "true",
-    });
-    const con = db.connect();
-    con.run(`LOAD '${EXT_PATH}'`, (err) => {
-      if (err) reject(err);
-      else resolve({ db, con });
-    });
+async function freshConn() {
+  const instance = await DuckDBInstance.create(":memory:", {
+    allow_unsigned_extensions: "true",
   });
+  const conn = await instance.connect();
+  await conn.run(`LOAD '${EXT_PATH}'`);
+  return conn;
 }
 
-function exec(con, sql) {
-  return new Promise((resolve, reject) => {
-    con.run(sql, (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
-}
-
-function query(con, sql) {
-  return new Promise((resolve, reject) => {
-    con.all(sql, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
+async function getRows(result) {
+  const names = result.columnNames();
+  const rows = [];
+  for (let ci = 0; ci < result.chunkCount; ci++) {
+    const chunk = result.getChunk(ci);
+    for (let r = 0; r < chunk.rowCount; r++) {
+      const row = {};
+      for (let c = 0; c < chunk.columnCount; c++) {
+        const val = chunk.getColumnVector(c).getItem(r);
+        row[names[c]] = typeof val === "bigint" ? Number(val) : val;
+      }
+      rows.push(row);
+    }
+  }
+  return { columns: names, rows };
 }
 
 function assert(condition, msg) {
@@ -55,8 +50,7 @@ function parseCommands(text) {
   return text.trim().split("\n").filter((l) => l.trim());
 }
 
-function checkExpect(expect, rows) {
-  const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+function checkExpect(expect, columns, rows) {
   const t = expect.type;
 
   if (t === "scalar") {
@@ -83,12 +77,13 @@ function checkExpect(expect, rows) {
 }
 
 async function runCase(testCase) {
-  const { con } = await freshConn();
-  if (testCase.setup) await exec(con, testCase.setup);
+  const conn = await freshConn();
+  if (testCase.setup) await conn.run(testCase.setup);
   const cmds = parseCommands(testCase.commands).map((c) => c.replace(/\{data\}/g, DATA_DIR));
-  for (const cmd of cmds.slice(0, -1)) await exec(con, cmd);
-  const rows = await query(con, cmds[cmds.length - 1]);
-  checkExpect(testCase.expect, rows);
+  for (const cmd of cmds.slice(0, -1)) await conn.run(cmd);
+  const result = await conn.run(cmds[cmds.length - 1]);
+  const { columns, rows } = await getRows(result);
+  checkExpect(testCase.expect, columns, rows);
 }
 
 async function main() {

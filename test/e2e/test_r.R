@@ -7,7 +7,8 @@ args <- commandArgs(trailingOnly = TRUE)
 project_dir <- if (length(args) > 0) args[1] else getwd()
 # Remove trailing slash if present
 project_dir <- sub("/$", "", project_dir)
-ext_path <- file.path(project_dir, "build", "release", "extension", "dodo", "dodo.duckdb_extension")
+ext_path <- Sys.getenv("DODO_EXT_PATH",
+    file.path(project_dir, "build", "release", "extension", "dodo", "dodo.duckdb_extension"))
 data_dir <- file.path(project_dir, "test", "data")
 script_dir <- file.path(project_dir, "test", "e2e")
 cases_path <- file.path(script_dir, "cases.yaml")

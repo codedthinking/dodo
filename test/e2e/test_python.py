@@ -6,7 +6,8 @@ import duckdb
 import yaml
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EXT_PATH = os.path.join(PROJECT_DIR, "build", "release", "extension", "dodo", "dodo.duckdb_extension")
+EXT_PATH = os.environ.get("DODO_EXT_PATH",
+    os.path.join(PROJECT_DIR, "build", "release", "extension", "dodo", "dodo.duckdb_extension"))
 DATA_DIR = os.path.join(PROJECT_DIR, "test", "data")
 CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.yaml")
 

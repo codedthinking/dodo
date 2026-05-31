@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.2-r.2",
+    "js-yaml": "^4.1.1"
+  }
+}
