@@ -1,13 +1,13 @@
 # E2E test: R DBI client with dodo extension
 library(DBI)
 library(duckdb)
-library(jsonlite)
+library(yaml)
 
 args <- commandArgs(trailingOnly = TRUE)
 project_dir <- if (length(args) > 0) args[1] else getwd()
 ext_path <- file.path(project_dir, "build", "release", "extension", "dodo", "dodo.duckdb_extension")
 data_dir <- file.path(project_dir, "test", "data")
-cases_path <- file.path(dirname(sys.frame(1)$ofile), "cases.json")
+cases_path <- file.path(dirname(sys.frame(1)$ofile), "cases.yaml")
 
 if (!file.exists(ext_path)) {
     cat("FAIL: Extension not found at", ext_path, "\n")
@@ -19,6 +19,11 @@ fresh_conn <- function() {
     dbExecute(con, "SET allow_unsigned_extensions = true")
     dbExecute(con, sprintf("LOAD '%s'", ext_path))
     con
+}
+
+parse_commands <- function(text) {
+    lines <- strsplit(trimws(text), "\n")[[1]]
+    lines[nzchar(trimws(lines))]
 }
 
 check_expect <- function(expect, result) {
@@ -40,7 +45,7 @@ check_expect <- function(expect, result) {
     }
 }
 
-cases <- fromJSON(cases_path, simplifyVector = FALSE)
+cases <- yaml.load_file(cases_path)
 
 failures <- 0L
 cat("=== R e2e tests ===\n")
@@ -49,7 +54,7 @@ for (case in cases) {
     tryCatch({
         con <- fresh_conn()
         if (!is.null(case$setup)) dbExecute(con, case$setup)
-        cmds <- unlist(case$commands)
+        cmds <- parse_commands(case$commands)
         for (cmd in cmds[-length(cmds)]) {
             dbExecute(con, gsub("\\{data\\}", data_dir, cmd))
         }

@@ -37,7 +37,7 @@ e2e-cli:
 	bash test/e2e/test_cli.sh
 
 e2e-python:
-	uv run --python 3.13 --with 'duckdb==1.5.2' test/e2e/test_python.py
+	uv run --python 3.13 --with 'duckdb==1.5.2' --with pyyaml test/e2e/test_python.py
 
 e2e-r:
 	Rscript test/e2e/test_r.R $(PROJ_DIR)

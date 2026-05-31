@@ -2,13 +2,14 @@
 const duckdb = require("duckdb");
 const path = require("path");
 const fs = require("fs");
+const yaml = require("js-yaml");
 
 const PROJECT_DIR = path.resolve(__dirname, "..", "..");
 const EXT_PATH = path.join(
   PROJECT_DIR, "build", "release", "extension", "dodo", "dodo.duckdb_extension",
 );
 const DATA_DIR = path.join(PROJECT_DIR, "test", "data");
-const CASES_PATH = path.join(__dirname, "cases.json");
+const CASES_PATH = path.join(__dirname, "cases.yaml");
 
 if (!fs.existsSync(EXT_PATH)) {
   console.log(`FAIL: Extension not found at ${EXT_PATH}`);
@@ -50,6 +51,10 @@ function assert(condition, msg) {
   if (!condition) throw new Error(msg);
 }
 
+function parseCommands(text) {
+  return text.trim().split("\n").filter((l) => l.trim());
+}
+
 function checkExpect(expect, rows) {
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
   const t = expect.type;
@@ -80,14 +85,14 @@ function checkExpect(expect, rows) {
 async function runCase(testCase) {
   const { con } = await freshConn();
   if (testCase.setup) await exec(con, testCase.setup);
-  const cmds = testCase.commands.map((c) => c.replace(/\{data\}/g, DATA_DIR));
+  const cmds = parseCommands(testCase.commands).map((c) => c.replace(/\{data\}/g, DATA_DIR));
   for (const cmd of cmds.slice(0, -1)) await exec(con, cmd);
   const rows = await query(con, cmds[cmds.length - 1]);
   checkExpect(testCase.expect, rows);
 }
 
 async function main() {
-  const cases = JSON.parse(fs.readFileSync(CASES_PATH, "utf8"));
+  const cases = yaml.load(fs.readFileSync(CASES_PATH, "utf8"));
   let failures = 0;
 
   console.log("=== Node.js e2e tests ===");

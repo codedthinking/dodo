@@ -1,14 +1,14 @@
 """E2E test: Python duckdb client with dodo extension."""
-import json
 import os
 import sys
 
 import duckdb
+import yaml
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXT_PATH = os.path.join(PROJECT_DIR, "build", "release", "extension", "dodo", "dodo.duckdb_extension")
 DATA_DIR = os.path.join(PROJECT_DIR, "test", "data")
-CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.json")
+CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.yaml")
 
 
 def fresh_conn():
@@ -39,13 +39,18 @@ def check(expect, columns, rows):
             f"expected {expect['value']}, got {rows[expect['row']][col_idx]}"
 
 
+def parse_commands(text):
+    return [line for line in text.strip().splitlines() if line.strip()]
+
+
 def run_case(case):
     con = fresh_conn()
     if "setup" in case:
         con.execute(case["setup"])
-    for cmd in case["commands"][:-1]:
+    cmds = parse_commands(case["commands"])
+    for cmd in cmds[:-1]:
         con.execute(cmd.replace("{data}", DATA_DIR))
-    result = con.execute(case["commands"][-1].replace("{data}", DATA_DIR))
+    result = con.execute(cmds[-1].replace("{data}", DATA_DIR))
     columns = [d[0] for d in result.description]
     rows = result.fetchall()
     check(case["expect"], columns, rows)
@@ -57,7 +62,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     with open(CASES_PATH) as f:
-        cases = json.load(f)
+        cases = yaml.safe_load(f)
 
     failures = 0
     print("=== Python e2e tests ===")
