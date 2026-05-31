@@ -96,8 +96,7 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 			continue;
 		}
 
-		if (StringUtil::StartsWith(trimmed, "use ") &&
-		    (trimmed.find('"') != string::npos || trimmed.find('\'') != string::npos)) {
+		if (StringUtil::StartsWith(trimmed, "use ")) {
 			has_conflict_commands = true;
 		}
 		if (StringUtil::StartsWith(trimmed, "import ")) {
@@ -166,28 +165,32 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 
 				Parser parser;
 				parser.ParseQuery(sql);
-				for (auto &stmt : parser.statements) {
-					all_statements.push_back(std::move(stmt));
-				}
 
-				// Live view: inject view creation for UI data panel
-				string view_sql = BuildLiveViewSQL(state);
-				if (!view_sql.empty()) {
-					Parser view_parser;
-					view_parser.ParseQuery(view_sql);
-					for (auto &stmt : view_parser.statements) {
-						all_statements.push_back(std::move(stmt));
-					}
-				}
-
-				// History table: inject rebuild for UI visibility
+				// History table and live view: inject BEFORE the last
+				// statement of the command so the command result is returned
+				// to clients like Python that return the last statement's result.
 				string history_sql = BuildHistorySQL(state);
-				if (!history_sql.empty()) {
-					Parser hist_parser;
-					hist_parser.ParseQuery(history_sql);
-					for (auto &stmt : hist_parser.statements) {
-						all_statements.push_back(std::move(stmt));
+				string view_sql = BuildLiveViewSQL(state);
+
+				for (idx_t si = 0; si < parser.statements.size(); si++) {
+					if (si == parser.statements.size() - 1) {
+						// Inject history and live view before the final statement
+						if (!history_sql.empty()) {
+							Parser hist_parser;
+							hist_parser.ParseQuery(history_sql);
+							for (auto &stmt : hist_parser.statements) {
+								all_statements.push_back(std::move(stmt));
+							}
+						}
+						if (!view_sql.empty()) {
+							Parser view_parser;
+							view_parser.ParseQuery(view_sql);
+							for (auto &stmt : view_parser.statements) {
+								all_statements.push_back(std::move(stmt));
+							}
+						}
 					}
+					all_statements.push_back(std::move(parser.statements[si]));
 				}
 			} else {
 				Parser parser;
