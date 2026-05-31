@@ -27,3 +27,20 @@ dodoc-install: dodoc
 
 dodoc-clean:
 	rm -rf $(DODOC_BUILD_DIR)
+
+# ---- E2E tests across client interfaces ----
+.PHONY: e2e e2e-cli e2e-python e2e-r e2e-node
+
+e2e: e2e-cli e2e-python e2e-r e2e-node
+
+e2e-cli:
+	bash test/e2e/test_cli.sh
+
+e2e-python:
+	uv run --python 3.13 --with 'duckdb==1.5.2' test/e2e/test_python.py
+
+e2e-r:
+	Rscript test/e2e/test_r.R $(PROJ_DIR)
+
+e2e-node:
+	node test/e2e/test_node.js
