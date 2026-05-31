@@ -5,9 +5,12 @@ library(yaml)
 
 args <- commandArgs(trailingOnly = TRUE)
 project_dir <- if (length(args) > 0) args[1] else getwd()
+# Remove trailing slash if present
+project_dir <- sub("/$", "", project_dir)
 ext_path <- file.path(project_dir, "build", "release", "extension", "dodo", "dodo.duckdb_extension")
 data_dir <- file.path(project_dir, "test", "data")
-cases_path <- file.path(dirname(sys.frame(1)$ofile), "cases.yaml")
+script_dir <- file.path(project_dir, "test", "e2e")
+cases_path <- file.path(script_dir, "cases.yaml")
 
 if (!file.exists(ext_path)) {
     cat("FAIL: Extension not found at", ext_path, "\n")
@@ -15,8 +18,8 @@ if (!file.exists(ext_path)) {
 }
 
 fresh_conn <- function() {
-    con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
-    dbExecute(con, "SET allow_unsigned_extensions = true")
+    drv <- duckdb::duckdb(config = list(allow_unsigned_extensions = "true"))
+    con <- dbConnect(drv, dbdir = ":memory:")
     dbExecute(con, sprintf("LOAD '%s'", ext_path))
     con
 }

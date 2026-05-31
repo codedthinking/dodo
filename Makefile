@@ -39,8 +39,10 @@ e2e-cli:
 e2e-python:
 	uv run --python 3.13 --with 'duckdb==1.5.2' --with pyyaml test/e2e/test_python.py
 
+RSCRIPT ?= Rscript
+
 e2e-r:
-	Rscript test/e2e/test_r.R $(PROJ_DIR)
+	$(RSCRIPT) test/e2e/test_r.R $(PROJ_DIR)
 
 e2e-node:
 	node test/e2e/test_node.js
