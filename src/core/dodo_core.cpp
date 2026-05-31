@@ -1573,6 +1573,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		if (!by_cols.empty()) {
 			sql += " GROUP BY " + by_cols;
+			sql += " ORDER BY " + by_cols;
 		}
 
 		state.AddStep(sql);
