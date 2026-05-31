@@ -1312,7 +1312,7 @@ h1.doc-h1 .mono {
         <div class="syntax">
 <span class="cmd">use</span> <span class="req">source</span> [, <span class="opt">clear</span> | <span class="opt">lazy</span> | <span class="opt">table</span>]
         </div>
-        <p><code>source</code> is either a quoted file path (CSV / Parquet / JSON) or a bare identifier referring to an existing DuckDB table. Pass <code>clear</code> to drop the previous dataset before loading.</p>
+        <p><code>source</code> is either a quoted file path (CSV / Parquet / JSON / .dta) or a bare identifier referring to an existing DuckDB table. Pass <code>clear</code> to drop the previous dataset before loading. Variable labels from <code>.dta</code> files are automatically imported.</p>
 
         <h2 id="u-examples">examples</h2>
 
@@ -1324,6 +1324,7 @@ h1.doc-h1 .mono {
           </div>
 <pre><code><span class="tok-cmd">use</span> <span class="tok-str">"data/firms.csv"</span>, <span class="tok-kw">clear</span>;
 <span class="tok-cmd">use</span> <span class="tok-str">"data/firms.parquet"</span>, <span class="tok-kw">clear</span>;
+<span class="tok-cmd">use</span> <span class="tok-str">"data/firms.dta"</span>, <span class="tok-kw">clear</span>;
 <span class="tok-cmd">use</span> <span class="tok-str">"s3://bucket/firms.parquet"</span>, <span class="tok-kw">clear</span>;</code></pre>
         </div>
 
@@ -1367,9 +1368,9 @@ h1.doc-h1 .mono {
           <li>Lazy mode pairs well with <code>head</code> and <code>count</code>; it pairs poorly with iterative <code>generate</code> chains, since each terminal command re-reads the source.</li>
         </ul>
 
-        <div class="callout callout--danger">
-          <div class="callout__h"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"><path d="M18 6 6 18M6 6l12 12"/></svg>not yet supported</div>
-          <p>Stata <code>.dta</code> files are <strong>not</strong> a <code>use</code> source. They require a separate reader; see <a href="#" onclick="return false" style="color:var(--accent-deep);font-weight:600;">known limitations</a> for the workaround.</p>
+        <div class="callout callout--info">
+          <div class="callout__h"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>native .dta support</div>
+          <p>Stata <code>.dta</code> files (formats 117&ndash;121, Stata 13&ndash;18) are read natively &mdash; no external extensions needed. Variable labels are automatically imported into dodo metadata.</p>
         </div>
 
         <div class="pagefoot">
@@ -1851,7 +1852,7 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
         <p>In the DuckDB REPL, every statement needs a trailing semicolon. Inside <code>.do</code> files, semicolons are optional &mdash; newlines delimit commands, just like the original.</p>
 
         <h2 id="mig-data">data formats</h2>
-        <p>dodo reads CSV, Parquet, and JSON natively. For <code>.dta</code> files, install the <code>stata_scanner</code> DuckDB extension &mdash; dodo will use <code>st_read()</code> automatically when it sees a <code>.dta</code> extension.</p>
+        <p>dodo reads CSV, Parquet, JSON, and <code>.dta</code> files natively. The built-in <code>.dta</code> reader supports formats 117&ndash;121 (Stata 13&ndash;18), including variable labels, value labels, strL strings, and all numeric types. No external extensions required.</p>
 
         <h2 id="mig-programs">unsupported features</h2>
         <p>dodo does not support user-defined programs (<code>program define</code>), macros (<code>local</code>/<code>global</code>), loops (<code>forvalues</code>, <code>foreach</code>), or matrix operations (<code>mata</code>). These are programming constructs with no SQL equivalent. If your script uses them, refactor the logic into SQL or a host language (Python, R) and use dodo for the data-manipulation parts.</p>
@@ -1877,7 +1878,7 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
         <p>No support for <code>local</code>/<code>global</code> macros, <code>forvalues</code>/<code>foreach</code> loops, <code>program define</code>, <code>if</code>/<code>else</code> control flow, or <code>mata</code>. These have no SQL equivalent. Use a host language for scripting and dodo for data steps.</p>
 
         <h2 id="lim-dta">.dta files</h2>
-        <p>Reading <code>.dta</code> files requires the <code>stata_scanner</code> DuckDB community extension. Install it with <code>INSTALL stata_scanner FROM community;</code>. dodo detects the <code>.dta</code> extension and calls <code>st_read()</code> automatically.</p>
+        <p>Native <code>.dta</code> support covers formats 117&ndash;121 (Stata 13&ndash;18). Format 115 (Stata 10&ndash;12) is not supported. All 27 extended missing value codes (<code>.a</code>&ndash;<code>.z</code>) are mapped to a single <code>NULL</code>.</p>
 
         <h2 id="lim-mvencode">mvencode _all</h2>
         <p><code>mvencode _all, mv(0)</code> is not yet supported. List column names explicitly instead.</p>
@@ -1913,12 +1914,13 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
           <div class="codeblock__head"><span class="codeblock__lang">.do</span><button class="codeblock__copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><rect x="9" y="9" width="13" height="13"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>copy</button></div>
 <pre><code><span class="tok-cmd">save</span> <span class="tok-str">"output.csv"</span>, <span class="tok-kw">replace</span>;
 <span class="tok-cmd">save</span> <span class="tok-str">"output.parquet"</span>, <span class="tok-kw">replace</span>;
+<span class="tok-cmd">save</span> <span class="tok-str">"output.dta"</span>, <span class="tok-kw">replace</span>;        <span class="tok-com">// native .dta writer</span>
 <span class="tok-cmd">save</span> my_table, <span class="tok-kw">replace</span> <span class="tok-kw">table</span>;     <span class="tok-com">// in-memory duckdb table</span></code></pre>
         </div>
 
         <h2 id="s-notes">notes</h2>
         <ul>
-          <li>Format is inferred from the extension. <code>.csv</code>, <code>.parquet</code>, <code>.json</code>, <code>.tsv</code> are supported.</li>
+          <li>Format is inferred from the extension. <code>.csv</code>, <code>.parquet</code>, <code>.json</code>, <code>.tsv</code>, and <code>.dta</code> are supported. Variable labels are preserved in <code>.dta</code> output.</li>
           <li>The <code>table</code> option writes to an in-memory DuckDB table rather than disk. This is the only way to reach the data from straight SQL.</li>
           <li><code>save</code> is a terminal command — it executes the chain.</li>
         </ul>
