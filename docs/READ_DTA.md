@@ -7,13 +7,11 @@ The existing `duckdb-read-stat` extension uses ReadStat and has O(N^2) performan
 ## File Structure
 
 ```
-src/read_dta/
+src/dta/
   dta_reader.hpp      -- DtaReader class (pure C++17, no DuckDB dependency)
   dta_reader.cpp      -- Implementation: header parsing, data scanning, strL, value labels
   read_dta_function.hpp  -- DuckDB table function declarations
   read_dta_function.cpp  -- bind/init/scan callbacks, row-to-column transposition
-src/include/
-  dta_reader.hpp      -- proxy header
 ```
 
 ## Architecture
@@ -179,8 +177,8 @@ include_directories(... ${CMAKE_CURRENT_SOURCE_DIR}/src/read_dta)
 set(EXTENSION_SOURCES
     src/extension/dodo_extension.cpp
     src/core/dodo_core.cpp
-    src/read_dta/dta_reader.cpp
-    src/read_dta/read_dta_function.cpp)
+    src/dta/dta_reader.cpp
+    src/dta/read_dta_function.cpp)
 ```
 
 ## Integration Point
@@ -191,7 +189,7 @@ set(EXTENSION_SOURCES
 RegisterReadDtaFunction(loader);
 ```
 
-`src/core/dodo_core.cpp` line 331: change `st_read` → `read_dta`.
+`src/core/dodo_core.cpp`: `st_read` → `read_dta` (done).
 
 ## Implementation Order
 

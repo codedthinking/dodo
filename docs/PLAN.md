@@ -69,7 +69,7 @@ Each command adds a new `_sN AS (...)` referencing the previous `_sN-1`. Shown b
 | Stata Command | CTE Step SQL |
 |---|---|
 | `use "file.csv", clear` | Resets chain. `_s0 AS (SELECT * FROM read_csv('file.csv'))` |
-| `use "file.dta", clear` | Resets chain. `_s0 AS (SELECT * FROM st_read('file.dta'))` |
+| `use "file.dta", clear` | Resets chain. `_s0 AS (SELECT * FROM read_dta('file.dta'))` |
 | `use tablename, clear` | Resets chain. `_s0 AS (SELECT * FROM tablename)` |
 | `keep var1 var2` | `SELECT var1, var2 FROM _prev` |
 | `keep if expr` | `SELECT * FROM _prev WHERE expr` |
@@ -667,8 +667,8 @@ The codebase is split into three modules:
 |---|---|---|
 | `src/core/` | Compiler: tokenizer, expression translator, command processor, SQL formatter, state | No |
 | `src/extension/` | DuckDB glue: parser hooks, planner redirect, option registration | Yes |
+| `src/dta/` | Native .dta reader/writer: `DtaReader` (pure C++), `DtaWriter`, DuckDB table function + CopyFunction | Reader: No, DuckDB wrappers: Yes |
 | `src/cli/` | `dodoc` standalone compiler (reads stdin/.do files, writes SQL to stdout) | No |
-| `src/include/` | Copies of headers for build system compatibility | — |
 
 Key files:
 - `src/core/dodo_core.hpp` — `DodoState`, `DodoCommand`, free function declarations
@@ -676,8 +676,14 @@ Key files:
 - `src/core/string_utils.hpp` — standalone string utilities (no DuckDB dependency)
 - `src/extension/dodo_extension.hpp` — `DodoStateInfo` (wraps `DodoState` with DuckDB interfaces)
 - `src/extension/dodo_extension.cpp` — parser/planner/operator registration, live view, history table
+- `src/dta/dta_reader.hpp/cpp` — pure C++ .dta file reader (formats 117-121)
+- `src/dta/dta_writer.hpp/cpp` — pure C++ .dta file writer (format 118)
+- `src/dta/read_dta_function.hpp/cpp` — DuckDB `read_dta()` table function
+- `src/dta/write_dta_function.hpp/cpp` — DuckDB `COPY TO (FORMAT dta)` CopyFunction
 - `src/cli/dodoc.cpp` — CLI compiler entry point
 - `test/sql/dodo.test` — sqllogictest suite (920+ assertions)
+- `test/sql/read_dta.test` — read_dta tests
+- `test/sql/write_dta.test` — write_dta + round-trip tests
 
 ## Milestone Status
 

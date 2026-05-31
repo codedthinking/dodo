@@ -143,7 +143,7 @@ dodoc --annotate script.do -o output.sql
 | Command | Example |
 |---|---|
 | `use` | `use "data.csv", clear` |
-| `save` | `save "output.parquet", replace` |
+| `save` | `save "output.parquet"` or `save "output.dta"` |
 | `import delimited` | `import delimited "data.csv", clear` |
 | `export delimited` | `export delimited using "out.csv", replace` |
 | `append` | `append using "more_data.csv"` |
@@ -204,7 +204,7 @@ dodo auto-detects format from the file extension:
 | `.csv` | Comma-separated |
 | `.parquet` | Apache Parquet |
 | `.json` | JSON / NDJSON |
-| `.dta` | Stata data file |
+| `.dta` | Stata data file (native reader/writer, formats 117-121) |
 
 ---
 

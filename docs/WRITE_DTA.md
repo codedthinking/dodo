@@ -2,7 +2,7 @@
 
 ## Context
 
-The extension can read .dta files but has no native .dta writer. Currently, `save "file.dta"` falls through to `COPY ... TO 'file.dta'` without a format clause, which fails because DuckDB has no built-in .dta writer. We'll implement a DuckDB `CopyFunction` named `"dta"` that writes format-119 .dta files, enabling both:
+The extension can read .dta files but has no native .dta writer. Currently, `save "file.dta"` falls through to `COPY ... TO 'file.dta'` without a format clause, which fails because DuckDB has no built-in .dta writer. We'll implement a DuckDB `CopyFunction` named `"dta"` that writes format-118 .dta files, enabling both:
 
 ```sql
 COPY my_table TO 'output.dta' (FORMAT dta);
@@ -17,13 +17,11 @@ save "output.dta"
 ## File Structure
 
 ```
-src/write_dta/
+src/dta/
   dta_writer.hpp      -- DtaWriter class (pure C++17, no DuckDB dependency)
   dta_writer.cpp      -- Implementation: header, map, metadata, data, value labels
   write_dta_function.hpp  -- DuckDB CopyFunction declarations
   write_dta_function.cpp  -- bind/init/sink/combine/finalize callbacks
-src/include/
-  dta_writer.hpp      -- proxy header
 ```
 
 ## Architecture
@@ -99,15 +97,15 @@ private:
 };
 ```
 
-Format-119 specifics:
-- `<release>119</release>`, `<byteorder>LSF</byteorder>` (native x86/ARM)
-- K field: 4 bytes (supports >32,767 variables)
+Format-118 specifics (default):
+- `<release>118</release>`, `<byteorder>LSF</byteorder>` (native x86/ARM)
+- K field: 2 bytes (up to 32,767 variables)
 - N field: 8 bytes
 - Variable names: 129 bytes each
 - Format strings: 57 bytes each
 - Value-label names: 129 bytes each
 - Variable labels: 321 bytes each
-- Sortlist entries: 4 bytes each
+- Sortlist entries: 2 bytes each
 - Dataset label length: 2 bytes
 - No alias variables
 
@@ -143,7 +141,7 @@ Bind data stores:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `version` | INTEGER | 119 | .dta format version (118 or 119) |
+| `version` | INTEGER | 118 | .dta format version (118 or 119) |
 | `variable_labels` | STRUCT | {} | Map of column name → label |
 
 #### Global State (`WriteDtaInitializeGlobal`)
@@ -192,10 +190,10 @@ For VARCHAR columns, the bind phase must decide between str# (fixed-width) and s
 set(EXTENSION_SOURCES
     src/extension/dodo_extension.cpp
     src/core/dodo_core.cpp
-    src/read_dta/dta_reader.cpp
-    src/read_dta/read_dta_function.cpp
-    src/write_dta/dta_writer.cpp
-    src/write_dta/write_dta_function.cpp)
+    src/dta/dta_reader.cpp
+    src/dta/read_dta_function.cpp
+    src/dta/dta_writer.cpp
+    src/dta/write_dta_function.cpp)
 ```
 
 ## Integration Points
