@@ -1,4 +1,5 @@
 #include "dodo_core.hpp"
+#include "dta_reader.hpp"
 
 #include <fstream>
 #include <regex>
@@ -889,6 +890,21 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			state.AddStep("SELECT * FROM " + read_expr);
 		}
 		state.current_source = cmd.arguments;
+
+		// Extract variable labels from .dta files
+		if (str::EndsWith(str::Lower(source), ".dta")) {
+			try {
+				dta::DtaReader reader(source);
+				for (auto &col : reader.Columns()) {
+					if (!col.label.empty()) {
+						state.variable_labels[col.name] = col.label;
+					}
+				}
+			} catch (...) {
+				// Ignore errors — labels are best-effort
+			}
+		}
+
 		result_sql += "SELECT 'OK' AS status";
 		return pre_cleanup + result_sql;
 	}
@@ -2026,7 +2042,22 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else if (str::EndsWith(lower_fn, ".dta")) {
 			format_clause = " (FORMAT DTA)";
 		}
-		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
+
+		string pre_save_sql;
+		// For .dta: apply variable labels as COMMENT ON COLUMN on materialized table
+		if (str::EndsWith(lower_fn, ".dta") && state.materialized && !state.variable_labels.empty()) {
+			for (auto &[col, label] : state.variable_labels) {
+				string escaped_label = label;
+				size_t pos = 0;
+				while ((pos = escaped_label.find('\'', pos)) != string::npos) {
+					escaped_label.replace(pos, 1, "''");
+					pos += 2;
+				}
+				pre_save_sql += "COMMENT ON COLUMN dodo._current." + col + " IS '" + escaped_label + "'; ";
+			}
+		}
+
+		return pre_save_sql + "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
 	}
 
 	if (cmd.command == "append") {

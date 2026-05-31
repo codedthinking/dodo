@@ -366,6 +366,84 @@ SELECT empty IS NULL, missing IS NULL FROM read_dta('__TEST_DIR__/empty_str.dta'
 true	true
 
 # ============================================================
+# Variable labels round-trip: .dta -> dodo -> save .dta -> read
+# ============================================================
+
+# auto.dta has variable labels set by the Python generator
+statement ok
+use "test/data/auto.dta", clear
+
+# Verify labels were read
+query IIII
+codebook
+----
+id	INTEGER	Firm identifier	(empty)
+name	VARCHAR	Firm name	(empty)
+revenue	DOUBLE	Annual revenue	(empty)
+year	SMALLINT	Fiscal year	(empty)
+
+# Save and re-read — labels should survive
+statement ok
+save "__TEST_DIR__/labeled.dta"
+
+statement ok
+clear
+
+statement ok
+use "__TEST_DIR__/labeled.dta", clear
+
+query IIII
+codebook
+----
+id	INTEGER	Firm identifier	(empty)
+name	VARCHAR	Firm name	(empty)
+revenue	DOUBLE	Annual revenue	(empty)
+year	SMALLINT	Fiscal year	(empty)
+
+statement ok
+clear
+
+# ============================================================
+# Variable labels from label variable command
+# ============================================================
+
+statement ok
+use "test/data/auto.dta", clear
+
+statement ok
+label variable id "Unique firm ID"
+
+# id label should be overridden
+query IIII
+codebook
+----
+id	INTEGER	Unique firm ID	(empty)
+name	VARCHAR	Firm name	(empty)
+revenue	DOUBLE	Annual revenue	(empty)
+year	SMALLINT	Fiscal year	(empty)
+
+# Save and verify override persists
+statement ok
+save "__TEST_DIR__/relabeled.dta"
+
+statement ok
+clear
+
+statement ok
+use "__TEST_DIR__/relabeled.dta", clear
+
+query IIII
+codebook
+----
+id	INTEGER	Unique firm ID	(empty)
+name	VARCHAR	Firm name	(empty)
+revenue	DOUBLE	Annual revenue	(empty)
+year	SMALLINT	Fiscal year	(empty)
+
+statement ok
+clear
+
+# ============================================================
 # save command with .dta extension
 # ============================================================
 

@@ -5,6 +5,8 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include <cstring>
 #include <mutex>
@@ -161,12 +163,47 @@ static dta::DtaWriteColumn MapDuckDBType(const string &name, const LogicalType &
 
 // ─── Bind ───────────────────────────────────────────────────────────────────
 
+// Try to find column comments from known tables
+static unordered_map<string, string> LookupColumnComments(ClientContext &context, const vector<string> &names) {
+	unordered_map<string, string> comments;
+	try {
+		// Try dodo._current first (most common case for save command)
+		auto &catalog = Catalog::GetCatalog(context, INVALID_CATALOG);
+		auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, "dodo", "_current",
+		                               OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto &table_entry = entry->Cast<TableCatalogEntry>();
+			for (auto &col_name : names) {
+				string n = col_name;
+				if (table_entry.ColumnExists(n)) {
+					const auto &col_def = table_entry.GetColumn(table_entry.GetColumnIndex(n));
+					if (!col_def.Comment().IsNull()) {
+						comments[col_name] = col_def.Comment().ToString();
+					}
+				}
+			}
+		}
+	} catch (...) {
+		// Table doesn't exist or no comments — ignore
+	}
+	return comments;
+}
+
 static unique_ptr<FunctionData> WriteDtaBind(ClientContext &context, CopyFunctionBindInput &input,
                                              const vector<string> &names, const vector<LogicalType> &sql_types) {
 	auto result = make_uniq<WriteDtaBindData>();
 
+	// Look up column comments for variable labels
+	auto comments = LookupColumnComments(context, names);
+
 	for (idx_t i = 0; i < names.size(); i++) {
 		auto col = MapDuckDBType(names[i], sql_types[i]);
+
+		// Set variable label from column comment
+		auto it = comments.find(names[i]);
+		if (it != comments.end()) {
+			col.label = it->second;
+		}
 
 		// Handle ENUM: create value label
 		if (sql_types[i].id() == LogicalTypeId::ENUM) {

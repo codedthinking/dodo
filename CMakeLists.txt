@@ -32,6 +32,6 @@ install(
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
 # CLI tool (standalone, no DuckDB dependency)
-add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp)
-target_include_directories(dodoc PRIVATE src/core)
+add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp src/dta/dta_reader.cpp)
+target_include_directories(dodoc PRIVATE src/core src/dta)
 target_compile_features(dodoc PRIVATE cxx_std_17)
