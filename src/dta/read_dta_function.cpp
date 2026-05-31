@@ -24,6 +24,8 @@ struct ReadDtaBindData : public TableFunctionData {
 
 	// Value label lookups: for each return column, the value label map (if any)
 	vector<const dta::DtaValueLabel *> col_value_labels;
+	// Pre-built: stata value -> enum index for each column with value labels
+	vector<unordered_map<int32_t, uint32_t>> col_enum_index;
 };
 
 // ─── Init state ─────────────────────────────────────────────────────────────
@@ -170,6 +172,17 @@ static unique_ptr<FunctionData> ReadDtaBind(ClientContext &context, TableFunctio
 		names.push_back(cols[i].name);
 		result->reader_col_indices.push_back(i);
 		result->col_value_labels.push_back(vl);
+
+		// Build enum index: stata_value -> sorted enum position
+		unordered_map<int32_t, uint32_t> enum_idx;
+		if (vl && type.id() == LogicalTypeId::ENUM) {
+			vector<pair<int32_t, string>> sorted_pairs(vl->mappings.begin(), vl->mappings.end());
+			std::sort(sorted_pairs.begin(), sorted_pairs.end());
+			for (uint32_t ei = 0; ei < sorted_pairs.size(); ei++) {
+				enum_idx[sorted_pairs[ei].first] = ei;
+			}
+		}
+		result->col_enum_index.push_back(std::move(enum_idx));
 	}
 
 	result->return_types = return_types;
@@ -223,29 +236,34 @@ static void ReadDtaScan(ClientContext &context, TableFunctionInput &data, DataCh
 		for (idx_t row = 0; row < actual; row++) {
 			const char *row_ptr = gstate.row_buffer.data() + row * row_width + col_offset;
 
+			// Helper: write an enum value from a Stata integer
+			auto write_enum = [&](int32_t stata_val) {
+				auto &eidx = bind_data.col_enum_index[out_col];
+				auto eit = eidx.find(stata_val);
+				if (eit != eidx.end()) {
+					auto enum_size = EnumType::GetSize(type);
+					if (enum_size <= 256) {
+						FlatVector::GetData<uint8_t>(vec)[row] = static_cast<uint8_t>(eit->second);
+					} else if (enum_size <= 65536) {
+						FlatVector::GetData<uint16_t>(vec)[row] = static_cast<uint16_t>(eit->second);
+					} else {
+						FlatVector::GetData<uint32_t>(vec)[row] = eit->second;
+					}
+				} else {
+					FlatVector::SetNull(vec, row, true);
+				}
+			};
+
+			bool is_enum = (type.id() == LogicalTypeId::ENUM);
+
 			switch (col_def.type_code) {
 			case 65530: { // byte
 				int8_t val;
 				memcpy(&val, row_ptr, 1);
 				if (dta::DtaMissing::IsMissingByte(val)) {
 					FlatVector::SetNull(vec, row, true);
-				} else if (type.id() == LogicalTypeId::ENUM) {
-					// Look up value in enum
-					auto *vl = bind_data.col_value_labels[out_col];
-					auto it = vl->mappings.find(val);
-					if (it != vl->mappings.end()) {
-						// Find position in sorted enum
-						vector<pair<int32_t, string>> sorted(vl->mappings.begin(), vl->mappings.end());
-						std::sort(sorted.begin(), sorted.end());
-						for (idx_t ei = 0; ei < sorted.size(); ei++) {
-							if (sorted[ei].first == val) {
-								FlatVector::GetData<uint8_t>(vec)[row] = static_cast<uint8_t>(ei);
-								break;
-							}
-						}
-					} else {
-						FlatVector::SetNull(vec, row, true);
-					}
+				} else if (is_enum) {
+					write_enum(val);
 				} else {
 					FlatVector::GetData<int8_t>(vec)[row] = val;
 				}
@@ -257,6 +275,8 @@ static void ReadDtaScan(ClientContext &context, TableFunctionInput &data, DataCh
 				val = reader.Swap(val);
 				if (dta::DtaMissing::IsMissingInt(val)) {
 					FlatVector::SetNull(vec, row, true);
+				} else if (is_enum) {
+					write_enum(val);
 				} else {
 					FlatVector::GetData<int16_t>(vec)[row] = val;
 				}
@@ -268,6 +288,8 @@ static void ReadDtaScan(ClientContext &context, TableFunctionInput &data, DataCh
 				val = reader.Swap(val);
 				if (dta::DtaMissing::IsMissingLong(val)) {
 					FlatVector::SetNull(vec, row, true);
+				} else if (is_enum) {
+					write_enum(val);
 				} else {
 					FlatVector::GetData<int32_t>(vec)[row] = val;
 				}
@@ -279,6 +301,8 @@ static void ReadDtaScan(ClientContext &context, TableFunctionInput &data, DataCh
 				val = reader.Swap(val);
 				if (dta::DtaMissing::IsMissingFloat(val)) {
 					FlatVector::SetNull(vec, row, true);
+				} else if (is_enum) {
+					write_enum(static_cast<int32_t>(val));
 				} else {
 					FlatVector::GetData<float>(vec)[row] = val;
 				}
@@ -290,12 +314,12 @@ static void ReadDtaScan(ClientContext &context, TableFunctionInput &data, DataCh
 				val = reader.Swap(val);
 				if (dta::DtaMissing::IsMissingDouble(val)) {
 					FlatVector::SetNull(vec, row, true);
+				} else if (is_enum) {
+					write_enum(static_cast<int32_t>(val));
 				} else if (type.id() == LogicalTypeId::DATE) {
-					// Stata days since 1960-01-01 -> DuckDB date
 					int32_t stata_days = static_cast<int32_t>(val);
 					FlatVector::GetData<date_t>(vec)[row] = date_t(stata_days - STATA_EPOCH_OFFSET);
 				} else if (type.id() == LogicalTypeId::TIMESTAMP) {
-					// Stata ms since 1960-01-01 -> DuckDB timestamp (microseconds since 1970-01-01)
 					int64_t stata_ms = static_cast<int64_t>(val);
 					int64_t unix_ms = stata_ms - STATA_TC_EPOCH_OFFSET_MS;
 					FlatVector::GetData<timestamp_t>(vec)[row] = timestamp_t(unix_ms * 1000);
