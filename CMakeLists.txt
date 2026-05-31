@@ -12,13 +12,13 @@ set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/extension ${CMAKE_CURRENT_SOURCE_DIR}/src/core
-                    ${CMAKE_CURRENT_SOURCE_DIR}/src/read_dta ${CMAKE_CURRENT_SOURCE_DIR}/src/write_dta)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/dta)
 
 set(EXTENSION_SOURCES
     src/extension/dodo_extension.cpp
     src/core/dodo_core.cpp
-    src/read_dta/dta_reader.cpp
-    src/read_dta/read_dta_function.cpp)
+    src/dta/dta_reader.cpp
+    src/dta/read_dta_function.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
