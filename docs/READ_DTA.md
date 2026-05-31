@@ -2,7 +2,7 @@
 
 ## Context
 
-The existing `duckdb-read-stat` extension uses ReadStat and has O(N^2) performance — it re-parses the .dta file from the beginning on every 2048-row chunk. We'll build a from-scratch .dta reader as a new module in this extension, supporting formats 117-121.
+The existing `duckdb-read-stat` extension uses ReadStat and has O(N^2) performance — it re-parses the .dta file from the beginning on every 2048-row chunk. We'll build a from-scratch .dta reader as a new module in this extension, supporting formats 117-121 (Stata 13–18). Format 115 (Stata 10–12) uses a completely different binary layout (no XML tags, 1-byte type codes, no strL, no `<map>`) and is excluded from the initial implementation.
 
 ## File Structure
 
@@ -44,6 +44,24 @@ struct DtaVersionParams {
     uint32_t dataset_label_len_size; // 1 or 2
     bool has_alias_vars;    // true for 120, 121
 };
+
+// Version → parameter mapping:
+//
+// | Field                  | 117       | 118    | 119    | 120    | 121    |
+// |------------------------|-----------|--------|--------|--------|--------|
+// | varname_len            | 33        | 129    | 129    | 129    | 129    |
+// | sortlist_entry_size    | 2         | 2      | 4      | 2      | 4      |
+// | fmt_len                | 49        | 57     | 57     | 57     | 57     |
+// | label_name_len         | 33        | 129    | 129    | 129    | 129    |
+// | var_label_len          | 81        | 321    | 321    | 321    | 321    |
+// | k_field_size           | 2         | 2      | 4      | 2      | 4      |
+// | n_field_size           | 4         | 8      | 8      | 8      | 8      |
+// | dataset_label_len_size | 1         | 2      | 2      | 2      | 2      |
+// | has_alias_vars         | false     | false  | false  | true   | true   |
+// | string encoding        | ASCII     | UTF-8  | UTF-8  | UTF-8  | UTF-8  |
+//
+// Formats 119/121 exist for datasets with >32,767 variables (K and sortlist use 4 bytes).
+// Formats 120/121 exist for datasets with alias variables (type code 65525).
 
 struct DtaValueLabel {
     std::string name;
@@ -146,7 +164,11 @@ Date conversion: Stata epoch is 1960-01-01. For %td: `duckdb_date = stata_days -
 
 ### Alias Variables (v120/v121)
 
-For the initial implementation, alias variables will be **skipped** — they are references to variables in other frames and have no data in the .dta file itself. We detect them during type parsing and exclude them from the column list. This is safe because alias variables are only meaningful within Stata's frame system.
+For the initial implementation, alias variables (type code 65525) will be **skipped** — they are references to variables in other frames and have no data in the .dta file itself. We detect them during type parsing and exclude them from the column list. This is safe because alias variables are only meaningful within Stata's frame system.
+
+### String Encoding
+
+Format 117 uses ASCII encoding for all strings (variable names, data, labels). Formats 118+ use UTF-8. Since ASCII is a subset of UTF-8, the reader treats all strings as UTF-8 and no special handling is needed.
 
 ## Build System Changes
 
