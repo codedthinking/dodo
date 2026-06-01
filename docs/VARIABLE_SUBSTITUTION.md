@@ -126,65 +126,100 @@ impossible — rewrite set-based (see VARIABLE_SUBSTITUTION.md §B.3)."*
 
 ---
 
-## Category B — Runtime-dependent values (compiled to SQL)
+## Category B — Runtime-dependent values (compiled to `SET VARIABLE`)
 
-These cannot be known while compiling. Instead of fetching them, dodo **rewrites
-each one into the SQL** so DuckDB computes it. There is no execution round-trip.
+These cannot be known while compiling. dodo compiles them to DuckDB's native
+`SET VARIABLE` / `getvariable()` mechanism. **No execution round-trip needed** —
+the emitted SQL is self-contained and dodoc-safe.
 
-### B.0 The kind of a name is a property of its *definition*, not its use
+### B.0 The DuckDB mechanism: `SET VARIABLE` + `getvariable()`
 
-Whether a name is compile-time or runtime **cannot be decided from the line that
-uses it.** Consider:
+DuckDB's `SET VARIABLE name = expr` evaluates `expr` **at execution time** and
+stores the result in a session-scoped variable. Later, `getvariable('name')`
+retrieves the stored value. Key properties:
+
+- **Evaluated once at assignment.** The value is frozen when the `SET VARIABLE`
+  statement runs. Later data changes do not affect it. This matches Stata's `r()`
+  semantics: `r(max)` holds the value *as summarize saw it*.
+- **Session-scoped.** Variables persist across statements within a connection,
+  exactly like Stata scalars.
+- **Composable.** `SET VARIABLE floor = getvariable('hi') - 1` works natively.
+- **dodoc-safe.** `SET VARIABLE` and `getvariable()` are valid DuckDB SQL that
+  dodoc emits and downstream consumers execute.
+- **Can be set from subqueries.** `SET VARIABLE x = (SELECT max(col) FROM tbl)`
+  evaluates the subquery and stores the scalar result.
+
+### B.1 Stored results `r()` → `SET VARIABLE`
+
+When the compiler processes a terminal command that populates `r()`, it emits
+`SET VARIABLE` statements that capture each result from the CTE chain at that
+point.
+
+`summarize revenue` (latest step `_s3`) emits:
+
+```sql
+SET VARIABLE _r_N    = (SELECT count(revenue)       FROM _s3);
+SET VARIABLE _r_mean = (SELECT avg(revenue)         FROM _s3);
+SET VARIABLE _r_sum  = (SELECT sum(revenue)         FROM _s3);
+SET VARIABLE _r_min  = (SELECT min(revenue)         FROM _s3);
+SET VARIABLE _r_max  = (SELECT max(revenue)         FROM _s3);
+SET VARIABLE _r_sd   = (SELECT stddev_samp(revenue) FROM _s3);
+```
+
+(The `_s3` CTE definition is included in the `WITH` prefix of the query that
+contains these statements, so the subqueries resolve correctly.)
+
+Likewise `count` emits `SET VARIABLE _r_N = (SELECT count(*) FROM _sK)`.
+
+A later reference to `r(max)` in an expression is translated to
+`getvariable('_r_max')`:
 
 ```stata
-summarize employment           // r(min) recorded against _s3
-scalar min_employment = r(min) // <-- this makes min_employment RUNTIME
-keep if employment > min_employment
+summarize revenue          // emits SET VARIABLE _r_max = ...
+keep if revenue >= r(mean) // → WHERE revenue >= getvariable('_r_mean')
+generate hi = revenue == r(max)  // → (revenue = getvariable('_r_max')) AS hi
 ```
 
-Looking at `keep if employment > min_employment` in isolation, `min_employment` is
-indistinguishable from a column. It is runtime only *because* of how it was
-defined two lines earlier. So the compiler must carry a **compile-time symbol
-table** — a namespace that records, for every macro/scalar it has seen, which
-**kind** it is and what it expands to:
+**`r()` volatility.** Every new r-class command emits fresh `SET VARIABLE`
+statements that overwrite the previous `_r_*` variables (matching Stata, where
+`r()` is overwritten by the next r-class command). A reference to a stale
+`r(...)` at compile time produces an error: *"r(max) is not set; the most recent
+r-class command was `count`."*
 
+### B.2 Scalars and macros bound to runtime values
+
+```stata
+summarize revenue
+scalar hi = r(max)           // → SET VARIABLE hi = getvariable('_r_max')
+scalar floor = hi - 1        // → SET VARIABLE floor = getvariable('hi') - 1
+keep if revenue > floor      // → WHERE revenue > getvariable('floor')
 ```
-kind ∈ { LITERAL,  RUNTIME }
-       (compile-time text)  (SQL fragment / subquery)
-```
+
+The compiler tracks which names are `LITERAL` (compile-time text) vs `RUNTIME`
+(backed by a DuckDB variable). The kind is determined at definition:
 
 | | `LITERAL` | `RUNTIME` |
 |---|---|---|
-| stored value | raw text (`"age educ"`, `"2020"`) | an SQL fragment (`(SELECT min(employment) FROM _s3)`) |
-| resolved by | textual substitution (Category A) | expression translation (this section) |
-| set by | `local x text`, `scalar x = const`, foldable `= exp` | RHS that touches **any** runtime symbol |
+| stored as | raw text in compiler state | DuckDB variable via `SET VARIABLE` |
+| resolved by | textual substitution (Category A) | `getvariable('name')` in generated SQL |
+| set by | `local x text`, `scalar x = const` | RHS references `r()`, `_N`, or another RUNTIME name |
 
-**Taint propagation.** A definition is `RUNTIME` **iff its right-hand side, after
-expansion, references at least one runtime symbol** — `r(...)`, `e(...)`, a
-`levelsof` list, or a name already bound `RUNTIME`. The taint is transitive and
-the fragment composes:
+**Taint propagation.** If any part of the RHS is runtime-dependent, the whole
+definition is `RUNTIME`, and the compiler emits `SET VARIABLE` with the
+appropriate `getvariable()` references composed into the expression.
 
-```stata
-scalar min_employment = r(min)      // RUNTIME: (SELECT min(employment) FROM _s3)
-scalar floor = min_employment - 1   // RUNTIME: ((SELECT min(employment) FROM _s3) - 1)
-local big = floor * 2               // RUNTIME: (((SELECT ...) - 1) * 2)
-```
+### B.3 Name resolution at a use site
 
-Everything else (`local controls age educ`, `scalar pi = 3.14159`,
-`local n2 = 4*4`) stays `LITERAL` and is handled by Category A.
+When translating an expression, a bare identifier is looked up:
 
-**Name resolution at a use site.** When translating an expression, a bare
-identifier is looked up in the scalar namespace first: if it is a known `RUNTIME`
-scalar, substitute its fragment; if a known `LITERAL` scalar, substitute its
-literal; otherwise treat it as a **column reference** and leave it alone. (Stata
-lets a variable and a scalar share a name; dodo resolves scalar-table hits first
-and the docs recommend distinct names to avoid surprise.) Delimited macro refs
-`` `x' ``/`$x` are still resolved in the textual pass — but a `RUNTIME` macro
-pastes its *SQL fragment text*, which then flows into expression translation as a
-subquery, so the two namespaces meet cleanly.
+1. If it is a `RUNTIME` scalar → emit `getvariable('name')`
+2. If it is a `LITERAL` scalar → text-substitute the value (Category A)
+3. Otherwise → treat as a **column reference** (leave for DuckDB to resolve)
 
-This symbol table is the single source of truth for the A-vs-B decision; the rest
-of Category B (`r()`, `levelsof`) just *populates* it.
+This means `keep if employment > min_employment` compiles to
+`WHERE employment > getvariable('min_employment')` if `min_employment` was
+defined as `scalar min_employment = r(min)`, but would be a column reference
+if no such scalar exists.
 
 ### B.1 Stored results `r()` become SQL subqueries
 
@@ -236,7 +271,7 @@ symbol-table mechanism; the only difference from Category A is the `kind` flag �
 `RUNTIME` symbols carry a subquery, `LITERAL` symbols carry text — and the
 resolution site (expression translation vs the textual pass).
 
-### B.3 `levelsof` and set-based rewrites
+### B.4 `levelsof` and set-based rewrites
 
 `levelsof x, local(L)` produces a list whose **length and contents are unknown at
 compile time**. It therefore cannot fill a compile-time local, and a
@@ -250,13 +285,10 @@ by mapping them to **set-based SQL** instead of loops:
 | `foreach v of local L { gen d_`v' = x==`v' }` (one column per value) | `PIVOT`-style generation — **only if** the value set can be reified; otherwise rejected |
 | `foreach … { append/stack }` | `GROUP BY` / `UNPIVOT` where expressible |
 
-`levelsof x, local(L)` records `L` as a runtime-list symbol bound to
-`(SELECT DISTINCT x FROM _sK ORDER BY x)`. References that resolve to set
-membership compile cleanly. References that genuinely require iterating an unknown
-number of times (e.g. generating one new column per distinct value, where the
-distinct values can't be reified at compile time) are **out of scope for the pure
-compiler** and produce an explicit, actionable error rather than silently wrong
-SQL.
+`levelsof x, local(L)` records `L` as a runtime-list symbol. The list subquery
+`(SELECT DISTINCT x FROM _sK ORDER BY x)` is used inline for membership tests.
+Loops over a runtime list that require iterating an unknown number of times are
+**out of scope for the pure compiler** and produce an explicit error.
 
 ### B.4 `e()` (estimation results)
 
@@ -292,23 +324,21 @@ like any other verb, so the line routes cleanly: the handler strips `let`, reads
 `<name> =`, and runs the remainder as a captured command. This mirrors the
 keyword-led design of `local`, `scalar`, `egen`, etc.
 
-### Semantics — it is just a named, non-volatile §B.1
+### Semantics — named, non-volatile SET VARIABLE namespace
 
-`let NAME = <r-class command>` runs the command in **capture mode**: instead of
-materializing output, it records the command's result fields as `RUNTIME` symbols
-(§B.0) under the namespace `NAME`, each bound to the same frozen subquery B.1 would
-produce against the step the command saw.
+`let NAME = <r-class command>` runs the command and emits `SET VARIABLE`
+statements under a named prefix:
 
-| `let result = summarize employment` (step `_s3`) | resolves to |
+| `let result = summarize employment` (step `_s3`) | emitted SQL |
 |---|---|
-| `result.N` | `(SELECT count(employment) FROM _s3)` |
-| `result.mean` | `(SELECT avg(employment) FROM _s3)` |
-| `result.min` / `result.max` | `(SELECT min/max(employment) FROM _s3)` |
-| `result.sd` | `(SELECT stddev_samp(employment) FROM _s3)` |
+| `result.N` | `SET VARIABLE result_N = (SELECT count(employment) FROM _s3)` |
+| `result.mean` | `SET VARIABLE result_mean = (SELECT avg(employment) FROM _s3)` |
+| `result.min` / `result.max` | `SET VARIABLE result_min/max = (SELECT ...)` |
+| `result.sd` | `SET VARIABLE result_sd = (SELECT stddev_samp(employment) FROM _s3)` |
 
-`result.min` is resolved exactly like a bare runtime scalar (§B.0): a lookup in the
-symbol table during expression translation, substituting the fragment. Taint
-propagates normally — `scalar lo = result.min - 1` is `RUNTIME`.
+`result.min` in an expression compiles to `getvariable('result_min')`.
+Taint propagates normally — `scalar lo = result.min - 1` emits
+`SET VARIABLE lo = getvariable('result_min') - 1`.
 
 Two properties make it strictly better than `r()`:
 
@@ -334,17 +364,13 @@ makes the legacy/modern relationship obvious in the docs.
 
 ### Scope, state, parity
 
-- A struct is a `RUNTIME` namespace in the symbol table — reuse the §B.0 machinery;
-  add a `std::unordered_map<std::string, std::unordered_map<std::string,std::string>> result_structs;`
-  (`name -> {field -> fragment}`), or fold dotted names straight into `scalars`.
-- **Scope:** session-scoped like `scalar`/`global`, cleared by `clear`. (Open
-  question: do-file vs session scope — leaning session, since a named result is
-  meant to outlive a block. Flag for sign-off.)
-- **Pure compile-time, dodoc-safe.** `let` records fragments and `.field` access
-  emits subqueries; nothing executes, so `dodoc` supports it with no database —
-  same parity guarantee as the rest of Category B.
-- **Sequencing after M14b**, since it is a thin, named re-skin of the `r()`
-  recording it depends on.
+- Named structs are tracked in compiler state as `RUNTIME` symbols with a
+  `name.field` → DuckDB variable name mapping. The variables themselves live in
+  DuckDB's session via `SET VARIABLE`.
+- **Scope:** session-scoped like `scalar`/`global`, cleared by `clear`.
+- **dodoc-safe.** `let` emits `SET VARIABLE` statements and `.field` access
+  emits `getvariable()` — valid SQL that dodoc outputs and DuckDB executes.
+- **Sequencing after M14b**, since it reuses the `SET VARIABLE` recording.
 
 ---
 
@@ -357,60 +383,65 @@ We reject this:
 
 1. **It breaks `dodoc`.** `dodoc` has no database and never executes anything. A
    round-trip would make the standalone compiler strictly less capable than the
-   extension, splitting the language in two. Keeping runtime values as SQL means
-   *one* compiler with *one* semantics.
+   extension, splitting the language in two.
 2. **It breaks laziness.** Materializing mid-script to read a scalar forces
-   execution of the whole chain early, defeating the lazy-CTE design and changing
-   performance characteristics unpredictably.
-3. **It changes semantics under edits.** A pasted literal is frozen to the data at
-   compile time; a subquery re-evaluates against the actual chain. The subquery is
-   the more faithful and the more composable choice.
-4. **It is impure.** Compilation would depend on live data, so the same `.do` file
-   could compile to different SQL on different days. The subquery approach makes
-   compilation deterministic.
+   execution of the whole chain early, defeating the lazy-CTE design.
+3. **It is impure.** Compilation would depend on live data, so the same `.do` file
+   could compile to different SQL on different days.
 
-The only thing dodo *cannot* do without a round-trip is unroll a loop over a
-runtime list (B.3, the rejected column-per-value case). That is a deliberate,
-documented boundary, not a bug.
+Instead, we use DuckDB's `SET VARIABLE` / `getvariable()`:
+- The compiler emits `SET VARIABLE _r_max = (SELECT max(x) FROM _sN)` — valid SQL
+  that dodoc can output and DuckDB evaluates at runtime.
+- The value is frozen at the point the `SET VARIABLE` executes, matching Stata's
+  assignment-time semantics.
+- No compiler round-trip needed — the SQL is self-contained and deterministic.
+
+The only thing dodo *cannot* do is unroll a loop over a runtime list (B.4). That
+is a deliberate, documented boundary, not a bug.
 
 ---
 
 ## State changes (`DodoState`)
 
-Every macro/scalar lives in one symbol table whose entries carry the kind flag
-from §B.0, so the A-vs-B decision is a single lookup:
+### Compile-time state (in-memory, M14a — done)
+
+```cpp
+std::unordered_map<std::string, std::string> local_macros;   // `x' → text
+std::unordered_map<std::string, std::string> global_macros;  // $x  → text
+std::unordered_map<std::string, std::string> scalars;        // bare x → text
+```
+
+### Runtime state (M14b — emitted as SQL)
+
+Runtime values live in DuckDB session variables, not in compiler state. The
+compiler only tracks **which names are RUNTIME** (so it knows to emit
+`getvariable('name')` instead of text-substituting):
 
 ```cpp
 enum class BindingKind { LITERAL, RUNTIME };
 
-struct Symbol {
-    BindingKind kind;   // LITERAL = compile-time text; RUNTIME = SQL fragment
-    std::string value;  // raw text  (LITERAL)  |  "(SELECT max(x) FROM _s3)"  (RUNTIME)
-};
+// For each scalar/local, track whether it was set from a runtime expression
+std::unordered_map<std::string, BindingKind> symbol_kinds;
 
-// the three Stata namespaces, each a name -> Symbol map
-std::unordered_map<std::string, Symbol> locals;   // `x'    (do-file / loop scoped)
-std::unordered_map<std::string, Symbol> globals;  // $x     (session)
-std::unordered_map<std::string, Symbol> scalars;  // bare x (session)
+// Map from r() names to DuckDB variable names: "r(max)" → "_r_max"
+std::unordered_map<std::string, std::string> stored_results;
 
-// r()/e() and levelsof lists: always RUNTIME, populated by terminal commands
-std::unordered_map<std::string, std::string> stored_results; // "r(max)" -> "(SELECT ...)"
-std::unordered_map<std::string, std::string> runtime_lists;  // levelsof local -> "(SELECT DISTINCT ...)"
-
-// the command that last populated r(), for good error messages and volatility
+// The command that last populated r(), for volatility enforcement
 std::string last_rclass_command;
 ```
 
-`Define(table, name, rhs)` classifies once: scan the expanded `rhs` for any
-runtime symbol (`r()`, `e()`, a `RUNTIME` entry in any table, a `runtime_lists`
-name); if found, store `{RUNTIME, fragment}` with runtime refs replaced by their
-fragments; otherwise store `{LITERAL, foldedText}`. That is where taint
-propagation (§B.0) lives.
+**How it works:**
+- `scalar pi = 3.14159` → `LITERAL`, text-substituted (Category A)
+- `scalar pi = 3.14159` also emits `SET VARIABLE pi = 3.14159` for SQL-level access
+- `summarize revenue` → emits `SET VARIABLE _r_max = (SELECT max(revenue) FROM _sN)` etc.
+- `scalar hi = r(max)` → `RUNTIME`, emits `SET VARIABLE hi = getvariable('_r_max')`
+- `keep if revenue > hi` → `WHERE revenue > getvariable('hi')`
 
-Scoping: `locals` live for the duration of a `do`-file (and loop bodies); push a
-frame on `do`/loop entry and pop on exit. `globals`, `scalars`, `stored_results`,
-and `runtime_lists` are session-scoped. All are reset by `clear`/`ClearAll`
-alongside the existing fields.
+**Taint rule:** if the RHS of a definition references any `r()` token, `_N`, or
+a name already marked `RUNTIME`, the new name is `RUNTIME`. Otherwise `LITERAL`.
+
+**Scoping:** `locals` are do-file/loop scoped (push frame on entry, pop on exit).
+`globals`, `scalars`, `stored_results` are session-scoped. `clear` resets all.
 
 ---
 
@@ -418,18 +449,22 @@ alongside the existing fields.
 
 ```
 raw line(s)
-  └─ join /// continuations, strip comments        (ProcessDoFile, exists)
-       └─ LOOP UNROLLING (forvalues/foreach)        ── NEW, Category A.3
-            └─ MACRO EXPANSION ($g, `l', `=exp')     ── NEW, Category A.2
+  └─ join /// continuations, strip comments        (ProcessLines, done)
+       └─ LOOP UNROLLING (forvalues/foreach)        ── done (M14a)
+            └─ MACRO EXPANSION ($g, `l', `=exp')     ── done (M14a)
                  └─ TokenizeCommand                  (exists)
                       └─ ProcessCommand              (exists)
+                           ├─ terminal cmd (summarize/count)
+                           │    └─ emit SET VARIABLE _r_* = (SELECT ... FROM _sN)  ── M14b
                            └─ TranslateExpression    (exists)
-                                └─ resolve r()/e()/runtime scalars ── NEW, Category B
+                                └─ RUNTIME scalars → getvariable('name')           ── M14b
+                                └─ r(max) → getvariable('_r_max')                  ── M14b
 ```
 
-Category A is a string-rewriting front pass shared by both `dodoc` and the
-extension. Category B lives inside expression translation and the terminal-command
-handlers (which already exist for `summarize`/`count`), so it too is shared.
+Category A (textual preprocessing) is done. Category B (runtime) adds SQL
+generation in terminal command handlers and `getvariable()` emission in expression
+translation. Both paths emit valid SQL; dodoc and the extension share the same
+compiler.
 
 ---
 
