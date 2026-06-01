@@ -1876,6 +1876,26 @@ display "`total'"
 ----
 6
 
+# --- runtime token errors ---
+
+# local = _N must fail at compile time
+statement error
+local n = _N
+----
+runtime token '_N' which cannot be resolved at compile time
+
+# scalar = r(max) must fail at compile time
+statement error
+scalar hi = r(max)
+----
+runtime token 'r()' which cannot be resolved at compile time
+
+# global = e(N) must fail at compile time
+statement error
+global g = e(N)
+----
+runtime token 'e()' which cannot be resolved at compile time
+
 # --- cleanup ---
 
 statement ok

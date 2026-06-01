@@ -174,6 +174,36 @@ string DodoState::BuildQuery(const string &final_select) const {
 }
 
 //===--------------------------------------------------------------------===//
+// Runtime token detection — reject values that require data at compile time
+//===--------------------------------------------------------------------===//
+
+// Check if a string contains runtime-dependent tokens that cannot be resolved
+// at compile time. Returns the offending token name, or empty if clean.
+static string FindRuntimeToken(const string &expr) {
+	string lower = str::Lower(expr);
+	// _N (observation count) — only valid in SQL expressions, not compile-time
+	// Match as whole word to avoid false positives like "a_N_b"
+	for (idx_t i = 0; i < lower.size(); i++) {
+		if (lower[i] == '_' && i + 1 < lower.size() && lower[i + 1] == 'n') {
+			bool start_ok = (i == 0 || (!isalnum(lower[i - 1]) && lower[i - 1] != '_'));
+			bool end_ok = (i + 2 >= lower.size() || (!isalnum(lower[i + 2]) && lower[i + 2] != '_'));
+			if (start_ok && end_ok) {
+				return "_N";
+			}
+		}
+	}
+	// r(...) stored results
+	if (lower.find("r(") != string::npos) {
+		return "r()";
+	}
+	// e(...) estimation results
+	if (lower.find("e(") != string::npos) {
+		return "e()";
+	}
+	return "";
+}
+
+//===--------------------------------------------------------------------===//
 // Simple Expression Evaluator (for local x = expr, scalar x = expr)
 //===--------------------------------------------------------------------===//
 
@@ -1909,6 +1939,14 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
 				state.local_macros[name] = ExtractQuotedString(value);
 			} else {
+				// Check for runtime-dependent tokens
+				string rt = FindRuntimeToken(value);
+				if (!rt.empty()) {
+					throw DodoException("'local " + name + " = " + value +
+					                    "': expression contains runtime token '" + rt +
+					                    "' which cannot be resolved at compile time. "
+					                    "Runtime stored results (r(), _N) will be supported in M14b.");
+				}
 				// Evaluate as numeric expression
 				try {
 					double result = EvaluateSimpleExpr(value);
@@ -1967,6 +2005,13 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
 				state.global_macros[name] = ExtractQuotedString(value);
 			} else {
+				string rt = FindRuntimeToken(value);
+				if (!rt.empty()) {
+					throw DodoException("'global " + name + " = " + value +
+					                    "': expression contains runtime token '" + rt +
+					                    "' which cannot be resolved at compile time. "
+					                    "Runtime stored results (r(), _N) will be supported in M14b.");
+				}
 				try {
 					double result = EvaluateSimpleExpr(value);
 					state.global_macros[name] = FormatNumber(result);
@@ -2074,6 +2119,14 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string expr = Trim(args.substr(eq_pos + 1));
 
 		string value;
+		// Check for runtime-dependent tokens
+		string rt = FindRuntimeToken(expr);
+		if (!rt.empty()) {
+			throw DodoException("'scalar " + name + " = " + expr +
+			                    "': expression contains runtime token '" + rt +
+			                    "' which cannot be resolved at compile time. "
+			                    "Runtime stored results (r(), _N) will be supported in M14b.");
+		}
 		// Check for string scalar
 		if (expr.size() >= 2 && expr.front() == '"' && expr.back() == '"') {
 			value = expr.substr(1, expr.size() - 2);
@@ -3249,6 +3302,13 @@ static pair<string, vector<string>> ParseForeachHeader(const string &header, con
 		}
 		if (str::StartsWith(lower_rest, "numlist ")) {
 			string spec = Trim(rest.substr(8));
+			string rt = FindRuntimeToken(spec);
+			if (!rt.empty()) {
+				throw DodoException("'foreach " + lname + " of numlist " + spec +
+				                    "': numlist contains runtime token '" + rt +
+				                    "' which cannot be resolved at compile time. "
+				                    "Rewrite as a set-based operation (see docs/VARIABLE_SUBSTITUTION.md).");
+			}
 			return {lname, ParseNumlist(spec)};
 		}
 
@@ -3280,6 +3340,15 @@ static pair<string, vector<string>> ParseForvaluesHeader(const string &header) {
 
 	string lname = Trim(rest.substr(0, eq_pos));
 	string range = Trim(rest.substr(eq_pos + 1));
+
+	// Check for runtime tokens in range — loop bounds must be compile-time known
+	string rt = FindRuntimeToken(range);
+	if (!rt.empty()) {
+		throw DodoException("'forvalues " + lname + " = " + range +
+		                    "': loop bound contains runtime token '" + rt +
+		                    "' which cannot be resolved at compile time. "
+		                    "Rewrite as a set-based operation (see docs/VARIABLE_SUBSTITUTION.md).");
+	}
 
 	return {lname, ParseNumlist(range)};
 }
