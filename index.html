@@ -937,6 +937,24 @@ h1.doc-h1 .mono {
             <li><a href="#bysort" data-page="bysort">bysort / by</a></li>
           </ul>
         </details>
+
+        <details open>
+          <summary>
+            <span>programming</span>
+            <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square"><path d="m9 6 6 6-6 6"/></svg>
+          </summary>
+          <ul class="sidebar__list">
+            <li><a href="#local" data-page="local">local<span class="badge">new</span></a></li>
+            <li><a href="#global" data-page="global">global</a></li>
+            <li><a href="#scalar" data-page="scalar">scalar</a></li>
+            <li><a href="#foreach" data-page="foreach">foreach</a></li>
+            <li><a href="#forvalues" data-page="forvalues">forvalues</a></li>
+            <li><a href="#display" data-page="display">display</a></li>
+            <li><a href="#assert" data-page="assert">assert</a></li>
+            <li><a href="#levelsof" data-page="levelsof">levelsof</a></li>
+            <li><a href="#compress" data-page="compress">compress</a></li>
+          </ul>
+        </details>
       </div>
 
       <div class="sidebar__group">
@@ -1710,6 +1728,10 @@ _sN <span class="tok-kw">AS</span> (
             <tr><td><code>cond(a, b, c)</code></td><td><code>CASE WHEN a THEN b ELSE c END</code></td></tr>
             <tr><td><code>inrange(x, 1, 10)</code></td><td><code>x BETWEEN 1 AND 10</code></td></tr>
             <tr><td><code>inlist(x, 1, 2, 3)</code></td><td><code>x IN (1, 2, 3)</code></td></tr>
+            <tr><td><code>!expr</code></td><td><code>NOT expr</code></td></tr>
+            <tr><td><code>.</code> (bare dot)</td><td><code>NULL</code> (missing value)</td></tr>
+            <tr><td><code>missing(x, y, z)</code></td><td><code>(x IS NULL OR y IS NULL OR z IS NULL)</code></td></tr>
+            <tr><td><code>int(x)</code></td><td><code>CAST(x AS INTEGER)</code></td></tr>
           </tbody>
         </table>
 
@@ -1723,6 +1745,7 @@ _sN <span class="tok-kw">AS</span> (
             <tr><td><code>strupper(s)</code></td><td><code>UPPER(s)</code></td></tr>
             <tr><td><code>strtrim(s)</code></td><td><code>TRIM(s)</code></td></tr>
             <tr><td><code>real(s)</code></td><td><code>CAST(s AS DOUBLE)</code></td></tr>
+            <tr><td><code>substr(s, k, .)</code></td><td><code>SUBSTRING(s, k)</code> (to end of string)</td></tr>
           </tbody>
         </table>
 
@@ -1854,8 +1877,10 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
         <h2 id="mig-data">data formats</h2>
         <p>dodo reads CSV, Parquet, JSON, and <code>.dta</code> files natively. The built-in <code>.dta</code> reader supports formats 117&ndash;121 (Stata 13&ndash;18), including variable labels, value labels, strL strings, and all numeric types. No external extensions required.</p>
 
-        <h2 id="mig-programs">unsupported features</h2>
-        <p>dodo does not support user-defined programs (<code>program define</code>), macros (<code>local</code>/<code>global</code>), loops (<code>forvalues</code>, <code>foreach</code>), or matrix operations (<code>mata</code>). These are programming constructs with no SQL equivalent. If your script uses them, refactor the logic into SQL or a host language (Python, R) and use dodo for the data-manipulation parts.</p>
+        <h2 id="mig-programs">programming constructs</h2>
+        <p>dodo supports <code>local</code>, <code>global</code>, and <code>scalar</code> macros, as well as <code>foreach</code> and <code>forvalues</code> loops, <code>display</code>, and <code>assert</code>. See the <a href="#local" data-page="local" style="color:var(--accent-deep);font-weight:600;">programming</a> section for details.</p>
+        <p>Key difference: in the original, macro substitution is purely textual. In dodo, literal assignments work the same way, but expression assignments involving runtime values (like <code>_N</code>) use DuckDB's <code>SET VARIABLE</code> mechanism instead. Loop variables are scoped to the loop body and destroyed when the loop ends, unlike the original which keeps the last value.</p>
+        <p>Not supported: <code>program define</code>, <code>if</code>/<code>else</code> control flow (the command-level branching, not the <code>if</code> qualifier), <code>mata</code> matrix operations, and <code>r()</code>/<code>e()</code> stored results. The <code>levelsof ... , local()</code> option is also not available.</p>
 
         <h2 id="mig-keywords">keyword conflicts</h2>
         <p><code>describe</code> and <code>summarize</code> are also SQL keywords. dodo handles the conflict automatically when data is loaded &mdash; the commands route to dodo, not to DuckDB's <code>DESCRIBE</code>/<code>SUMMARIZE</code>. Use <code>codebook</code> as an unambiguous alias for <code>describe</code> if you prefer.</p>
@@ -1875,7 +1900,8 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
         <p class="doc-lede">dodo covers the most common data-manipulation commands. Here is what it does not do yet.</p>
 
         <h2 id="lim-lang">programming constructs</h2>
-        <p>No support for <code>local</code>/<code>global</code> macros, <code>forvalues</code>/<code>foreach</code> loops, <code>program define</code>, <code>if</code>/<code>else</code> control flow, or <code>mata</code>. These have no SQL equivalent. Use a host language for scripting and dodo for data steps.</p>
+        <p><code>local</code>, <code>global</code>, <code>scalar</code>, <code>foreach</code>, <code>forvalues</code>, <code>display</code>, and <code>assert</code> are all supported. See the <a href="#local" data-page="local" style="color:var(--accent-deep);font-weight:600;">programming</a> section.</p>
+        <p>Not supported: <code>program define</code> (user-defined programs), <code>if</code>/<code>else</code> control flow (command-level branching), <code>mata</code> (matrix operations), <code>r()</code>/<code>e()</code> stored results from estimation commands, and the <code>levelsof ... , local()</code> option. These have no SQL equivalent. Use a host language for scripting and dodo for data steps.</p>
 
         <h2 id="lim-dta">.dta files</h2>
         <p>Native <code>.dta</code> support covers formats 117&ndash;121 (Stata 13&ndash;18). Format 115 (Stata 10&ndash;12) is not supported. All 27 extended missing value codes (<code>.a</code>&ndash;<code>.z</code>) are mapped to a single <code>NULL</code>.</p>
@@ -2295,6 +2321,284 @@ cat analysis/clean.do <span class="tok-op">|</span> dodoc <span class="tok-op">-
 <span class="tok-cmd">generate</span> profit = revenue - cost;
 <span class="tok-cmd">show</span> sql;</code></pre></div>
         <p>Control formatting with <code>SET dodo_format_sql = true|false</code> and comments with <code>SET dodo_sql_comments = true|false</code>.</p>
+      </article>
+
+      <!-- ===================== programming commands ===================== -->
+
+      <!-- ---------- page: local ---------- -->
+      <article class="page" id="page-local" data-screen-label="local macros">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">local</span></div>
+        <h1 class="doc-h1"><span class="mono">local</span></h1>
+        <p class="doc-lede">Define a local macro that can be substituted into later commands with <code>`name'</code> syntax.</p>
+
+        <h2 id="loc-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">local</span> <span class="req">name</span> <span class="opt">value ...</span>
+<br/><span class="cmd">local</span> <span class="req">name</span> <span class="opt">= expr</span>
+<br/><span class="cmd">local</span> <span class="opt">++name</span>
+<br/><span class="cmd">local</span> <span class="opt">--name</span>
+        </div>
+
+        <p>Without the <code>=</code> sign, the rest of the line is stored as literal text. With <code>=</code>, the right-hand side is evaluated as an expression.</p>
+
+        <h2 id="loc-expansion">expansion</h2>
+        <p>Use <code>`name'</code> (backtick + name + single-quote) to substitute a local macro. The substitution happens at compile time before the command is parsed.</p>
+
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-com">* literal assignment — stores text</span>
+<span class="tok-cmd">local</span> outcome revenue
+<span class="tok-cmd">generate</span> log_y <span class="tok-op">=</span> <span class="tok-fn">log</span>(`outcome')
+
+<span class="tok-com">* expression assignment — evaluates the expression</span>
+<span class="tok-cmd">local</span> threshold <span class="tok-op">=</span> <span class="tok-num">100</span> <span class="tok-op">*</span> <span class="tok-num">1.5</span>
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> revenue <span class="tok-op">></span> `threshold'
+
+<span class="tok-com">* increment / decrement</span>
+<span class="tok-cmd">local</span> counter <span class="tok-op">=</span> <span class="tok-num">0</span>
+<span class="tok-cmd">local</span> ++counter
+<span class="tok-com">* counter is now 1</span></code></pre></div>
+
+        <h2 id="loc-identifier">identifier vs. value position</h2>
+        <p>A macro in <em>identifier position</em> (column name, command name) is spliced directly into the command text. A macro in <em>value position</em> (inside an expression after <code>=</code>) is substituted as a literal value.</p>
+
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-com">* identifier position — `var' becomes a column name</span>
+<span class="tok-cmd">local</span> var wage
+<span class="tok-cmd">summarize</span> `var'
+
+<span class="tok-com">* value position — `cutoff' becomes a number in the expression</span>
+<span class="tok-cmd">local</span> cutoff <span class="tok-op">=</span> <span class="tok-num">50000</span>
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> `var' <span class="tok-op">></span> `cutoff'</code></pre></div>
+
+        <div class="callout callout--warn">
+          <div class="callout__h"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"><path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>how variable substitution works in dodo</div>
+          <p><strong>Literal assignments</strong> (<code>local x hello</code>) store text and substitute it directly into commands &mdash; same behavior as the original.</p>
+          <p><strong>Expression assignments</strong> (<code>local x = 5</code>) try compile-time evaluation first. If the expression resolves to a literal (e.g., <code>100 * 1.5</code>), the result is stored and substituted the same way as a literal assignment.</p>
+          <p><strong>Runtime references:</strong> when an expression contains values that can only be known at query time (like <code>_N</code>), dodo uses DuckDB's <code>SET VARIABLE</code> and <code>getvariable()</code> mechanism. The value is evaluated by DuckDB at runtime, not by the compiler.</p>
+          <p><strong>Loop scoping:</strong> loop variables (the index in <code>foreach</code> / <code>forvalues</code>) are scoped to the loop body and destroyed when the loop ends. In the original, the loop variable keeps the last value after the loop finishes.</p>
+          <p><strong>Namespace independence:</strong> the same name can exist in the local, global, and scalar namespaces independently. They do not shadow each other.</p>
+        </div>
+      </article>
+
+      <!-- ---------- page: global ---------- -->
+      <article class="page" id="page-global" data-screen-label="global macros">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">global</span></div>
+        <h1 class="doc-h1"><span class="mono">global</span></h1>
+        <p class="doc-lede">Define a global macro, accessible with <code>$name</code> or <code>${name}</code> syntax.</p>
+
+        <h2 id="gl-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">global</span> <span class="req">name</span> <span class="opt">value ...</span>
+<br/><span class="cmd">global</span> <span class="req">name</span> <span class="opt">= expr</span>
+        </div>
+
+        <p>Without <code>=</code>, the rest of the line is stored as literal text. With <code>=</code>, the expression is evaluated. Expansion uses <code>$name</code> or <code>${name}</code> (the braces form avoids ambiguity when the macro name is followed by other text).</p>
+
+        <h2 id="gl-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-cmd">global</span> controls age education experience
+<span class="tok-cmd">generate</span> score <span class="tok-op">=</span> $controls   <span class="tok-com">// expands to: age education experience</span>
+
+<span class="tok-cmd">global</span> base_year <span class="tok-op">=</span> <span class="tok-num">2015</span>
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> year <span class="tok-op">>=</span> ${base_year}</code></pre></div>
+
+        <div class="callout">
+          <div class="callout__h"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>locals vs. globals</div>
+          <p>In dodo, both local and global macros are resolved at compile time. The distinction is syntactic: locals use <code>`name'</code>, globals use <code>$name</code>. The same substitution and scoping rules from the <a href="#local" data-page="local" style="color:var(--accent-deep);font-weight:600;">local</a> page apply.</p>
+        </div>
+      </article>
+
+      <!-- ---------- page: scalar ---------- -->
+      <article class="page" id="page-scalar" data-screen-label="scalar command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">scalar</span></div>
+        <h1 class="doc-h1"><span class="mono">scalar</span></h1>
+        <p class="doc-lede">Store a named value &mdash; text, integer, or float &mdash; that can be referenced by its bare name in expressions.</p>
+
+        <h2 id="sc-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">scalar</span> [<span class="opt">define</span>] <span class="req">name</span> = <span class="req">expr</span>
+<br/><span class="cmd">scalar</span> <span class="opt">list</span>
+<br/><span class="cmd">scalar</span> <span class="opt">drop</span> <span class="req">name</span>
+        </div>
+
+        <h2 id="sc-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-cmd">scalar</span> define cutoff <span class="tok-op">=</span> <span class="tok-num">1000</span>
+<span class="tok-cmd">keep</span> <span class="tok-kw">if</span> revenue <span class="tok-op">></span> cutoff
+
+<span class="tok-cmd">scalar</span> pi <span class="tok-op">=</span> <span class="tok-num">3.14159</span>
+<span class="tok-cmd">generate</span> area <span class="tok-op">=</span> pi <span class="tok-op">*</span> radius<span class="tok-op">^</span><span class="tok-num">2</span>
+
+<span class="tok-cmd">scalar</span> list       <span class="tok-com">// show all scalars</span>
+<span class="tok-cmd">scalar</span> drop cutoff</code></pre></div>
+
+        <h2 id="sc-notes">notes</h2>
+        <ul>
+          <li>Scalars are referenced by their bare name in expressions &mdash; no backticks or dollar signs.</li>
+          <li>The <code>define</code> keyword is optional; <code>scalar x = 5</code> and <code>scalar define x = 5</code> are equivalent.</li>
+          <li>Scalars can hold text strings, integers, or floating-point values.</li>
+          <li>Scalars live in their own namespace, independent of local and global macros.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: foreach ---------- -->
+      <article class="page" id="page-foreach" data-screen-label="foreach loop">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">foreach</span></div>
+        <h1 class="doc-h1"><span class="mono">foreach</span></h1>
+        <p class="doc-lede">Loop over a list, repeating the body once per element. The loop variable is substituted with <code>`var'</code> syntax.</p>
+
+        <h2 id="fe-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">foreach</span> <span class="req">var</span> <span class="opt">in</span> <span class="req">list</span> { <span class="req">body</span> }
+<br/><span class="cmd">foreach</span> <span class="req">var</span> <span class="opt">of local</span> <span class="req">macname</span> { <span class="req">body</span> }
+<br/><span class="cmd">foreach</span> <span class="req">var</span> <span class="opt">of global</span> <span class="req">macname</span> { <span class="req">body</span> }
+<br/><span class="cmd">foreach</span> <span class="req">var</span> <span class="opt">of numlist</span> <span class="req">spec</span> { <span class="req">body</span> }
+        </div>
+
+        <h2 id="fe-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-com">* loop over a literal list</span>
+<span class="tok-cmd">foreach</span> v <span class="tok-kw">in</span> wage hours bonus {
+    <span class="tok-cmd">generate</span> log_`v' <span class="tok-op">=</span> <span class="tok-fn">log</span>(`v')
+}
+
+<span class="tok-com">* loop over items stored in a local</span>
+<span class="tok-cmd">local</span> outcomes revenue profit margin
+<span class="tok-cmd">foreach</span> y <span class="tok-kw">of local</span> outcomes {
+    <span class="tok-cmd">replace</span> `y' <span class="tok-op">=</span> <span class="tok-num">0</span> <span class="tok-kw">if</span> <span class="tok-fn">missing</span>(`y')
+}
+
+<span class="tok-com">* loop over a numlist</span>
+<span class="tok-cmd">foreach</span> yr <span class="tok-kw">of numlist</span> <span class="tok-num">2010</span>/<span class="tok-num">2020</span> {
+    <span class="tok-cmd">generate</span> d`yr' <span class="tok-op">=</span> (year <span class="tok-op">==</span> `yr')
+}</code></pre></div>
+
+        <h2 id="fe-notes">notes</h2>
+        <ul>
+          <li>Each iteration adds CTE steps to the query &mdash; the data is transformed once per loop pass.</li>
+          <li>The loop variable (<code>`v'</code>, <code>`y'</code>, etc.) is scoped to the loop body and destroyed when the loop ends.</li>
+          <li>The opening brace <code>{</code> must appear on the same line as <code>foreach</code>. The closing brace <code>}</code> must be on its own line.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: forvalues ---------- -->
+      <article class="page" id="page-forvalues" data-screen-label="forvalues loop">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">forvalues</span></div>
+        <h1 class="doc-h1"><span class="mono">forvalues</span></h1>
+        <p class="doc-lede">Loop over a range of numbers.</p>
+
+        <h2 id="fv-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">forvalues</span> <span class="req">var</span> = <span class="req">#1</span>/<span class="req">#2</span> { <span class="req">body</span> }
+<br/><span class="cmd">forvalues</span> <span class="req">var</span> = <span class="req">#1</span>(<span class="req">#d</span>)<span class="req">#2</span> { <span class="req">body</span> }
+        </div>
+
+        <p>The first form increments by 1 from <code>#1</code> to <code>#2</code>. The second form increments by <code>#d</code>.</p>
+
+        <h2 id="fv-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-com">* simple range</span>
+<span class="tok-cmd">forvalues</span> i <span class="tok-op">=</span> <span class="tok-num">1</span>/<span class="tok-num">5</span> {
+    <span class="tok-cmd">generate</span> lag`i' <span class="tok-op">=</span> x[_n <span class="tok-op">-</span> `i']
+}
+
+<span class="tok-com">* with step size</span>
+<span class="tok-cmd">forvalues</span> yr <span class="tok-op">=</span> <span class="tok-num">2000</span>(<span class="tok-num">5</span>)<span class="tok-num">2020</span> {
+    <span class="tok-cmd">generate</span> d`yr' <span class="tok-op">=</span> (year <span class="tok-op">==</span> `yr')
+}</code></pre></div>
+
+        <h2 id="fv-notes">notes</h2>
+        <ul>
+          <li>Same scoping as <code>foreach</code>: the loop variable is destroyed when the loop ends.</li>
+          <li>The opening brace <code>{</code> must appear on the same line as <code>forvalues</code>. The closing brace <code>}</code> must be on its own line.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: display ---------- -->
+      <article class="page" id="page-display" data-screen-label="display command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">display</span></div>
+        <h1 class="doc-h1"><span class="mono">display</span></h1>
+        <p class="doc-lede">Print a value or expression to the console. Returns a single-row result.</p>
+
+        <h2 id="di-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">display</span> <span class="req">"text"</span>
+<br/><span class="cmd">display</span> <span class="req">expr</span>
+        </div>
+
+        <h2 id="di-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-cmd">display</span> <span class="tok-str">"hello, world"</span>
+<span class="tok-cmd">display</span> <span class="tok-num">2</span> <span class="tok-op">+</span> <span class="tok-num">2</span>
+<span class="tok-cmd">display</span> <span class="tok-fn">sqrt</span>(<span class="tok-num">144</span>)</code></pre></div>
+
+        <h2 id="di-notes">notes</h2>
+        <ul>
+          <li><code>display</code> is a terminal command &mdash; it executes the expression immediately and returns one row.</li>
+          <li>Macro references are expanded before evaluation: <code>display `x'</code> prints the value of local <code>x</code>.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: assert ---------- -->
+      <article class="page" id="page-assert" data-screen-label="assert command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">assert</span></div>
+        <h1 class="doc-h1"><span class="mono">assert</span></h1>
+        <p class="doc-lede">Check that a condition holds for every row. Throws an error if any row violates it.</p>
+
+        <h2 id="as-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">assert</span> <span class="req">condition</span>
+        </div>
+
+        <h2 id="as-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-cmd">assert</span> revenue <span class="tok-op">>=</span> <span class="tok-num">0</span>
+<span class="tok-cmd">assert</span> <span class="tok-op">!</span><span class="tok-fn">missing</span>(firm_id)
+<span class="tok-cmd">assert</span> year <span class="tok-op">>=</span> <span class="tok-num">2000</span> <span class="tok-op">&</span> year <span class="tok-op"><=</span> <span class="tok-num">2025</span></code></pre></div>
+
+        <h2 id="as-notes">notes</h2>
+        <ul>
+          <li>If any row fails the condition, dodo raises an error and reports the number of violations.</li>
+          <li><code>assert</code> does not modify the data &mdash; it is a check only.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: levelsof ---------- -->
+      <article class="page" id="page-levelsof" data-screen-label="levelsof command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">levelsof</span></div>
+        <h1 class="doc-h1"><span class="mono">levelsof</span></h1>
+        <p class="doc-lede">Return the distinct values of a variable.</p>
+
+        <h2 id="lv-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">levelsof</span> <span class="req">varname</span>
+        </div>
+
+        <h2 id="lv-examples">examples</h2>
+        <div class="codeblock"><div class="codeblock__head"><span class="codeblock__lang">.do</span></div>
+<pre><code><span class="tok-cmd">levelsof</span> sector
+<span class="tok-cmd">levelsof</span> year</code></pre></div>
+
+        <h2 id="lv-notes">notes</h2>
+        <ul>
+          <li><code>levelsof</code> is a terminal command that returns the distinct values of the specified variable.</li>
+          <li>The <code>local()</code> option from the original is not supported. Use <code>levelsof</code> for inspection only.</li>
+        </ul>
+      </article>
+
+      <!-- ---------- page: compress ---------- -->
+      <article class="page" id="page-compress" data-screen-label="compress command">
+        <div class="crumbs"><a href="#getting-started" data-page="getting-started">docs</a><span class="sep">/</span><a href="#" onclick="return false">commands</a><span class="sep">/</span><a href="#" onclick="return false">programming</a><span class="sep">/</span><span class="cur">compress</span></div>
+        <h1 class="doc-h1"><span class="mono">compress</span></h1>
+        <p class="doc-lede">Accepted for compatibility. No-op &mdash; DuckDB handles storage types automatically.</p>
+
+        <h2 id="cp-syntax">syntax</h2>
+        <div class="syntax">
+<span class="cmd">compress</span>
+        </div>
+
+        <h2 id="cp-notes">notes</h2>
+        <p>In the original, <code>compress</code> shrinks variable storage types to the smallest type that fits the data. DuckDB manages storage automatically, so this command is silently accepted and does nothing.</p>
       </article>
 
       <!-- ---------- page: dodoc-overview ---------- -->
