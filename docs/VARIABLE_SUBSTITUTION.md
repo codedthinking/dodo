@@ -68,6 +68,11 @@ substituted.
 Loop bounds must be compile-time known. A loop whose bound comes from
 `getvariable()` cannot be unrolled — the compiler raises an error.
 
+**Scoping:** Loop index variables are scoped to the loop body. They are set as
+LITERAL entries in `local_symbols` during each iteration and **erased** when
+the loop ends. Variables created inside the loop body (via `local`, `scalar`,
+etc.) persist normally — only the index variable is destroyed.
+
 ### Status
 
 **M14a: Done.** See `docs/M14.md`.
