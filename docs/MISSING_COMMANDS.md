@@ -1,8 +1,8 @@
 # Missing Commands in dodo
 
-Inventory based on [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create). Updated May 2026 for v0.2.0.
+Inventory based on [korenmiklos/ceo-value](https://github.com/korenmiklos/ceo-value/tree/main/lib/create). Updated June 2026 for v0.3.0.
 
-## Implemented (v0.2.0)
+## Implemented (v0.3.0)
 
 These were previously listed as missing but are now complete:
 
@@ -22,6 +22,13 @@ These were previously listed as missing but are now complete:
 - `undo`/`redo`, `history`
 - `show sql`
 - `var[_n-1]` subscript syntax (positional lag/lead)
+- `local`/`global`/`scalar` macros with compile-time and runtime (`SET VARIABLE`) evaluation
+- `foreach`/`forvalues` loops with compile-time unrolling
+- `display`, `assert`, `compress`, `levelsof`
+- `tempvar`, `tempname`
+- `!` as NOT, `.` as NULL, multi-arg `missing()`
+- Bulk `rename` syntax
+- `total` as alias for `sum` in `egen`
 
 ## Still missing
 
@@ -29,16 +36,8 @@ These were previously listed as missing but are now complete:
 
 | Gap | Usage | SQL mapping |
 |---|---|---|
-| Compile-time macros (`local`/`global`/literal `scalar`, `` `x' ``/`$x`) | Variable substitution | Textual substitution in a pre-tokenization pass |
-| `foreach` / `forvalues` loops | Repeated operations | Unroll the body at compile time |
-| Runtime results (`r(max)`, `r(N)`, `levelsof … local()`) | Reuse of computed values | Compiled to **SQL subqueries**, not substituted as literals |
-
-These are programming constructs, not data commands. Design lives in
-**`docs/VARIABLE_SUBSTITUTION.md`**: the core split is *compile-time-known* values
-(handled by textual substitution + loop unrolling, works in `dodoc` with no
-database) versus *runtime-dependent* values (`r()`, `levelsof`), which are
-compiled into the generated SQL as subqueries rather than fetched and pasted
-back — preserving lazy evaluation and `dodoc`/extension parity.
+| Runtime stored results (`r(max)`, `r(N)`, `e()`) | Reuse of computed values | Planned as single-row tables (M14c) |
+| `levelsof ... , local()` option | Store distinct values in macro | Planned via set-based SQL rewrites |
 
 ### Nice to have
 
@@ -47,8 +46,8 @@ back — preserving lazy evaluation and `dodoc`/extension parity.
 | `joinby` | Many-to-many merge | Could use `CROSS JOIN` or unrestricted `JOIN` |
 | `reghdfe` / `regress` | Regression | Needs stats extension or custom implementation |
 | `recode` | Value recoding | `CASE WHEN` chains |
-| `scalar`, `display`, `assert` | Scripting/debugging | Low priority |
 | `set seed` | Simulation setup | `SELECT setseed(N)` |
-| `compress` | No-op | DuckDB doesn't need this |
 | `mvencode _all` | Replace all missing | Needs column introspection at runtime |
 | `reshape wide` with multiple value vars | Multi-var pivot | Currently supports one value variable |
+| `program define` | User-defined programs | No SQL equivalent |
+| `if`/`else` control flow | Branching | No SQL equivalent |

@@ -728,7 +728,7 @@ Six high-impact fixes based on reviewing production .do files from ceo-value:
 
 ---
 
-## Current Source Structure (v0.2.0)
+## Current Source Structure (v0.3.0)
 
 The codebase is split into three modules:
 
@@ -783,7 +783,7 @@ Key files:
 | M18 | `undo`/`redo`, `history` | Done |
 | M19 | Polish phase 2: `!` NOT, `.` missing, multi-arg `missing()`, bulk `rename`, `total`, `assert` | Partial (`display`, `compress`, type qualifiers done) |
 
-### Added in v0.2.0 (not in original plan)
+### Added in v0.2.0–v0.3.0 (not in original plan)
 
 - **`dodoc` standalone compiler** (`src/cli/`) — translates .do to SQL without DuckDB
 - **SQL formatting** — formatted output with indentation and `-- [source]` comments

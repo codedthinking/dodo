@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-static const char *DODOC_VERSION = "0.2.0";
+static const char *DODOC_VERSION = "0.3.0";
 
 static void print_usage(const char *prog) {
 	std::cerr << "Usage: " << prog << " [OPTIONS] [INPUT_FILE]\n"
