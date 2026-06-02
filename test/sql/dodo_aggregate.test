@@ -244,3 +244,32 @@ count
 
 statement ok
 clear
+
+# ============================================================
+# egen with nested expression (cond inside aggregate)
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+# egen min of conditional expression: first year with revenue > 1000
+statement ok
+egen first_big_year = min(cond(revenue > 1000, year, .)), by(year)
+
+statement ok
+keep year first_big_year
+
+statement ok
+duplicates drop
+
+statement ok
+sort year
+
+query II
+list
+----
+2017	2017
+2018	2018
+
+statement ok
+clear

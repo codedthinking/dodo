@@ -2567,7 +2567,9 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string by_cols = ParseByOption(cmd.options);
 		string partition = by_cols.empty() ? "" : "PARTITION BY " + by_cols;
 
-		string window_expr = sql_func + "(" + QuoteIdent(func_arg) + ") OVER (" + partition + ")";
+		// func_arg may be an expression (e.g., cond(...)), not just a column name
+		string translated_arg = TrExpr(func_arg, by_cols);
+		string window_expr = sql_func + "(" + translated_arg + ") OVER (" + partition + ")";
 
 		if (!cmd.condition.empty()) {
 			string sql_cond = TrExpr(cmd.condition, by_cols);
