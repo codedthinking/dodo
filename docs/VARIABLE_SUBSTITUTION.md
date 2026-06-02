@@ -76,61 +76,84 @@ Loop bounds must be compile-time known. A loop whose bound comes from
 
 ## Value position — `SET VARIABLE` (M14b)
 
-Everything that appears as a **value** (not an identifier) compiles to DuckDB's
-`SET VARIABLE`. This covers constants, computed results, and observation counts.
+For `=` assignments, the compiler first tries to evaluate the expression at
+compile time (after macro expansion). If the expression is fully resolvable
+to a literal, the symbol is stored as **LITERAL**. Otherwise, the compiler
+emits `SET VARIABLE` and stores the symbol as **VARIABLE**.
 
 ### The mechanism
 
-```sql
--- Assignment: evaluates RHS when the statement executes, freezes the value
-SET VARIABLE pi = 3.14159;
-SET VARIABLE n = (SELECT count(*) FROM _s3);
-SET VARIABLE floor = getvariable('pi') * 2;
+```stata
+scalar pi = 3.14159        // parser evaluates → LITERAL "3.14159"
+local a = 300              // parser evaluates → LITERAL "300"
+local b = `a' * 5         // `a' expands to "300", parser evaluates → LITERAL "1500"
+local n = _N               // _N is runtime → VARIABLE, emits SET VARIABLE _dodo_l_n = (SELECT count(*) FROM ...)
+scalar floor = `n' * 2    // `n' expands to getvariable(...), can't evaluate → VARIABLE
 ```
 
-Properties:
+When falling back to VARIABLE:
+
+```sql
+SET VARIABLE _dodo_l_n = (SELECT count(*) FROM _s3);
+SET VARIABLE _dodo_s_floor = getvariable('_dodo_l_n') * 2;
+```
+
+Properties of `SET VARIABLE`:
 - **Evaluated once at assignment.** Value is frozen when `SET VARIABLE` runs.
 - **Session-scoped.** Variables persist across statements within a connection.
-- **Composable.** `SET VARIABLE floor = getvariable('pi') * 2` works natively.
+- **Composable.** `getvariable()` references work inside `SET VARIABLE` RHS.
 - **dodoc-safe.** `SET VARIABLE` is valid DuckDB SQL.
 - **No compiler round-trip.** The compiler emits SQL; DuckDB evaluates it.
 
-M14b emits `SET VARIABLE` for assignments only. Use-site resolution (emitting
-`getvariable()` in expressions like `WHERE revenue > floor`) comes in a later
-milestone.
+### Symbol resolution at use sites
+
+When a symbol is encountered during macro expansion (`ExpandMacros`):
+- **LITERAL** entry → substitute the stored text directly
+- **VARIABLE** entry → substitute `getvariable('<uname>')`
+
+```stata
+local vars revenue profit     // LITERAL → `vars' expands to "revenue profit"
+local a = 300                 // LITERAL → `a' expands to "300"
+local n = _N                  // VARIABLE → `n' expands to getvariable('_dodo_l_n')
+```
+
+This means LITERAL symbols propagate: if `a` is LITERAL and `b = `a' * 5`,
+macro expansion produces `b = 300 * 5`, the parser evaluates to 1500, and `b`
+is also LITERAL. Only when a VARIABLE symbol contaminates an expression does
+the result become VARIABLE.
 
 ### Scalars
 
-Every `scalar` command emits `SET VARIABLE`:
-
 ```stata
-scalar pi = 3.14159        // → SET VARIABLE pi = 3.14159
-scalar floor = pi * 2      // → SET VARIABLE floor = getvariable('pi') * 2
+scalar pi = 3.14159        // LITERAL "3.14159" — parser evaluates
+scalar floor = pi * 2      // pi is LITERAL, expands to "3.14159", evaluates → LITERAL "6.28318"
+scalar n = _N              // VARIABLE → SET VARIABLE _dodo_s_n = (SELECT count(*) FROM ...)
+scalar msg = "hello"       // LITERAL "hello" — quoted string
 ```
 
 ### `local`/`global` with `=`
 
 When `local` or `global` uses `=`, it defines a value (not a word list for
-identifier substitution). These also compile to `SET VARIABLE`:
+identifier substitution):
 
 ```stata
-local n = _N               // → SET VARIABLE n = (SELECT count(*) FROM _sN)
-local threshold = 1500     // → SET VARIABLE threshold = 1500
+local n = _N               // VARIABLE → SET VARIABLE _dodo_l_n = (SELECT count(*) FROM _sN)
+local threshold = 1500     // LITERAL "1500" — parser evaluates
+local msg = "hello"        // LITERAL "hello" — quoted string
 ```
 
-**Note:** The same local can appear in both positions. `local x 5` stores `"5"`.
-If used as `` generate col`x' = 1 `` (identifier), it's text-substituted to
-`generate col5 = 1`. The compiler determines which mechanism to use based on
-where in the SQL the reference lands. Use-site `getvariable()` emission is a
-later milestone.
+**Note:** The same local can appear in both positions. `local x 5` stores `"5"`
+as LITERAL. `local x = 5` also stores `"5"` as LITERAL (parser evaluates).
+Both expand identically via `` `x' `` → `"5"`. The difference only arises
+when the RHS contains runtime references.
 
 ### `_N` (observation count)
 
 `_N` in a `SET VARIABLE` context compiles to a count subquery:
 
 ```stata
-local n = _N               // → SET VARIABLE n = (SELECT count(*) FROM _sN)
-scalar total = _N          // → SET VARIABLE total = (SELECT count(*) FROM _sN)
+local n = _N               // → SET VARIABLE _dodo_l_n = (SELECT count(*) FROM _sN)
+scalar total = _N          // → SET VARIABLE _dodo_s_total = (SELECT count(*) FROM _sN)
 ```
 
 `_N` inside SQL expressions (e.g., `generate pct = _n / _N`) continues to use
@@ -237,21 +260,64 @@ Execute `summarize`, read the result, substitute the literal into later commands
 
 ## State changes (`DodoState`)
 
-### Compiler state (M14a — done)
+### Unified symbol table (M14b)
+
+The runtime carries a single symbol table with four namespaces: local macro,
+global macro, scalar, and table. The same name can exist in all namespaces
+independently. Each symbol is either **LITERAL** (text value stored directly)
+or **VARIABLE** (backed by a DuckDB `SET VARIABLE`, resolved at runtime via
+`getvariable()`).
 
 ```cpp
-// Text substitution (identifier position)
-std::unordered_map<std::string, std::string> local_macros;   // `x' → text
-std::unordered_map<std::string, std::string> global_macros;  // $x  → text
+enum class SymbolKind { LITERAL, VARIABLE };
+
+struct SymbolEntry {
+    SymbolKind kind;
+    std::string value;  // LITERAL: the text; VARIABLE: the DuckDB variable name
+};
+
+// Four distinct namespaces — same name can exist in each
+std::unordered_map<std::string, SymbolEntry> local_symbols;
+std::unordered_map<std::string, SymbolEntry> global_symbols;
+std::unordered_map<std::string, SymbolEntry> scalar_symbols;
+// table_symbols reserved for M14c
+
+std::vector<std::string> pending_sql;  // queued SET VARIABLE statements
 ```
 
-### Value state (M14b)
+**LITERAL** symbols have a text value stored directly. A symbol is LITERAL when:
+- Declared without `=` (word lists): `local vars revenue profit`
+- Declared with `=` and a quoted string: `scalar msg = "hello"`
+- Declared with `=` and an expression that the parser can fully evaluate at
+  compile time (all operands are literals or resolve to LITERAL symbols):
 
-```cpp
-// Names that have been SET VARIABLE'd — so the compiler knows which
-// names are session variables (vs column references)
-std::unordered_set<std::string> set_variables;
+```stata
+local vars revenue profit      // LITERAL: "revenue profit"
+scalar msg = "hello"           // LITERAL: "hello"
+local a = 300                  // LITERAL: "300" (parser evaluates 300 → "300")
+scalar pi = 3.14159            // LITERAL: "3.14159"
+local b = `a' * 5             // LITERAL: "1500" (a is LITERAL "300", expands, evaluates)
 ```
+
+**VARIABLE** symbols are backed by a DuckDB `SET VARIABLE`. A symbol becomes
+VARIABLE when the expression parser cannot fully evaluate the RHS — i.e., after
+macro expansion, the expression still contains runtime references (`_N`,
+`getvariable()` from other VARIABLE symbols, etc.):
+
+```stata
+local n = _N                   // VARIABLE: _dodo_l_n → SET VARIABLE _dodo_l_n = (SELECT count(*) FROM ...)
+scalar hi = _N - 1             // VARIABLE: _dodo_s_hi → SET VARIABLE _dodo_s_hi = (SELECT count(*) - 1 FROM ...)
+local m = `n' + 1             // VARIABLE: n is VARIABLE, expands to getvariable(...), can't evaluate
+```
+
+The decision is made by the expression parser: **try to evaluate → if it
+succeeds, LITERAL; if it fails, VARIABLE with SET VARIABLE**. This keeps
+compile-time evaluation as the fast path and only falls back to runtime when
+necessary.
+
+Unique DuckDB variable names follow the pattern `_dodo_<prefix>_<name>` where
+prefix is `l` (local), `g` (global), or `s` (scalar). This ensures namespace
+isolation: `local x` and `scalar x` produce `_dodo_l_x` and `_dodo_s_x`.
 
 ### Result table state (M14c)
 
@@ -275,15 +341,16 @@ raw line(s)
   └─ join /// continuations, strip comments        (ProcessLines, done)
        └─ LOOP UNROLLING (forvalues/foreach)        ── done (M14a)
             └─ TEXT SUBSTITUTION ($g, `l')           ── done (M14a)
+                 │  LITERAL symbols → substitute text directly
+                 │  VARIABLE symbols → substitute getvariable('<uname>')
                  └─ TokenizeCommand                  (exists)
                       └─ ProcessCommand              (exists)
-                           ├─ scalar / local =       → emit SET VARIABLE         ── M14b
+                           ├─ local/global/scalar =  → emit SET VARIABLE         ── M14b
                            ├─ terminal cmd           → emit result table          ── M14c
                            ├─ scalar name = cmd      → emit named result table    ── M14c
-                           └─ TranslateExpression    (exists)
+                           └─ TranslateExpression    (exists, no symbol lookup)
                                 └─ r(max)            → (SELECT max FROM _r)       ── M14c
                                 └─ result.field      → (SELECT field FROM _name)  ── M14c
-                                └─ known SET VAR     → getvariable('name')       ── future
                                 └─ unknown names     → column reference (as-is)
 ```
 
@@ -292,9 +359,12 @@ raw line(s)
 ## Milestone split
 
 - **M14a — Text substitution & loops. ✅ DONE.** See `docs/M14.md`.
-- **M14b — `SET VARIABLE` for assignments.** `scalar`/`local =`/`global =`
-  emit `SET VARIABLE`. `_N` emits count subquery. `levelsof` for set membership.
-  No use-site `getvariable()` emission yet.
+- **M14b — Unified symbol table & `SET VARIABLE`.** Replace separate macro/scalar
+  maps with `SymbolEntry` (LITERAL/VARIABLE) in four namespaces. `=` assignments
+  try compile-time evaluation first (LITERAL if successful), fall back to
+  `SET VARIABLE` with namespaced unique names (`_dodo_l_x`, `_dodo_s_x`).
+  `ExpandMacros` resolves VARIABLE symbols to `getvariable()`.
+  `_N` emits count subquery. `levelsof` for set membership.
 - **M14c — Stored results as single-row tables.** Terminal commands emit
   `CREATE OR REPLACE TEMP TABLE _r AS (SELECT ...)`. `r(field)` compiles to
   `(SELECT field FROM _r)`. `scalar name = cmd` stores named result tables.
@@ -307,9 +377,17 @@ raw line(s)
 **M14a (done):** text substitution, loops, macro functions — 1359 assertions.
 
 **M14b:**
-- `scalar pi = 3.14159` → `SET VARIABLE pi = 3.14159`
-- `scalar floor = pi * 2` → `SET VARIABLE floor = getvariable('pi') * 2`
-- `local n = _N` → `SET VARIABLE n = (SELECT count(*) FROM _sN)`
+- `scalar pi = 3.14159` → LITERAL `"3.14159"` (parser evaluates, no SET VARIABLE)
+- `scalar floor = pi * 2` → LITERAL `"6.28318"` (pi is LITERAL, expands, evaluates)
+- `local n = _N` → VARIABLE, `SET VARIABLE _dodo_l_n = (SELECT count(*) FROM _sN)`
+- `local a = 300` → LITERAL `"300"` (parser evaluates)
+- `local b = `a' * 5` → LITERAL `"1500"` (a is LITERAL, expands to 300, evaluates)
+- `local m = `n' + 1` → VARIABLE (n is VARIABLE, expands to getvariable, can't evaluate)
+- `local x 5` then `` `x' `` → `"5"` (LITERAL, text substitution)
+- `local x = 5` then `` `x' `` → `"5"` (also LITERAL — parser evaluates successfully)
+- Namespace isolation: `local x = _N` and `scalar x = _N` → `_dodo_l_x` and `_dodo_s_x`
+- `foreach v of local mylist` where mylist is VARIABLE → error (cannot iterate runtime value)
+- Loop accumulation: `local total = `total' + `i'` stays LITERAL when both are LITERAL
 - `levelsof year, local(yrs); keep if inlist(year, `yrs')` →
   `WHERE year IN (SELECT DISTINCT year FROM _sK)`
 
