@@ -3318,21 +3318,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			format_clause = " (FORMAT DTA)";
 		}
 
-		string pre_save_sql;
-		// For .dta: apply variable labels as COMMENT ON COLUMN on materialized table
-		if (str::EndsWith(lower_fn, ".dta") && state.materialized && !state.variable_labels.empty()) {
-			for (auto &[col, label] : state.variable_labels) {
-				string escaped_label = label;
-				size_t pos = 0;
-				while ((pos = escaped_label.find('\'', pos)) != string::npos) {
-					escaped_label.replace(pos, 1, "''");
-					pos += 2;
-				}
-				pre_save_sql += "COMMENT ON COLUMN dodo._current." + col + " IS '" + escaped_label + "'; ";
-			}
-		}
-
-		return pre_save_sql + "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
+		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
 	}
 
 	if (cmd.command == "append") {
