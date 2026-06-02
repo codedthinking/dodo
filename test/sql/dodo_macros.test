@@ -437,7 +437,7 @@ local n = _N
 
 # Verify the SET VARIABLE was executed: getvariable should return 5
 query I
-SELECT getvariable('n')
+SELECT getvariable('_dodo_l_n')
 ----
 5
 
@@ -446,7 +446,7 @@ statement ok
 scalar total = _N
 
 query I
-SELECT getvariable('total')
+SELECT getvariable('_dodo_s_total')
 ----
 5
 
@@ -455,7 +455,7 @@ statement ok
 global g_count = _N
 
 query I
-SELECT getvariable('g_count')
+SELECT getvariable('_dodo_g_g_count')
 ----
 5
 
@@ -467,7 +467,7 @@ statement ok
 scalar n_2018 = _N
 
 query I
-SELECT getvariable('n_2018')
+SELECT getvariable('_dodo_s_n_2018')
 ----
 3
 

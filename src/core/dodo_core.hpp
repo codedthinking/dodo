@@ -12,6 +12,16 @@
 namespace dodo {
 
 //===--------------------------------------------------------------------===//
+// SymbolEntry — unified symbol table entry (LITERAL text or VARIABLE ref)
+//===--------------------------------------------------------------------===//
+enum class SymbolKind { LITERAL, VARIABLE };
+
+struct SymbolEntry {
+	SymbolKind kind;
+	std::string value; //! LITERAL: the text; VARIABLE: the DuckDB variable name (_dodo_l_x etc.)
+};
+
+//===--------------------------------------------------------------------===//
 // DodoCommand — parsed .do command representation
 //===--------------------------------------------------------------------===//
 struct DodoCommand {
@@ -47,15 +57,11 @@ struct DodoState {
 	//! Column-to-value-label mapping: column_name -> label_name
 	std::unordered_map<std::string, std::string> column_labels;
 
-	//! Stata macros (text substitution)
-	std::unordered_map<std::string, std::string> local_macros;
-	std::unordered_map<std::string, std::string> global_macros;
+	//! Unified symbol tables — four namespaces, each name → SymbolEntry
+	std::unordered_map<std::string, SymbolEntry> local_symbols;
+	std::unordered_map<std::string, SymbolEntry> global_symbols;
+	std::unordered_map<std::string, SymbolEntry> scalar_symbols;
 
-	//! Stata scalars (evaluated numeric/string values)
-	std::unordered_map<std::string, std::string> scalars;
-
-	//! Names that have been SET VARIABLE'd (M14b)
-	std::unordered_set<std::string> set_variables;
 	//! Pending SET VARIABLE SQL to emit (drained by ProcessLines / extension)
 	std::vector<std::string> pending_sql;
 
@@ -84,6 +90,19 @@ struct DodoState {
 	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
 	int preserve_checkpoint = -1;
 	int preserve_step_counter = -1;
+
+	//! Generate a unique DuckDB variable name for SET VARIABLE
+	static std::string GenerateUname(const std::string &prefix, const std::string &name) {
+		return "_dodo_" + prefix + "_" + name;
+	}
+
+	//! Resolve a symbol entry for substitution
+	static std::string ResolveSymbol(const SymbolEntry &entry) {
+		if (entry.kind == SymbolKind::LITERAL) {
+			return entry.value;
+		}
+		return "getvariable('" + entry.value + "')";
+	}
 
 	std::string LatestStep() const {
 		return cte_steps.empty() ? "" : "_s" + std::to_string(step_counter - 1);
@@ -143,9 +162,9 @@ struct DodoState {
 
 	//! Full reset: also clears macros, scalars, and tempnames
 	void ClearMacros() {
-		local_macros.clear();
-		global_macros.clear();
-		scalars.clear();
+		local_symbols.clear();
+		global_symbols.clear();
+		scalar_symbols.clear();
 		tempname_names.clear();
 		temp_counter = 0;
 	}
