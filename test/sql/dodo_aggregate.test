@@ -74,6 +74,10 @@ summarize revenue if year == 2018
 ----
 3	1833.3333333333333	1258.3057763498999	500	1250.0	2000.0	2500.0	3000
 
+# summarize with detail returns a single formatted string (not error)
+statement ok
+summarize revenue, detail
+
 # tabulate
 statement ok
 use "test/data/firms.csv", clear

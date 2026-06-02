@@ -19,7 +19,8 @@ static void print_usage(const char *prog) {
 	          << "Options:\n"
 	          << "  -o, --output FILE    Write SQL to FILE (default: stdout)\n"
 	          << "  --annotate           Emit original .do command as SQL comment\n"
-	          << "  --terminal           Also emit SQL for terminal commands\n"
+	          << "  --no-terminal        Suppress SQL for terminal commands (count, describe, etc.)\n"
+	          << "  --terminal           Emit SQL for terminal commands (default)\n"
 	          << "  -v, --version        Show version\n"
 	          << "  -h, --help           Show this help message\n";
 }
@@ -28,7 +29,7 @@ struct CliOptions {
 	std::string input_file;  // empty = stdin
 	std::string output_file; // empty = stdout
 	bool annotate = false;
-	bool terminal = false;
+	bool terminal = true;
 };
 
 static CliOptions parse_args(int argc, char *argv[]) {
@@ -51,6 +52,8 @@ static CliOptions parse_args(int argc, char *argv[]) {
 			opts.annotate = true;
 		} else if (arg == "--terminal") {
 			opts.terminal = true;
+		} else if (arg == "--no-terminal") {
+			opts.terminal = false;
 		} else if (arg[0] == '-') {
 			std::cerr << "Unknown option: " << arg << "\n";
 			print_usage(argv[0]);

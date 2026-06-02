@@ -996,6 +996,29 @@ SELECT getvariable('_dodo_l_m')
 ----
 6
 
+# --- display concatenation ---
+
+statement ok
+clear
+
+statement ok
+scalar drop _all
+
+statement ok
+macro drop _all
+
+# Multiple quoted strings concatenated
+query T
+display "Hello " "world"
+----
+Hello world
+
+# Mixed string and number display
+query T
+display "value = " 3.14
+----
+value = 3.14
+
 # --- cleanup ---
 
 statement ok

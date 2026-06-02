@@ -2358,22 +2358,88 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			args += ", " + cmd.options;
 		}
 		args = Trim(args);
-		// Strip quotes
-		if (args.size() >= 2 && args.front() == '"' && args.back() == '"') {
-			args = args.substr(1, args.size() - 2);
+
+		if (args.empty()) {
+			return "SELECT '' AS display";
 		}
-		// If args contain getvariable() calls, evaluate as expression
-		if (args.find("getvariable(") != string::npos) {
-			return "SELECT " + args + " AS display";
+
+		// Parse display arguments into tokens: quoted strings, format specs
+		// (e.g. %5.2f), and bare expressions. Then concatenate with ||.
+		vector<string> sql_parts;
+		size_t i = 0;
+		while (i < args.size()) {
+			// Skip whitespace between tokens
+			while (i < args.size() && args[i] == ' ') {
+				i++;
+			}
+			if (i >= args.size()) {
+				break;
+			}
+
+			if (args[i] == '"') {
+				// Quoted string literal — find closing quote
+				size_t start = i + 1;
+				size_t end = args.find('"', start);
+				if (end == string::npos) {
+					end = args.size();
+				}
+				string lit = args.substr(start, end - start);
+				// Escape single quotes for SQL
+				string escaped;
+				for (char c : lit) {
+					if (c == '\'') {
+						escaped += "''";
+					} else {
+						escaped += c;
+					}
+				}
+				sql_parts.push_back("'" + escaped + "'");
+				i = (end < args.size()) ? end + 1 : end;
+			} else if (args[i] == '%') {
+				// Format spec like %5.2f — skip it (formatting not yet supported)
+				size_t start = i;
+				i++;
+				while (i < args.size() && args[i] != ' ' && args[i] != '"') {
+					i++;
+				}
+				// Silently skip the format spec for now
+			} else {
+				// Bare expression token — collect until next quoted string or whitespace
+				// but respect parentheses (e.g. getvariable('name'))
+				size_t start = i;
+				int paren_depth = 0;
+				while (i < args.size()) {
+					if (args[i] == '(') {
+						paren_depth++;
+					} else if (args[i] == ')') {
+						paren_depth--;
+						if (paren_depth <= 0) {
+							i++;
+							break;
+						}
+					} else if (paren_depth == 0 && (args[i] == ' ' || args[i] == '"')) {
+						break;
+					}
+					i++;
+				}
+				string expr = Trim(args.substr(start, i - start));
+				if (!expr.empty()) {
+					// Cast to VARCHAR so || concatenation works on numeric values
+					sql_parts.push_back("CAST(" + expr + " AS VARCHAR)");
+				}
+			}
 		}
-		// Escape for SQL
-		string escaped = args;
-		size_t pos = 0;
-		while ((pos = escaped.find('\'', pos)) != string::npos) {
-			escaped.replace(pos, 1, "''");
-			pos += 2;
+
+		if (sql_parts.empty()) {
+			return "SELECT '' AS display";
 		}
-		return "SELECT '" + escaped + "' AS display";
+
+		// Concatenate all parts with ||
+		string concat_expr = sql_parts[0];
+		for (size_t j = 1; j < sql_parts.size(); j++) {
+			concat_expr += " || " + sql_parts[j];
+		}
+		return "SELECT " + concat_expr + " AS display";
 	}
 
 	if (!state.HasData()) {
@@ -3085,34 +3151,99 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (!cmd.condition.empty()) {
 			where_clause = " WHERE " + TrExpr(cmd.condition);
 		}
-		string sql = "SELECT "
-		             "COUNT(" +
-		             var +
-		             ") AS N, "
-		             "AVG(" +
-		             var +
-		             ") AS mean, "
-		             "STDDEV(" +
-		             var +
-		             ") AS sd, "
-		             "MIN(" +
-		             var +
-		             ") AS min, "
-		             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY " +
-		             var +
-		             ") AS p25, "
-		             "PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY " +
-		             var +
-		             ") AS p50, "
-		             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY " +
-		             var +
-		             ") AS p75, "
-		             "MAX(" +
-		             var +
-		             ") AS max "
-		             "FROM " +
-		             prev + where_clause;
-		return state.BuildQuery(sql);
+
+		// Variable label for header
+		string raw_name = Trim(cmd.arguments);
+		string var_label;
+		auto it = state.variable_labels.find(raw_name);
+		if (it != state.variable_labels.end()) {
+			var_label = it->second;
+		}
+		// Escape single quotes in label for SQL
+		string escaped_label;
+		for (char c : var_label) {
+			if (c == '\'') {
+				escaped_label += "''";
+			} else {
+				escaped_label += c;
+			}
+		}
+
+		bool detail = (str::Lower(cmd.options).find("detail") != string::npos ||
+		               str::Lower(cmd.options).find("d") == 0);
+
+		if (!detail) {
+			// Default summarize: single-row table with N, mean, sd, min, p25, p50, p75, max
+			string sql = "SELECT "
+			             "COUNT(" + var + ") AS N, "
+			             "AVG(" + var + ") AS mean, "
+			             "STDDEV(" + var + ") AS sd, "
+			             "MIN(" + var + ") AS min, "
+			             "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY " + var + ") AS p25, "
+			             "PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY " + var + ") AS p50, "
+			             "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY " + var + ") AS p75, "
+			             "MAX(" + var + ") AS max "
+			             "FROM " + prev + where_clause;
+			return state.BuildQuery(sql);
+		}
+
+		// detail option: formatted text output matching Stata layout
+		// Build header line: right-aligned variable label (or name)
+		string header_text = escaped_label.empty() ? raw_name : escaped_label;
+
+		// CTE: _prev is the data, _stats computes aggregates,
+		// _smallest/_largest get extreme values
+		string data_cte = state.BuildQuery("SELECT CAST(" + var + " AS DOUBLE) AS _val FROM " + prev + where_clause);
+
+		// Helper: fmt(width, val) = lpad(printf('%g', val), width, ' ')
+		// We inline this as a pattern for each value
+		auto F = [](int w, const string &expr) -> string {
+			return "lpad(printf('%g', " + expr + "), " + to_string(w) + ", ' ')";
+		};
+
+		string NL = " || chr(10) || ";
+
+		string sql =
+		    "SELECT "
+		    "lpad('" + header_text + "', 61, ' ')"
+		    + NL + "'-------------------------------------------------------------'"
+		    + NL + "'      Percentiles      Smallest'"
+		    + NL + "' 1%    ' || " + F(9, "p1") + " || '       ' || " + F(12, "s1")
+		    + NL + "' 5%    ' || " + F(9, "p5") + " || '       ' || " + F(12, "s2")
+		    + NL + "'10%    ' || " + F(9, "p10") + " || '       ' || " + F(12, "s3") + " || '       Obs         ' || " + F(12, "N::DOUBLE")
+		    + NL + "'25%    ' || " + F(9, "p25") + " || '       ' || " + F(12, "s4") + " || '       Sum of wgt. ' || " + F(12, "N::DOUBLE")
+		    + " || chr(10) || chr(10) || "
+		    "'50%    ' || " + F(9, "p50") + " || '                      Mean        ' || " + F(12, "mean")
+		    + NL + "'                        Largest       Std. dev.   ' || " + F(12, "sd")
+		    + NL + "'75%    ' || " + F(9, "p75") + " || '       ' || " + F(12, "l4")
+		    + NL + "'90%    ' || " + F(9, "p90") + " || '       ' || " + F(12, "l3") + " || '       Variance    ' || " + F(12, "var")
+		    + NL + "'95%    ' || " + F(9, "p95") + " || '       ' || " + F(12, "l2") + " || '       Skewness    ' || lpad(printf('%.4f', skew), 12, ' ')"
+		    + NL + "'99%    ' || " + F(9, "p99") + " || '       ' || " + F(12, "l1") + " || '       Kurtosis    ' || lpad(printf('%.1f', kurt), 12, ' ')"
+		    + " AS display FROM ("
+		    "SELECT "
+		    "COUNT(_val) AS N, "
+		    "AVG(_val) AS mean, "
+		    "COALESCE(STDDEV(_val), 0) AS sd, "
+		    "COALESCE(VARIANCE(_val), 0) AS var, "
+		    "COALESCE(SKEWNESS(_val), 0) AS skew, "
+		    "COALESCE(KURTOSIS(_val), 0) AS kurt, "
+		    "PERCENTILE_CONT(0.01) WITHIN GROUP (ORDER BY _val) AS p1, "
+		    "PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY _val) AS p5, "
+		    "PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY _val) AS p10, "
+		    "PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY _val) AS p25, "
+		    "PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY _val) AS p50, "
+		    "PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY _val) AS p75, "
+		    "PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY _val) AS p90, "
+		    "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY _val) AS p95, "
+		    "PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY _val) AS p99 "
+		    "FROM (" + data_cte + ") _d"
+		    ") _stats, "
+		    "LATERAL (SELECT list(_val::DOUBLE ORDER BY _val)[:4] AS vals FROM (" + data_cte + ") _d2) _sm, "
+		    "LATERAL (SELECT list(_val::DOUBLE ORDER BY _val DESC)[:4] AS vals FROM (" + data_cte + ") _d3) _lg, "
+		    "LATERAL (SELECT COALESCE(_sm.vals[1], 0) AS s1, COALESCE(_sm.vals[2], 0) AS s2, COALESCE(_sm.vals[3], 0) AS s3, COALESCE(_sm.vals[4], 0) AS s4) _s, "
+		    "LATERAL (SELECT COALESCE(_lg.vals[1], 0) AS l1, COALESCE(_lg.vals[2], 0) AS l2, COALESCE(_lg.vals[3], 0) AS l3, COALESCE(_lg.vals[4], 0) AS l4) _l";
+
+		return sql;
 	}
 
 	if (cmd.command == "tabulate") {
@@ -3635,6 +3766,9 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 
 		if (IsSideEffectCommand(sub_command)) {
 			side_effect_sql.push_back(sql);
+		} else if (!IsTransformationCommand(sub_command) && !sql.empty()) {
+			// Terminal command (count, describe, summarize, etc.) — collect its SQL
+			side_effect_sql.push_back(sql);
 		}
 
 		// Drain any pending SQL (SET VARIABLE from M14b)
@@ -3828,7 +3962,7 @@ vector<string> ProcessDoFile(const string &filename, DodoState &state) {
 		}
 		return false;
 	};
-	return ProcessLines(reader, state, /*skip_terminal=*/true);
+	return ProcessLines(reader, state, /*skip_terminal=*/false);
 }
 
 } // namespace dodo
