@@ -426,25 +426,75 @@ display "`total'"
 ----
 6
 
-# --- runtime token errors ---
+# --- M14b: SET VARIABLE for _N ---
 
-# local = _N must fail at compile time
-statement error
+# local = _N emits SET VARIABLE
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
 local n = _N
-----
-runtime token '_N' which cannot be resolved at compile time
 
-# scalar = r(max) must fail at compile time
+# Verify the SET VARIABLE was executed: getvariable should return 5
+query I
+SELECT getvariable('n')
+----
+5
+
+# scalar = _N also works
+statement ok
+scalar total = _N
+
+query I
+SELECT getvariable('total')
+----
+5
+
+# global = _N
+statement ok
+global g_count = _N
+
+query I
+SELECT getvariable('g_count')
+----
+5
+
+# _N after filtering should reflect filtered count
+statement ok
+keep if year == 2018
+
+statement ok
+scalar n_2018 = _N
+
+query I
+SELECT getvariable('n_2018')
+----
+3
+
+# --- levelsof ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+levelsof year
+----
+2017
+2018
+
+# --- runtime token errors (r() and e() still deferred to M14c) ---
+
+# scalar = r(max) must fail (M14c)
 statement error
 scalar hi = r(max)
 ----
-runtime token 'r()' which cannot be resolved at compile time
+requires M14c
 
-# global = e(N) must fail at compile time
+# global = e(N) must fail (M14c)
 statement error
 global g = e(N)
 ----
-runtime token 'e()' which cannot be resolved at compile time
+requires M14c
 
 # --- foreach of global ---
 

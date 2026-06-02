@@ -131,7 +131,8 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 		    StringUtil::StartsWith(lower_s, "scalar ") || StringUtil::StartsWith(lower_s, "macro ") ||
 		    StringUtil::StartsWith(lower_s, "foreach ") || StringUtil::StartsWith(lower_s, "forvalues ") ||
 		    StringUtil::StartsWith(lower_s, "tempvar ") || StringUtil::StartsWith(lower_s, "tempname ") ||
-		    StringUtil::StartsWith(lower_s, "display ")) {
+		    StringUtil::StartsWith(lower_s, "display ") ||
+		    StringUtil::StartsWith(lower_s, "levelsof ")) {
 			has_macro_commands = true;
 			break;
 		}
@@ -233,6 +234,16 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 					}
 					continue;
 				}
+
+				// Drain any pending SQL (SET VARIABLE from M14b)
+				for (auto &psql : state.core.pending_sql) {
+					Parser pend_parser;
+					pend_parser.ParseQuery(psql);
+					for (auto &stmt : pend_parser.statements) {
+						all_statements.push_back(std::move(stmt));
+					}
+				}
+				state.core.pending_sql.clear();
 
 				Parser parser;
 				parser.ParseQuery(sql);

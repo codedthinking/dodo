@@ -179,6 +179,55 @@ string DodoState::BuildQuery(const string &final_select) const {
 
 // Check if a string contains runtime-dependent tokens that cannot be resolved
 // at compile time. Returns the offending token name, or empty if clean.
+// Build a SET VARIABLE SQL statement for a runtime expression containing _N.
+// Returns the full SET VARIABLE statement ready for execution.
+static string BuildSetVariableSQL(const string &name, const string &expr, const DodoState &state) {
+	// For _N, emit: SET VARIABLE name = (SELECT count(*) FROM (<full CTE query>))
+	// The full CTE query is self-contained, so it works in any context.
+	string data_query = state.BuildQuery("SELECT * FROM " + state.LatestStep());
+
+	// Simple case: expr is just "_N"
+	string trimmed = Trim(expr);
+	if (trimmed == "_N") {
+		return "SET VARIABLE " + name + " = (SELECT count(*) FROM (" + data_query + ") AS _data)";
+	}
+
+	// General case: replace _N in the expression
+	string result = expr;
+	string out;
+	for (idx_t i = 0; i < result.size(); i++) {
+		if (result[i] == '_' && i + 1 < result.size() && result[i + 1] == 'N') {
+			bool start_ok = (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_'));
+			bool end_ok = (i + 2 >= result.size() || (!isalnum(result[i + 2]) && result[i + 2] != '_'));
+			if (start_ok && end_ok) {
+				out += "(SELECT count(*) FROM (" + data_query + ") AS _data)";
+				i++; // skip 'N'
+				continue;
+			}
+		}
+		out += result[i];
+	}
+
+	// Replace known set_variables with getvariable('name')
+	for (auto &sv : state.set_variables) {
+		idx_t spos = 0;
+		while ((spos = out.find(sv, spos)) != string::npos) {
+			bool start_ok = (spos == 0 || (!isalnum(out[spos - 1]) && out[spos - 1] != '_'));
+			bool end_ok = (spos + sv.size() >= out.size() ||
+			               (!isalnum(out[spos + sv.size()]) && out[spos + sv.size()] != '_'));
+			if (start_ok && end_ok) {
+				string replacement = "getvariable('" + sv + "')";
+				out.replace(spos, sv.size(), replacement);
+				spos += replacement.size();
+			} else {
+				spos += sv.size();
+			}
+		}
+	}
+
+	return "SET VARIABLE " + name + " = " + out;
+}
+
 static string FindRuntimeToken(const string &expr) {
 	string lower = str::Lower(expr);
 	// _N (observation count) — only valid in SQL expressions, not compile-time
@@ -647,7 +696,11 @@ string ExpandMacros(const string &text, const DodoState &state) {
 					if (valid) {
 						auto it = state.local_macros.find(content);
 						if (it != state.local_macros.end()) {
-							expanded += it->second;
+							if (it->second == "__SET_VAR__") {
+								expanded += "getvariable('" + content + "')";
+							} else {
+								expanded += it->second;
+							}
 						}
 						// If not found, expand to empty string (Stata behavior)
 						i = end + 1;
@@ -668,7 +721,11 @@ string ExpandMacros(const string &text, const DodoState &state) {
 						string name = result.substr(i + 2, end - i - 2);
 						auto it = state.global_macros.find(name);
 						if (it != state.global_macros.end()) {
-							expanded += it->second;
+							if (it->second == "__SET_VAR__") {
+								expanded += "getvariable('" + name + "')";
+							} else {
+								expanded += it->second;
+							}
 						}
 						i = end + 1;
 						continue;
@@ -683,7 +740,11 @@ string ExpandMacros(const string &text, const DodoState &state) {
 					string name = result.substr(start, j - start);
 					auto it = state.global_macros.find(name);
 					if (it != state.global_macros.end()) {
-						expanded += it->second;
+						if (it->second == "__SET_VAR__") {
+							expanded += "getvariable('" + name + "')";
+						} else {
+							expanded += it->second;
+						}
 					}
 					i = j;
 					continue;
@@ -700,8 +761,9 @@ string ExpandMacros(const string &text, const DodoState &state) {
 		result = expanded;
 
 		// Bare scalar name substitution: replace standalone identifiers
-		// that match scalar names with their values
+		// that match scalar names with their values (skip runtime vars — already handled)
 		for (auto &[sname, sval] : state.scalars) {
+			if (state.set_variables.count(sname)) continue;
 			idx_t spos = 0;
 			while ((spos = result.find(sname, spos)) != string::npos) {
 				bool start_ok = (spos == 0 || (!isalnum(result[spos - 1]) && result[spos - 1] != '_'));
@@ -794,7 +856,7 @@ const vector<string> DODO_COMMANDS = {
     "import",    "merge",      "tempfile", "preserve", "restore",    "xtset",      "tsset",
     "bysort",    "by",         "undo",     "redo",     "history",    "show",       "local",
     "global",    "scalar",     "macro",    "display",  "foreach",    "forvalues",  "tempvar",
-    "tempname", "assert", "compress"};
+    "tempname", "assert", "compress", "levelsof"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -2024,18 +2086,28 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				// Check for runtime-dependent tokens
 				string rt = FindRuntimeToken(value);
 				if (!rt.empty()) {
-					throw DodoException("'local " + name + " = " + value +
-					                    "': expression contains runtime token '" + rt +
-					                    "' which cannot be resolved at compile time. "
-					                    "Runtime stored results (r(), _N) will be supported in M14b.");
-				}
-				// Evaluate as numeric expression
-				try {
-					double result = EvaluateSimpleExpr(value);
-					state.local_macros[name] = FormatNumber(result);
-				} catch (...) {
-					// If evaluation fails, store as literal text
-					state.local_macros[name] = value;
+					if (rt == "r()" || rt == "e()") {
+						throw DodoException("'local " + name + " = " + value +
+						                    "': expression contains runtime token '" + rt +
+						                    "' which requires M14c (stored results as tables).");
+					}
+					// M14b: emit SET VARIABLE for _N
+					if (!state.HasData()) {
+						throw DodoException("'local " + name + " = " + value +
+						                    "': _N requires data. Use 'use' to load data first.");
+					}
+					state.set_variables.insert(name);
+					state.local_macros[name] = "__SET_VAR__";
+					state.pending_sql.push_back(BuildSetVariableSQL(name, value, state));
+				} else {
+					// Evaluate as numeric expression
+					try {
+						double result = EvaluateSimpleExpr(value);
+						state.local_macros[name] = FormatNumber(result);
+					} catch (...) {
+						// If evaluation fails, store as literal text
+						state.local_macros[name] = value;
+					}
 				}
 			}
 		} else {
@@ -2089,16 +2161,25 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			} else {
 				string rt = FindRuntimeToken(value);
 				if (!rt.empty()) {
-					throw DodoException("'global " + name + " = " + value +
-					                    "': expression contains runtime token '" + rt +
-					                    "' which cannot be resolved at compile time. "
-					                    "Runtime stored results (r(), _N) will be supported in M14b.");
-				}
-				try {
-					double result = EvaluateSimpleExpr(value);
-					state.global_macros[name] = FormatNumber(result);
-				} catch (...) {
-					state.global_macros[name] = value;
+					if (rt == "r()" || rt == "e()") {
+						throw DodoException("'global " + name + " = " + value +
+						                    "': expression contains runtime token '" + rt +
+						                    "' which requires M14c (stored results as tables).");
+					}
+					if (!state.HasData()) {
+						throw DodoException("'global " + name + " = " + value +
+						                    "': _N requires data. Use 'use' to load data first.");
+					}
+					state.set_variables.insert(name);
+					state.global_macros[name] = "__SET_VAR__";
+					state.pending_sql.push_back(BuildSetVariableSQL(name, value, state));
+				} else {
+					try {
+						double result = EvaluateSimpleExpr(value);
+						state.global_macros[name] = FormatNumber(result);
+					} catch (...) {
+						state.global_macros[name] = value;
+					}
 				}
 			}
 		} else {
@@ -2200,15 +2281,26 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string name = Trim(args.substr(0, eq_pos));
 		string expr = Trim(args.substr(eq_pos + 1));
 
-		string value;
-		// Check for runtime-dependent tokens
+		// Check for runtime-dependent tokens (_N, r(), e())
 		string rt = FindRuntimeToken(expr);
 		if (!rt.empty()) {
-			throw DodoException("'scalar " + name + " = " + expr +
-			                    "': expression contains runtime token '" + rt +
-			                    "' which cannot be resolved at compile time. "
-			                    "Runtime stored results (r(), _N) will be supported in M14b.");
+			// M14b: emit SET VARIABLE for runtime expressions
+			if (rt == "r()" || rt == "e()") {
+				throw DodoException("'scalar " + name + " = " + expr +
+				                    "': expression contains runtime token '" + rt +
+				                    "' which requires M14c (stored results as tables).");
+			}
+			if (!state.HasData()) {
+				throw DodoException("'scalar " + name + " = " + expr +
+				                    "': _N requires data. Use 'use' to load data first.");
+			}
+			state.set_variables.insert(name);
+			state.local_macros[name] = "__SET_VAR__";  // marker: use getvariable at use site
+			state.pending_sql.push_back(BuildSetVariableSQL(name, expr, state));
+			return "SELECT 'OK' AS status";
 		}
+
+		string value;
 		// Check for string scalar
 		if (expr.size() >= 2 && expr.front() == '"' && expr.back() == '"') {
 			value = expr.substr(1, expr.size() - 2);
@@ -2216,6 +2308,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			// Replace known scalar names with their values in the expression
 			string expanded_expr = expr;
 			for (auto &[sname, sval] : state.scalars) {
+				if (state.set_variables.count(sname)) continue; // runtime var
 				idx_t spos = 0;
 				while ((spos = expanded_expr.find(sname, spos)) != string::npos) {
 					bool start_ok = (spos == 0 || (!isalnum(expanded_expr[spos - 1]) && expanded_expr[spos - 1] != '_'));
@@ -3270,6 +3363,30 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		return "SELECT 'OK' AS status";
 	}
 
+	if (cmd.command == "levelsof") {
+		// levelsof varname [, local(macname)]
+		// Terminal command: SELECT DISTINCT varname FROM _prev ORDER BY varname
+		if (!state.HasData()) {
+			throw DodoException("No dataset in memory. Use 'use' to load data first.");
+		}
+		string args = Trim(cmd.arguments);
+		string varname;
+
+		idx_t comma = args.find(',');
+		if (comma != string::npos) {
+			varname = Trim(args.substr(0, comma));
+		} else {
+			varname = args;
+		}
+
+		if (varname.empty()) {
+			throw DodoException("'levelsof' requires a variable name");
+		}
+
+		return state.BuildQuery("SELECT DISTINCT " + QuoteIdent(varname) + " FROM " + prev +
+		                        " WHERE " + QuoteIdent(varname) + " IS NOT NULL ORDER BY " + QuoteIdent(varname));
+	}
+
 	if (cmd.command == "assert") {
 		if (cmd.arguments.empty()) {
 			throw DodoException("'assert' requires an expression");
@@ -3532,6 +3649,12 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 		if (IsSideEffectCommand(sub_command)) {
 			side_effect_sql.push_back(sql);
 		}
+
+		// Drain any pending SQL (SET VARIABLE from M14b)
+		for (auto &psql : state.pending_sql) {
+			side_effect_sql.push_back(psql);
+		}
+		state.pending_sql.clear();
 	};
 
 	// Execute a loop body with the given variable name bound to each value

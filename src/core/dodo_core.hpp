@@ -54,6 +54,11 @@ struct DodoState {
 	//! Stata scalars (evaluated numeric/string values)
 	std::unordered_map<std::string, std::string> scalars;
 
+	//! Names that have been SET VARIABLE'd (M14b)
+	std::unordered_set<std::string> set_variables;
+	//! Pending SET VARIABLE SQL to emit (drained by ProcessLines / extension)
+	std::vector<std::string> pending_sql;
+
 	//! Tempvar/tempname tracking
 	std::vector<std::string> tempvar_columns;  //! columns to exclude at scope end
 	std::vector<std::string> tempname_names;   //! scalar/macro names to drop at scope end
