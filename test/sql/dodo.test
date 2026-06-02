@@ -2137,6 +2137,145 @@ count if revenue > `s2'
 ----
 5
 
+# =============================================================
+# Type qualifiers in generate/egen
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate long x = 5
+
+statement ok
+generate byte flag = 1
+
+statement ok
+generate int count_col = id * 10
+
+statement ok
+generate double ratio = revenue / 1000.0
+
+query IIRIIIIR
+list
+----
+1	Acme	1000	2017	5	1	10	1.0
+2	Beta	2000	2018	5	1	20	2.0
+3	Gamma	1500	2017	5	1	30	1.5
+4	Delta	3000	2018	5	1	40	3.0
+5	Epsilon	500	2018	5	1	50	0.5
+
+# egen with type qualifier
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen long total_rev = sum(revenue), by(year)
+
+query IIRII
+list
+----
+1	Acme	1000	2017	2500
+2	Beta	2000	2018	5500
+3	Gamma	1500	2017	2500
+4	Delta	3000	2018	5500
+5	Epsilon	500	2018	5500
+
+# =============================================================
+# Integration test: balance-sheet-style workflow
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Parameterize with locals
+statement ok
+local start_year 2017
+
+statement ok
+local end_year 2018
+
+statement ok
+keep if inrange(year, `start_year', `end_year')
+
+query I
+count
+----
+5
+
+# Define variable lists and use in foreach
+statement ok
+local dimensions id name year
+
+statement ok
+local facts revenue
+
+statement ok
+keep `dimensions' `facts'
+
+statement ok
+order `dimensions' `facts'
+
+statement ok
+rename revenue sales
+
+# Generate typed columns
+statement ok
+generate long sales_sq = sales * sales
+
+# Loop over variables to check missing values
+statement ok
+local core_vars sales
+
+statement ok
+foreach var of local core_vars {
+    count if missing(`var')
+}
+
+# Panel operations
+statement ok
+xtset id year
+
+statement ok
+generate long lag_sales = L.sales
+
+query I
+count if missing(lag_sales)
+----
+5
+
+# Replace missing with zero
+statement ok
+mvencode lag_sales, mv(0)
+
+query I
+count if lag_sales == 0
+----
+5
+
+# Verify final dataset structure
+statement ok
+sort id
+
+query IRIIII
+list
+----
+1	Acme	2017	1000	1000000	0
+2	Beta	2018	2000	4000000	0
+3	Gamma	2017	1500	2250000	0
+4	Delta	2018	3000	9000000	0
+5	Epsilon	2018	500	250000	0
+
 # --- cleanup ---
 
 statement ok

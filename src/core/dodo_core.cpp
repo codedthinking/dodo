@@ -203,6 +203,29 @@ static string FindRuntimeToken(const string &expr) {
 	return "";
 }
 
+// Strip Stata type qualifier (byte, int, long, float, double, str#, strL) from variable name
+static string StripTypeQualifier(const string &name) {
+	static const vector<string> qualifiers = {"byte ", "int ", "long ", "float ", "double "};
+	string trimmed = Trim(name);
+	string lower = str::Lower(trimmed);
+	for (auto &q : qualifiers) {
+		if (str::StartsWith(lower, q)) {
+			return Trim(trimmed.substr(q.size()));
+		}
+	}
+	// str# or strL qualifier
+	if (str::StartsWith(lower, "str")) {
+		idx_t i = 3;
+		while (i < trimmed.size() && (isdigit(trimmed[i]) || trimmed[i] == 'L')) {
+			i++;
+		}
+		if (i > 3 && i < trimmed.size() && trimmed[i] == ' ') {
+			return Trim(trimmed.substr(i));
+		}
+	}
+	return trimmed;
+}
+
 //===--------------------------------------------------------------------===//
 // Simple Expression Evaluator (for local x = expr, scalar x = expr)
 //===--------------------------------------------------------------------===//
@@ -2297,7 +2320,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'generate' requires an assignment: generate varname = expression");
 		}
-		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -2354,7 +2377,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'egen' requires an assignment: egen varname = function(arg)");
 		}
-		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
 		string rhs = Trim(cmd.arguments.substr(eq_pos + 1));
 
 		string func_name, func_arg;
