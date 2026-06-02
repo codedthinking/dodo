@@ -3632,7 +3632,8 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 		state.pending_command = trimmed;
 		string sql = ProcessCommand(sub_cmd, state);
 
-		// In do-file context, use/import cannot materialize
+		// In do-file context, use/import cannot materialize (no DB connection)
+		// Rewrite to inline read so the CTE chain is self-contained
 		if ((sub_command == "use" || sub_command == "import") && state.materialized) {
 			string source = ExtractQuotedString(sub_cmd.arguments);
 			string read_expr = FileReadFunction(source);

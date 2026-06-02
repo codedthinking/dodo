@@ -109,23 +109,26 @@ int main(int argc, char *argv[]) {
 		out = &out_file;
 	}
 
-	// Emit the final CTE chain query if there is data
-	if (state.HasData()) {
-		if (opts.annotate) {
-			for (size_t i = 0; i < state.cte_commands.size(); i++) {
-				*out << "-- " << state.cte_commands[i] << "\n";
-			}
-		}
-		*out << state.BuildQuery("SELECT * FROM " + state.LatestStep()) << ";\n";
-	}
-
 	// Emit side-effect SQL (save, export, terminal commands)
+	bool has_side_effects = false;
 	for (auto &sql : side_effect_sql) {
 		// Skip "SELECT 'OK' AS status" lines
 		if (sql.find("SELECT 'OK' AS status") != std::string::npos) {
 			continue;
 		}
 		*out << sql << ";\n";
+		has_side_effects = true;
+	}
+
+	// Emit the final CTE chain query if there is data and no side-effect
+	// commands already consumed it (save/export embed the full CTE in COPY TO)
+	if (state.HasData() && !has_side_effects) {
+		if (opts.annotate) {
+			for (size_t i = 0; i < state.cte_commands.size(); i++) {
+				*out << "-- " << state.cte_commands[i] << "\n";
+			}
+		}
+		*out << state.BuildQuery("SELECT * FROM " + state.LatestStep()) << ";\n";
 	}
 
 	return 0;

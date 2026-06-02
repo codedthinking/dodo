@@ -215,3 +215,63 @@ count
 
 statement ok
 clear
+
+# ============================================================
+# save/export: pipeline runs once (no duplicate CTE)
+# ============================================================
+
+# save to csv after multiple transforms, then re-read to verify
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+generate rev2 = revenue * 2
+
+statement ok
+save "test/data/firms_save_test.csv", replace
+
+statement ok
+use "test/data/firms_save_test.csv", clear
+
+query I
+count
+----
+3
+
+# Verify the generated column survived the save
+statement ok
+keep id rev2
+
+query IR
+list
+----
+2	4000
+4	6000
+5	1000
+
+statement ok
+clear
+
+# export delimited after transforms, re-read
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if revenue > 1000
+
+statement ok
+export delimited using "test/data/firms_export_test.csv", replace
+
+statement ok
+import delimited "test/data/firms_export_test.csv", clear
+
+query I
+count
+----
+3
+
+statement ok
+clear
