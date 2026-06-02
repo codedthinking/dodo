@@ -109,20 +109,23 @@ int main(int argc, char *argv[]) {
 		out = &out_file;
 	}
 
-	// Emit side-effect SQL (save, export, terminal commands)
-	bool has_side_effects = false;
+	// Emit side-effect SQL (CREATE TABLE, SET VARIABLE, COPY TO, etc.)
+	bool has_terminal_side_effect = false;
 	for (auto &sql : side_effect_sql) {
 		// Skip "SELECT 'OK' AS status" lines
 		if (sql.find("SELECT 'OK' AS status") != std::string::npos) {
 			continue;
 		}
 		*out << sql << ";\n";
-		has_side_effects = true;
+		// COPY TO embeds the full CTE — don't also emit standalone CTE
+		if (sql.find("COPY (") != std::string::npos) {
+			has_terminal_side_effect = true;
+		}
 	}
 
-	// Emit the final CTE chain query if there is data and no side-effect
-	// commands already consumed it (save/export embed the full CTE in COPY TO)
-	if (state.HasData() && !has_side_effects) {
+	// Emit the final CTE chain query if there is data and no terminal
+	// side-effect already consumed it (save/export embed the full CTE in COPY TO)
+	if (state.HasData() && !has_terminal_side_effect) {
 		if (opts.annotate) {
 			for (size_t i = 0; i < state.cte_commands.size(); i++) {
 				*out << "-- " << state.cte_commands[i] << "\n";

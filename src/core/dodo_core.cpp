@@ -1619,9 +1619,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 	if (cmd.command == "use") {
 		// Drop previous materialized table if switching datasets
-		string pre_cleanup;
 		if (state.materialized) {
-			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
+			state.pending_sql.push_back("DROP TABLE IF EXISTS dodo._current");
 		}
 		string saved_cmd = state.pending_command;
 		state.Clear();
@@ -1632,11 +1631,10 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		bool lazy = (lower_opts.find("lazy") != string::npos);
 		bool is_file = (read_expr != source);
 
-		string result_sql;
 		if (!lazy && is_file) {
-			// Materialize: create table, reference it in CTE chain
-			result_sql = "CREATE SCHEMA IF NOT EXISTS dodo; ";
-			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM " + read_expr + "; ";
+			// Materialize: create table, then reference it in CTE chain
+			state.pending_sql.push_back("CREATE SCHEMA IF NOT EXISTS dodo");
+			state.pending_sql.push_back("CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM " + read_expr);
 			state.AddStep("SELECT * FROM dodo._current");
 			state.materialized = true;
 		} else {
@@ -1659,8 +1657,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			}
 		}
 
-		result_sql += "SELECT 'OK' AS status";
-		return pre_cleanup + result_sql;
+		return "SELECT 'OK' AS status";
 	}
 
 	if (cmd.command == "clear") {
@@ -1783,12 +1780,14 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	if (cmd.command == "do") {
 		string filename = ExtractQuotedString(cmd.arguments);
 		auto side_effect_sql = ProcessDoFile(filename, state);
-		string result;
+		// Push side-effect SQL (CREATE TABLE, SET VARIABLE) to pending_sql
+		// so the caller (extension/dodoc) drains them in the correct order
 		for (auto &sql : side_effect_sql) {
-			result += sql + "; ";
+			if (sql.find("SELECT 'OK' AS status") == string::npos) {
+				state.pending_sql.push_back(sql);
+			}
 		}
-		result += "SELECT 'OK' AS status";
-		return result;
+		return "SELECT 'OK' AS status";
 	}
 
 	if (cmd.command == "label") {
@@ -3631,21 +3630,6 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 		auto sub_cmd = TokenizeCommand(trimmed);
 		state.pending_command = trimmed;
 		string sql = ProcessCommand(sub_cmd, state);
-
-		// In do-file context, use/import cannot materialize (no DB connection)
-		// Rewrite to inline read so the CTE chain is self-contained
-		if ((sub_command == "use" || sub_command == "import") && state.materialized) {
-			string source = ExtractQuotedString(sub_cmd.arguments);
-			string read_expr = FileReadFunction(source);
-			if (sub_command == "import") {
-				string imp_rest = Trim(sub_cmd.arguments.substr(10));
-				read_expr = "read_csv('" + ExtractQuotedString(imp_rest) + "')";
-			}
-			state.cte_steps.clear();
-			state.step_counter = 0;
-			state.AddStep("SELECT * FROM " + read_expr);
-			state.materialized = false;
-		}
 
 		if (IsSideEffectCommand(sub_command)) {
 			side_effect_sql.push_back(sql);
