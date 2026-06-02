@@ -1398,8 +1398,14 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	result = std::regex_replace(result, log_re, "LN(");
 	// missing() already handled above (before L./F./D.)
 	// substr(s, start, len) -> SUBSTRING(s, start, len)
+	// substr(s, start, .) -> SUBSTRING(s, start) — Stata . means "to end", DuckDB uses 2-arg form
 	std::regex substr_re("\\bsubstr\\s*\\(");
 	result = std::regex_replace(result, substr_re, "SUBSTRING(");
+	// Clean up SUBSTRING(x, y, NULL) -> SUBSTRING(x, y) since . was already replaced with NULL
+	{
+		std::regex substr_null_re("SUBSTRING\\(([^)]+),\\s*NULL\\)");
+		result = std::regex_replace(result, substr_null_re, "SUBSTRING($1)");
+	}
 	// strlen(s) -> LENGTH(s)
 	std::regex strlen_re("\\bstrlen\\s*\\(");
 	result = std::regex_replace(result, strlen_re, "LENGTH(");
@@ -1412,12 +1418,40 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	// strtrim(s) -> TRIM(s)
 	std::regex strtrim_re("\\bstrtrim\\s*\\(");
 	result = std::regex_replace(result, strtrim_re, "TRIM(");
-	// real(s) -> CAST(s AS DOUBLE)
-	std::regex real_re("\\breal\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, real_re, "CAST($1 AS DOUBLE)");
+	// real(s) -> CAST(s AS DOUBLE) — uses paren-balancing for nested calls like real(substr(...))
 	// int(x) -> CAST(x AS INTEGER)
-	std::regex int_re("\\bint\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, int_re, "CAST($1 AS INTEGER)");
+	for (auto &[func_name, cast_type] : vector<pair<string, string>>{{"real", "DOUBLE"}, {"int", "INTEGER"}}) {
+		string out;
+		for (idx_t i = 0; i < result.size(); ) {
+			// Check for word boundary + func_name + optional spaces + (
+			if (result.substr(i, func_name.size()) == func_name &&
+			    (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_')) &&
+			    i + func_name.size() < result.size()) {
+				idx_t j = i + func_name.size();
+				while (j < result.size() && result[j] == ' ') j++;
+				if (j < result.size() && result[j] == '(') {
+					// Find matching closing paren
+					int depth = 1;
+					idx_t start = j + 1;
+					idx_t k = start;
+					while (k < result.size() && depth > 0) {
+						if (result[k] == '(') depth++;
+						else if (result[k] == ')') depth--;
+						if (depth > 0) k++;
+					}
+					if (depth == 0) {
+						string inner = result.substr(start, k - start);
+						out += "CAST(" + inner + " AS " + cast_type + ")";
+						i = k + 1;
+						continue;
+					}
+				}
+			}
+			out += result[i];
+			i++;
+		}
+		result = out;
+	}
 	// round(x) and round(x, d) — DuckDB supports ROUND natively, pass through
 	// abs(x) — DuckDB supports ABS natively, pass through
 

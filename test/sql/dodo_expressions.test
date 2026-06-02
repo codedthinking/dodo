@@ -257,5 +257,38 @@ count
 ----
 5
 
+# --- substr with . (missing) as 3rd arg means "to end" ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate name_tail = substr(name, 2, .)
+
+statement ok
+keep name_tail
+
+query T
+head 1
+----
+cme
+
+# --- real(substr(...)) nested parens ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate flag = real(substr(name, 1, 2) == "Ac")
+
+statement ok
+keep name flag
+
+query TI
+head 2
+----
+Acme	1
+Beta	0
+
 statement ok
 clear
