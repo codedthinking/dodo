@@ -176,11 +176,25 @@ struct DodoState {
 		std::string node_name = "dodo.__node_" + hash;
 
 		pending_sql.push_back("CREATE TABLE IF NOT EXISTS " + node_name + " AS (" + full_query + ")");
+		EmitColumnComments(node_name);
 		pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name);
 
 		current_node_hash = hash;
 		node_tables.insert(node_name);
 		FlushCTEChain();
+	}
+
+	//! Emit COMMENT ON COLUMN for all tracked variable labels
+	void EmitColumnComments(const std::string &table_name) {
+		for (auto &[col, label] : variable_labels) {
+			std::string escaped = label;
+			size_t pos = 0;
+			while ((pos = escaped.find('\'', pos)) != std::string::npos) {
+				escaped.replace(pos, 1, "''");
+				pos += 2;
+			}
+			pending_sql.push_back("COMMENT ON COLUMN " + table_name + "." + col + " IS '" + escaped + "'");
+		}
 	}
 
 	//! Get SQL to drop tempfile tables, materialized table, and schemas

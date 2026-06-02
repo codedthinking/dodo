@@ -1627,25 +1627,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		bool lazy = (lower_opts.find("lazy") != string::npos);
 		bool is_file = (read_expr != source);
 
-		if (!lazy && is_file) {
-			// Materialize: create node table + VIEW, reference VIEW in CTE chain
-			string hash = HashString(std::string("\0", 1) + source);
-			string node_name = "dodo.__node_" + hash;
-			state.pending_sql.push_back("CREATE SCHEMA IF NOT EXISTS dodo");
-			state.pending_sql.push_back("CREATE TABLE IF NOT EXISTS " + node_name +
-			                            " AS SELECT * FROM " + read_expr);
-			state.pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name);
-			state.current_node_hash = hash;
-			state.node_tables.insert(node_name);
-			state.AddStep("SELECT * FROM dodo._current");
-			state.materialized = true;
-		} else {
-			// Lazy mode or existing table: reference directly
-			state.AddStep("SELECT * FROM " + read_expr);
-		}
-		state.current_source = cmd.arguments;
-
-		// Extract variable labels from .dta files
+		// Extract variable labels from .dta files (before materialization so comments can be emitted)
 		if (str::EndsWith(str::Lower(source), ".dta")) {
 			try {
 				dta::DtaReader reader(source);
@@ -1658,6 +1640,25 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				// Ignore errors — labels are best-effort
 			}
 		}
+
+		if (!lazy && is_file) {
+			// Materialize: create node table + VIEW, reference VIEW in CTE chain
+			string hash = HashString(std::string("\0", 1) + source);
+			string node_name = "dodo.__node_" + hash;
+			state.pending_sql.push_back("CREATE SCHEMA IF NOT EXISTS dodo");
+			state.pending_sql.push_back("CREATE TABLE IF NOT EXISTS " + node_name +
+			                            " AS SELECT * FROM " + read_expr);
+			state.EmitColumnComments(node_name);
+			state.pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name);
+			state.current_node_hash = hash;
+			state.node_tables.insert(node_name);
+			state.AddStep("SELECT * FROM dodo._current");
+			state.materialized = true;
+		} else {
+			// Lazy mode or existing table: reference directly
+			state.AddStep("SELECT * FROM " + read_expr);
+		}
+		state.current_source = cmd.arguments;
 
 		return "SELECT 'OK' AS status";
 	}
@@ -2483,6 +2484,13 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				col_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT " + col_list + " FROM " + prev);
+			// Remove labels for dropped columns
+			std::unordered_set<std::string> kept;
+			for (auto &v : vars) { kept.insert(Trim(v)); }
+			for (auto it = state.variable_labels.begin(); it != state.variable_labels.end(); ) {
+				if (kept.find(it->first) == kept.end()) { it = state.variable_labels.erase(it); }
+				else { ++it; }
+			}
 		} else if (!cmd.arguments.empty() && !cmd.condition.empty()) {
 			auto vars = str::Split(cmd.arguments, ' ');
 			string col_list;
@@ -2493,6 +2501,13 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				col_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT " + col_list + " FROM " + prev + " WHERE " + TrExpr(cmd.condition));
+			// Remove labels for dropped columns
+			std::unordered_set<std::string> kept;
+			for (auto &v : vars) { kept.insert(Trim(v)); }
+			for (auto it = state.variable_labels.begin(); it != state.variable_labels.end(); ) {
+				if (kept.find(it->first) == kept.end()) { it = state.variable_labels.erase(it); }
+				else { ++it; }
+			}
 		} else {
 			throw DodoException("Invalid 'keep' syntax");
 		}
@@ -2519,6 +2534,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				exclude_list += QuoteIdent(Trim(vars[i]));
 			}
 			state.AddStep("SELECT * EXCLUDE (" + exclude_list + ") FROM " + prev);
+			// Remove labels for dropped columns
+			for (auto &v : vars) { state.variable_labels.erase(Trim(v)); }
 		} else {
 			throw DodoException("Invalid 'drop' syntax. Use 'drop var1 var2' or 'drop if condition'.");
 		}
@@ -2557,6 +2574,16 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				exclude_cols += oid;
 			}
 			state.AddStep("SELECT " + rename_cols + ", * EXCLUDE (" + exclude_cols + ") FROM " + prev);
+			// Move variable labels for renamed columns
+			for (idx_t i = 0; i < old_vars.size(); i++) {
+				string oname = Trim(old_vars[i]);
+				string nname = Trim(new_vars[i]);
+				auto it = state.variable_labels.find(oname);
+				if (it != state.variable_labels.end()) {
+					state.variable_labels[nname] = it->second;
+					state.variable_labels.erase(it);
+				}
+			}
 			return "SELECT 'OK' AS status";
 		}
 
@@ -2568,6 +2595,16 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string old_name = QuoteIdent(Trim(parts[0]));
 		string new_name = QuoteIdent(Trim(parts[1]));
 		state.AddStep("SELECT * EXCLUDE (" + old_name + "), " + old_name + " AS " + new_name + " FROM " + prev);
+		// Move variable label for renamed column
+		{
+			string oname = Trim(parts[0]);
+			string nname = Trim(parts[1]);
+			auto it = state.variable_labels.find(oname);
+			if (it != state.variable_labels.end()) {
+				state.variable_labels[nname] = it->second;
+				state.variable_labels.erase(it);
+			}
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2782,6 +2819,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 
 		state.AddStep(sql);
+		state.variable_labels.clear();
 		return "SELECT 'OK' AS status";
 	}
 
@@ -3458,6 +3496,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				state.AddStep("SELECT * REPLACE (" + replace_expr + ") FROM (UNPIVOT " + prev + " ON " + on_clause +
 				              " INTO NAME " + qj + " VALUE " + value_names + ")");
 			}
+			state.variable_labels.clear();
 		} else {
 			// PIVOT: long -> wide
 			// DuckDB PIVOT internally expands to multiple statements, so it can't live
