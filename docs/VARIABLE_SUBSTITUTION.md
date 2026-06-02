@@ -74,31 +74,30 @@ Loop bounds must be compile-time known. A loop whose bound comes from
 
 ---
 
-## Value position — `SET VARIABLE` / `getvariable()`
+## Value position — `SET VARIABLE` (M14b)
 
-Everything that appears as a **value** in a SQL expression compiles to DuckDB's
-`SET VARIABLE` + `getvariable()`. This covers constants, computed results, and
-observation counts uniformly.
+Everything that appears as a **value** (not an identifier) compiles to DuckDB's
+`SET VARIABLE`. This covers constants, computed results, and observation counts.
 
 ### The mechanism
 
 ```sql
 -- Assignment: evaluates RHS when the statement executes, freezes the value
 SET VARIABLE pi = 3.14159;
-SET VARIABLE hi = (SELECT max(revenue) FROM _s3);
 SET VARIABLE n = (SELECT count(*) FROM _s3);
-SET VARIABLE floor = getvariable('hi') - 1;
-
--- Reference: retrieves stored value
-SELECT * FROM _s4 WHERE revenue > getvariable('floor');
+SET VARIABLE floor = getvariable('pi') * 2;
 ```
 
 Properties:
 - **Evaluated once at assignment.** Value is frozen when `SET VARIABLE` runs.
 - **Session-scoped.** Variables persist across statements within a connection.
-- **Composable.** `SET VARIABLE floor = getvariable('hi') - 1` works natively.
-- **dodoc-safe.** Both `SET VARIABLE` and `getvariable()` are valid DuckDB SQL.
+- **Composable.** `SET VARIABLE floor = getvariable('pi') * 2` works natively.
+- **dodoc-safe.** `SET VARIABLE` is valid DuckDB SQL.
 - **No compiler round-trip.** The compiler emits SQL; DuckDB evaluates it.
+
+M14b emits `SET VARIABLE` for assignments only. Use-site resolution (emitting
+`getvariable()` in expressions like `WHERE revenue > floor`) comes in a later
+milestone.
 
 ### Scalars
 
@@ -106,15 +105,7 @@ Every `scalar` command emits `SET VARIABLE`:
 
 ```stata
 scalar pi = 3.14159        // → SET VARIABLE pi = 3.14159
-scalar hi = r(max)         // → SET VARIABLE hi = (SELECT max(revenue) FROM _sN)
-scalar floor = hi - 1      // → SET VARIABLE floor = getvariable('hi') - 1
-```
-
-At use sites, bare scalar names in value position compile to `getvariable()`:
-
-```stata
-keep if revenue > floor    // → WHERE revenue > getvariable('floor')
-generate ratio = revenue / pi  // → (revenue / getvariable('pi')) AS ratio
+scalar floor = pi * 2      // → SET VARIABLE floor = getvariable('pi') * 2
 ```
 
 ### `local`/`global` with `=`
@@ -127,43 +118,11 @@ local n = _N               // → SET VARIABLE n = (SELECT count(*) FROM _sN)
 local threshold = 1500     // → SET VARIABLE threshold = 1500
 ```
 
-At use sites in value position, `` `n' `` compiles to `getvariable('n')`.
-
 **Note:** The same local can appear in both positions. `local x 5` stores `"5"`.
 If used as `` generate col`x' = 1 `` (identifier), it's text-substituted to
-`generate col5 = 1`. If used as `` keep if id > `x' `` (value), it compiles to
-`WHERE id > getvariable('x')`. The compiler determines which mechanism to use
-based on where in the SQL the reference lands.
-
-### Stored results `r()`
-
-When the compiler processes a terminal command (`summarize`, `count`), it emits
-`SET VARIABLE` statements that capture the results from the current CTE step:
-
-```stata
-summarize revenue          // latest step: _s3
-```
-
-emits:
-
-```sql
-SET VARIABLE _r_N    = (SELECT count(revenue)       FROM _s3);
-SET VARIABLE _r_mean = (SELECT avg(revenue)         FROM _s3);
-SET VARIABLE _r_min  = (SELECT min(revenue)         FROM _s3);
-SET VARIABLE _r_max  = (SELECT max(revenue)         FROM _s3);
-SET VARIABLE _r_sd   = (SELECT stddev_samp(revenue) FROM _s3);
-```
-
-`count` emits `SET VARIABLE _r_N = (SELECT count(*) FROM _sN)`.
-
-References to `r(max)` compile to `getvariable('_r_max')`:
-
-```stata
-keep if revenue >= r(mean)       // → WHERE revenue >= getvariable('_r_mean')
-generate hi = revenue == r(max)  // → (revenue = getvariable('_r_max')) AS hi
-```
-
-**Volatility:** Each new r-class command overwrites the `_r_*` variables.
+`generate col5 = 1`. The compiler determines which mechanism to use based on
+where in the SQL the reference lands. Use-site `getvariable()` emission is a
+later milestone.
 
 ### `_N` (observation count)
 
@@ -191,11 +150,53 @@ out of scope and produce an explicit error.
 
 ### `e()` (estimation results)
 
-Deferred with `regress` (M9). Same `SET VARIABLE` mechanism as `r()`.
+Deferred with `regress` (M9). Same `SET VARIABLE` mechanism.
 
 ---
 
-## Stretch goal: named result structs via `let`
+## Stored results as single-row tables (M14c)
+
+Terminal commands (`summarize`, `count`) produce multiple named results. Rather
+than emitting one `SET VARIABLE` per field, M14c stores all results in a
+**single-row table**. This is more natural in SQL: the result is a relation,
+not a bag of scalars.
+
+### The mechanism
+
+```stata
+summarize revenue          // latest step: _s3
+```
+
+emits a CTE that produces one row with all statistics as columns:
+
+```sql
+CREATE OR REPLACE TEMP TABLE _r AS
+  SELECT
+    count(revenue)       AS N,
+    avg(revenue)         AS mean,
+    min(revenue)         AS min,
+    max(revenue)         AS max,
+    stddev_samp(revenue) AS sd
+  FROM _s3;
+```
+
+`count` emits:
+
+```sql
+CREATE OR REPLACE TEMP TABLE _r AS
+  SELECT count(*) AS N FROM _sN;
+```
+
+References to `r(max)` compile to a scalar subquery:
+
+```stata
+keep if revenue >= r(mean)       // → WHERE revenue >= (SELECT mean FROM _r)
+generate hi = revenue == r(max)  // → (revenue = (SELECT max FROM _r)) AS hi
+```
+
+**Volatility:** Each new r-class command replaces the `_r` table.
+
+### Named result structs via `let`
 
 ```stata
 let result = summarize employment
@@ -203,15 +204,14 @@ keep if employment > result.min
 generate z = (employment - result.mean) / result.sd
 ```
 
-`let` emits `SET VARIABLE` under a named prefix. `result.min` compiles to
-`getvariable('result_min')`.
+`let` stores the result table under a named alias. `result.min` compiles to
+`(SELECT min FROM _result)`.
 
 Advantages over `r()`:
-1. **Not volatile.** Multiple results coexist.
+1. **Not volatile.** Multiple result tables coexist.
 2. **Validated fields.** Unknown fields are compile-time errors.
 
-`r()` is reframed as the implicit, auto-reassigned `r` struct.
-Sequenced after M14b.
+`r()` is reframed as the implicit, auto-reassigned `_r` table.
 
 ---
 
@@ -240,14 +240,21 @@ std::unordered_map<std::string, std::string> global_macros;  // $x  → text
 ### Value state (M14b)
 
 ```cpp
-// Names that have been SET VARIABLE'd — so the compiler knows to emit
-// getvariable('name') when they appear in value position
+// Names that have been SET VARIABLE'd — so the compiler knows which
+// names are session variables (vs column references)
 std::unordered_set<std::string> set_variables;
+```
 
-// Map from r() names to DuckDB variable names: "r(max)" → "_r_max"
-std::unordered_map<std::string, std::string> stored_results;
+### Result table state (M14c)
 
-// The command that last populated r(), for volatility enforcement
+```cpp
+// Named result tables: "r" → "_r", "result" → "_result"
+std::unordered_map<std::string, std::string> result_tables;
+
+// Known columns per result table, for compile-time field validation
+std::unordered_map<std::string, std::vector<std::string>> result_table_fields;
+
+// The command that last populated _r, for volatility enforcement
 std::string last_rclass_command;
 ```
 
@@ -263,10 +270,12 @@ raw line(s)
                  └─ TokenizeCommand                  (exists)
                       └─ ProcessCommand              (exists)
                            ├─ scalar / local =       → emit SET VARIABLE         ── M14b
-                           ├─ terminal cmd           → emit SET VARIABLE _r_*    ── M14b
+                           ├─ terminal cmd           → emit result table          ── M14c
+                           ├─ let name = cmd         → emit named result table    ── M14c
                            └─ TranslateExpression    (exists)
-                                └─ known SET VAR     → getvariable('name')       ── M14b
-                                └─ r(max)            → getvariable('_r_max')     ── M14b
+                                └─ r(max)            → (SELECT max FROM _r)       ── M14c
+                                └─ result.field      → (SELECT field FROM _name)  ── M14c
+                                └─ known SET VAR     → getvariable('name')       ── future
                                 └─ unknown names     → column reference (as-is)
 ```
 
@@ -275,25 +284,31 @@ raw line(s)
 ## Milestone split
 
 - **M14a — Text substitution & loops. ✅ DONE.** See `docs/M14.md`.
-- **M14b — `SET VARIABLE` for scalars, `r()`, `_N`.** `scalar`/`local =`/
-  `global =` emit `SET VARIABLE`. Terminal commands emit `SET VARIABLE _r_*`.
-  Expression translation emits `getvariable()`. `levelsof` for set membership.
-- **M14c — Named result structs via `let` (stretch).** Sequenced after M14b.
+- **M14b — `SET VARIABLE` for assignments.** `scalar`/`local =`/`global =`
+  emit `SET VARIABLE`. `_N` emits count subquery. `levelsof` for set membership.
+  No use-site `getvariable()` emission yet.
+- **M14c — Stored results as single-row tables.** Terminal commands emit
+  `CREATE OR REPLACE TEMP TABLE _r AS (SELECT ...)`. `r(field)` compiles to
+  `(SELECT field FROM _r)`. `let name = cmd` stores named result tables.
+  `name.field` compiles to `(SELECT field FROM _name)`.
 
 ---
 
 ## Test plan
 
-**M14a (done):** text substitution, loops, macro functions — 250 assertions.
+**M14a (done):** text substitution, loops, macro functions — 1359 assertions.
 
 **M14b:**
-- `scalar pi = 3.14159; keep if revenue > pi` →
-  `SET VARIABLE pi = 3.14159; WHERE revenue > getvariable('pi')`
-- `summarize revenue; keep if revenue == r(max)` →
-  `SET VARIABLE _r_max = ...; WHERE revenue = getvariable('_r_max')`
-- `scalar hi = r(max); scalar floor = hi - 1; keep if revenue > floor` →
-  chain of `SET VARIABLE` + `getvariable()`
+- `scalar pi = 3.14159` → `SET VARIABLE pi = 3.14159`
+- `scalar floor = pi * 2` → `SET VARIABLE floor = getvariable('pi') * 2`
 - `local n = _N` → `SET VARIABLE n = (SELECT count(*) FROM _sN)`
 - `levelsof year, local(yrs); keep if inlist(year, `yrs')` →
   `WHERE year IN (SELECT DISTINCT year FROM _sK)`
-- Stale `r()`: `summarize a; count; keep if x > r(max)` → error
+
+**M14c:**
+- `summarize revenue` → `CREATE OR REPLACE TEMP TABLE _r AS (SELECT count(...) AS N, avg(...) AS mean, ...)`
+- `keep if revenue == r(max)` → `WHERE revenue = (SELECT max FROM _r)`
+- `let result = summarize employment; keep if employment > result.min` →
+  result table + `WHERE employment > (SELECT min FROM _result)`
+- Stale `r()`: `summarize a; count; keep if x > r(max)` → error (volatility)
+- `r(nonexistent)` → compile-time error (field validation)

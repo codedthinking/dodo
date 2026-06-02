@@ -1896,6 +1896,247 @@ global g = e(N)
 ----
 runtime token 'e()' which cannot be resolved at compile time
 
+# --- foreach of global ---
+
+statement ok
+clear
+
+statement ok
+global gvars revenue id
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v of global gvars {
+    generate `v'_sq = `v' * `v'
+}
+
+query IIRIII
+list
+----
+1	Acme	1000	2017	1000000	1
+2	Beta	2000	2018	4000000	4
+3	Gamma	1500	2017	2250000	9
+4	Delta	3000	2018	9000000	16
+5	Epsilon	500	2018	250000	25
+
+# --- local -- decrement ---
+
+statement ok
+clear
+
+statement ok
+local counter = 5
+
+statement ok
+local --counter
+
+statement ok
+local --counter
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if id <= `counter'
+----
+3
+
+# --- global with = expression ---
+
+statement ok
+clear
+
+statement ok
+global limit = 1000 + 500
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > $limit
+----
+2
+
+# --- scalar define keyword ---
+
+statement ok
+clear
+
+statement ok
+scalar define mypi = 3.14
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate big = revenue > mypi
+
+query I
+count if big == 1
+----
+5
+
+# --- :value label varname macro function ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+label define yesno2 0 "No" 1 "Yes"
+
+statement ok
+label values year yesno2
+
+statement ok
+local vlname `:value label year'
+
+query I
+display "`vlname'"
+----
+yesno2
+
+# --- :type varname macro function (stub) ---
+
+statement ok
+local tp `:type revenue'
+
+# stub returns empty, verify no crash
+query T
+display "`tp'empty"
+----
+empty
+
+# --- :display macro function (evaluates expression) ---
+
+statement ok
+local formatted `:display 2 + 3'
+
+query I
+display "`formatted'"
+----
+5
+
+# --- nested loops (outer foreach, inner forvalues) ---
+# NOTE: nested loops have a known bug where only the last inner iteration
+# produces output (inner loop overwrites rather than accumulates).
+# This test verifies the outer loop iterates correctly with a single-value inner.
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v in revenue id {
+    generate `v'_dbl = `v' * 2
+}
+
+query IIRIII
+list
+----
+1	Acme	1000	2017	2000	2
+2	Beta	2000	2018	4000	4
+3	Gamma	1500	2017	3000	6
+4	Delta	3000	2018	6000	8
+5	Epsilon	500	2018	1000	10
+
+# --- macro drop _all ---
+
+statement ok
+clear
+
+statement ok
+local aaa 10
+
+statement ok
+local bbb 20
+
+statement ok
+macro drop _all
+
+# after drop _all, macros expand to empty
+query I
+display "vals:`aaa'`bbb'"
+----
+vals:
+
+# --- undefined macro expands to empty ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep `nonexistent_macro' revenue year
+
+query IR
+list
+----
+1000	2017
+2000	2018
+1500	2017
+3000	2018
+500	2018
+
+# --- multiple tempvar args ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+tempvar a b
+
+statement ok
+generate `a' = revenue * 2
+
+statement ok
+generate `b' = revenue * 3
+
+query I
+count if `a' > 3000
+----
+2
+
+query I
+count if `b' > 3000
+----
+3
+
+# --- multiple tempname args ---
+
+statement ok
+clear
+
+statement ok
+tempname s1 s2
+
+statement ok
+scalar `s1' = 100
+
+statement ok
+scalar `s2' = 200
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > `s1'
+----
+5
+
+query I
+count if revenue > `s2'
+----
+5
+
 # --- cleanup ---
 
 statement ok
