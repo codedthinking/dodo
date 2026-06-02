@@ -1,0 +1,217 @@
+# name: test/sql/dodo_io.test
+# description: test do files, save, append, mvencode, reshape, duplicates, expand, export/import
+# group: [sql]
+
+require dodo
+
+# ============================================================
+# M5.5: do "script.do"
+# ============================================================
+
+# Run a .do file (no semicolons, with comments)
+statement ok
+do "test/data/clean.do"
+
+# Verify state: 2018 firms sorted by revenue with ln_rev
+query IIRIR
+list
+----
+5	Epsilon	500	2018	6.214608098422191
+2	Beta	2000	2018	7.600902459542082
+4	Delta	3000	2018	8.006367567650246
+
+query I
+count
+----
+3
+
+statement ok
+clear
+
+# ============================================================
+# M7: save, append, mvencode
+# ============================================================
+
+# save to CSV
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+save "test/data/firms_2018.csv", replace
+
+# reload saved file
+statement ok
+use "test/data/firms_2018.csv", clear
+
+query I
+count
+----
+3
+
+# append
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2017
+
+statement ok
+append using "test/data/firms_2018.csv"
+
+query I
+count
+----
+5
+
+# mvencode
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+replace revenue = NULL if year == 2017
+
+statement ok
+mvencode revenue, mv(0)
+
+query I
+list revenue
+----
+0
+2000
+0
+3000
+500
+
+statement ok
+clear
+
+# ============================================================
+# M8: reshape long / wide
+# ============================================================
+
+# reshape long
+statement ok
+use "test/data/panel.csv", clear
+
+statement ok
+reshape long revenue, i(id name) j(year)
+
+statement ok
+sort id year
+
+query IIRI
+list
+----
+1	Acme	2017	1000
+1	Acme	2018	1200
+2	Beta	2017	2000
+2	Beta	2018	2500
+3	Gamma	2017	1500
+3	Gamma	2018	1800
+
+# reshape wide (roundtrip)
+statement ok
+reshape wide revenue, i(id name) j(year)
+
+statement ok
+sort id
+
+query IIII
+list
+----
+1	Acme	1000	1200
+2	Beta	2000	2500
+3	Gamma	1500	1800
+
+statement ok
+clear
+
+# ============================================================
+# M13: duplicates drop, expand, export/import delimited
+# ============================================================
+
+# duplicates drop (all columns)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+append using "test/data/firms.csv"
+
+query I
+count
+----
+10
+
+statement ok
+duplicates drop
+
+query I
+count
+----
+5
+
+# duplicates drop on specific columns
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+duplicates drop year
+
+query I
+count
+----
+2
+
+# expand
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+expand 3
+
+query I
+count
+----
+15
+
+# expand with generate()
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+expand 2, generate(copy)
+
+query I
+count
+----
+10
+
+query I
+count if copy == 1
+----
+5
+
+# export delimited
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if year == 2018
+
+statement ok
+export delimited using "test/data/firms_export.csv", replace
+
+# import delimited
+statement ok
+import delimited "test/data/firms_export.csv", clear
+
+query I
+count
+----
+3
+
+statement ok
+clear

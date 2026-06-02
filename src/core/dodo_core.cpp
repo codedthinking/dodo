@@ -1,6 +1,8 @@
 #include "dodo_core.hpp"
 #include "dta_reader.hpp"
 
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <regex>
 
@@ -172,15 +174,672 @@ string DodoState::BuildQuery(const string &final_select) const {
 }
 
 //===--------------------------------------------------------------------===//
+// Runtime token detection — reject values that require data at compile time
+//===--------------------------------------------------------------------===//
+
+// Check if a string contains runtime-dependent tokens that cannot be resolved
+// at compile time. Returns the offending token name, or empty if clean.
+// Build a SET VARIABLE SQL statement for a runtime expression containing _N.
+// Returns the full SET VARIABLE statement ready for execution.
+static string BuildSetVariableSQL(const string &uname, const string &expr, const DodoState &state) {
+	// For _N, emit: SET VARIABLE uname = (SELECT count(*) FROM (<full CTE query>))
+	// The full CTE query is self-contained, so it works in any context.
+	string data_query = state.BuildQuery("SELECT * FROM " + state.LatestStep());
+
+	// Simple case: expr is just "_N"
+	string trimmed = Trim(expr);
+	if (trimmed == "_N") {
+		return "SET VARIABLE " + uname + " = (SELECT count(*) FROM (" + data_query + ") AS _data)";
+	}
+
+	// General case: replace _N in the expression with count subquery
+	// Other symbol references (scalars, macros) are already expanded by ExpandMacros
+	// before reaching here, so no need to replace them.
+	string result = expr;
+	string out;
+	for (idx_t i = 0; i < result.size(); i++) {
+		if (result[i] == '_' && i + 1 < result.size() && result[i + 1] == 'N') {
+			bool start_ok = (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_'));
+			bool end_ok = (i + 2 >= result.size() || (!isalnum(result[i + 2]) && result[i + 2] != '_'));
+			if (start_ok && end_ok) {
+				out += "(SELECT count(*) FROM (" + data_query + ") AS _data)";
+				i++; // skip 'N'
+				continue;
+			}
+		}
+		out += result[i];
+	}
+
+	return "SET VARIABLE " + uname + " = " + out;
+}
+
+static string FindRuntimeToken(const string &expr) {
+	string lower = str::Lower(expr);
+	// _N (observation count) — only valid in SQL expressions, not compile-time
+	// Match as whole word to avoid false positives like "a_N_b"
+	for (idx_t i = 0; i < lower.size(); i++) {
+		if (lower[i] == '_' && i + 1 < lower.size() && lower[i + 1] == 'n') {
+			bool start_ok = (i == 0 || (!isalnum(lower[i - 1]) && lower[i - 1] != '_'));
+			bool end_ok = (i + 2 >= lower.size() || (!isalnum(lower[i + 2]) && lower[i + 2] != '_'));
+			if (start_ok && end_ok) {
+				return "_N";
+			}
+		}
+	}
+	// r(...) stored results — must be standalone, not part of another word like getvariable()
+	for (idx_t ri = 0; ri < lower.size(); ri++) {
+		if (lower[ri] == 'r' && ri + 1 < lower.size() && lower[ri + 1] == '(') {
+			bool start_ok = (ri == 0 || (!isalnum(lower[ri - 1]) && lower[ri - 1] != '_'));
+			if (start_ok) {
+				return "r()";
+			}
+		}
+	}
+	// e(...) estimation results — must be standalone, not part of another word like getvariable()
+	for (idx_t ei = 0; ei < lower.size(); ei++) {
+		if (lower[ei] == 'e' && ei + 1 < lower.size() && lower[ei + 1] == '(') {
+			bool start_ok = (ei == 0 || (!isalnum(lower[ei - 1]) && lower[ei - 1] != '_'));
+			if (start_ok) {
+				return "e()";
+			}
+		}
+	}
+	return "";
+}
+
+// Strip Stata type qualifier (byte, int, long, float, double, str#, strL) from variable name
+static string StripTypeQualifier(const string &name) {
+	static const vector<string> qualifiers = {"byte ", "int ", "long ", "float ", "double "};
+	string trimmed = Trim(name);
+	string lower = str::Lower(trimmed);
+	for (auto &q : qualifiers) {
+		if (str::StartsWith(lower, q)) {
+			return Trim(trimmed.substr(q.size()));
+		}
+	}
+	// str# or strL qualifier
+	if (str::StartsWith(lower, "str")) {
+		idx_t i = 3;
+		while (i < trimmed.size() && (isdigit(trimmed[i]) || trimmed[i] == 'L')) {
+			i++;
+		}
+		if (i > 3 && i < trimmed.size() && trimmed[i] == ' ') {
+			return Trim(trimmed.substr(i));
+		}
+	}
+	return trimmed;
+}
+
+//===--------------------------------------------------------------------===//
+// Simple Expression Evaluator (for local x = expr, scalar x = expr)
+//===--------------------------------------------------------------------===//
+
+// Tokenizer for simple expressions
+struct ExprToken {
+	enum Type { NUMBER, OP, LPAREN, RPAREN, FUNC, END };
+	Type type;
+	double value;
+	char op;
+	string func_name;
+};
+
+static vector<ExprToken> TokenizeExpr(const string &expr) {
+	vector<ExprToken> tokens;
+	idx_t i = 0;
+	while (i < expr.size()) {
+		char c = expr[i];
+		if (c == ' ' || c == '\t') {
+			i++;
+			continue;
+		}
+		if (c == '(') {
+			tokens.push_back({ExprToken::LPAREN, 0, '(', ""});
+			i++;
+		} else if (c == ')') {
+			tokens.push_back({ExprToken::RPAREN, 0, ')', ""});
+			i++;
+		} else if (c == '+' || c == '*' || c == '/' || c == '%') {
+			tokens.push_back({ExprToken::OP, 0, c, ""});
+			i++;
+		} else if (c == '-') {
+			// Unary minus: at start, after operator, or after left paren
+			bool is_unary = tokens.empty() || tokens.back().type == ExprToken::OP ||
+			                tokens.back().type == ExprToken::LPAREN;
+			if (is_unary) {
+				// Parse as part of number
+				idx_t start = i;
+				i++;
+				while (i < expr.size() && (isdigit(expr[i]) || expr[i] == '.')) {
+					i++;
+				}
+				if (i == start + 1) {
+					// Just a minus sign followed by non-digit — treat as unary op
+					tokens.push_back({ExprToken::OP, 0, 'n', ""}); // 'n' = negate
+					continue;
+				}
+				tokens.push_back({ExprToken::NUMBER, std::stod(expr.substr(start, i - start)), 0, ""});
+			} else {
+				tokens.push_back({ExprToken::OP, 0, '-', ""});
+				i++;
+			}
+		} else if (isdigit(c) || c == '.') {
+			idx_t start = i;
+			while (i < expr.size() && (isdigit(expr[i]) || expr[i] == '.' || expr[i] == 'e' || expr[i] == 'E')) {
+				i++;
+			}
+			tokens.push_back({ExprToken::NUMBER, std::stod(expr.substr(start, i - start)), 0, ""});
+		} else if (isalpha(c) || c == '_') {
+			idx_t start = i;
+			while (i < expr.size() && (isalnum(expr[i]) || expr[i] == '_')) {
+				i++;
+			}
+			string name = expr.substr(start, i - start);
+			// Check if followed by ( — then it's a function
+			if (i < expr.size() && expr[i] == '(') {
+				tokens.push_back({ExprToken::FUNC, 0, 0, name});
+			} else {
+				throw DodoException("Unknown identifier in expression: " + name);
+			}
+		} else {
+			throw DodoException("Unexpected character in expression: " + string(1, c));
+		}
+	}
+	tokens.push_back({ExprToken::END, 0, 0, ""});
+	return tokens;
+}
+
+// Recursive descent parser for simple arithmetic
+static idx_t expr_pos;
+static double ParseExprAddSub(const vector<ExprToken> &tokens);
+
+static double ParseExprAtom(const vector<ExprToken> &tokens) {
+	auto &tok = tokens[expr_pos];
+	if (tok.type == ExprToken::NUMBER) {
+		expr_pos++;
+		return tok.value;
+	}
+	if (tok.type == ExprToken::OP && tok.op == 'n') {
+		// Unary negate
+		expr_pos++;
+		return -ParseExprAtom(tokens);
+	}
+	if (tok.type == ExprToken::FUNC) {
+		string fname = str::Lower(tok.func_name);
+		expr_pos++; // skip func name
+		if (tokens[expr_pos].type != ExprToken::LPAREN) {
+			throw DodoException("Expected '(' after function " + fname);
+		}
+		expr_pos++; // skip (
+		double arg = ParseExprAddSub(tokens);
+		if (tokens[expr_pos].type != ExprToken::RPAREN) {
+			throw DodoException("Expected ')' after function argument");
+		}
+		expr_pos++; // skip )
+		if (fname == "int" || fname == "floor") {
+			return std::floor(arg);
+		} else if (fname == "ceil") {
+			return std::ceil(arg);
+		} else if (fname == "round") {
+			return std::round(arg);
+		} else if (fname == "abs") {
+			return std::abs(arg);
+		} else if (fname == "sqrt") {
+			return std::sqrt(arg);
+		} else if (fname == "ln" || fname == "log") {
+			return std::log(arg);
+		} else if (fname == "exp") {
+			return std::exp(arg);
+		}
+		throw DodoException("Unknown function in expression: " + fname);
+	}
+	if (tok.type == ExprToken::LPAREN) {
+		expr_pos++; // skip (
+		double val = ParseExprAddSub(tokens);
+		if (tokens[expr_pos].type != ExprToken::RPAREN) {
+			throw DodoException("Mismatched parentheses in expression");
+		}
+		expr_pos++; // skip )
+		return val;
+	}
+	throw DodoException("Unexpected token in expression");
+}
+
+static double ParseExprMulDiv(const vector<ExprToken> &tokens) {
+	double left = ParseExprAtom(tokens);
+	while (tokens[expr_pos].type == ExprToken::OP &&
+	       (tokens[expr_pos].op == '*' || tokens[expr_pos].op == '/' || tokens[expr_pos].op == '%')) {
+		char op = tokens[expr_pos].op;
+		expr_pos++;
+		double right = ParseExprAtom(tokens);
+		if (op == '*') {
+			left *= right;
+		} else if (op == '/') {
+			if (right == 0) {
+				throw DodoException("Division by zero in expression");
+			}
+			left /= right;
+		} else {
+			left = std::fmod(left, right);
+		}
+	}
+	return left;
+}
+
+static double ParseExprAddSub(const vector<ExprToken> &tokens) {
+	double left = ParseExprMulDiv(tokens);
+	while (tokens[expr_pos].type == ExprToken::OP &&
+	       (tokens[expr_pos].op == '+' || tokens[expr_pos].op == '-')) {
+		char op = tokens[expr_pos].op;
+		expr_pos++;
+		double right = ParseExprMulDiv(tokens);
+		if (op == '+') {
+			left += right;
+		} else {
+			left -= right;
+		}
+	}
+	return left;
+}
+
+double EvaluateSimpleExpr(const string &expr) {
+	auto tokens = TokenizeExpr(Trim(expr));
+	expr_pos = 0;
+	double result = ParseExprAddSub(tokens);
+	if (tokens[expr_pos].type != ExprToken::END) {
+		throw DodoException("Unexpected trailing content in expression: " + expr);
+	}
+	return result;
+}
+
+// Format a double: use integer format if it's a whole number
+static string FormatNumber(double val) {
+	if (val == std::floor(val) && std::abs(val) < 1e15) {
+		return to_string(static_cast<long long>(val));
+	}
+	// Use enough precision
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.12g", val);
+	return string(buf);
+}
+
+//===--------------------------------------------------------------------===//
+// Macro Function Evaluator
+//===--------------------------------------------------------------------===//
+
+string EvaluateMacroFunction(const string &func, const DodoState &state) {
+	string trimmed = Trim(func);
+
+	// :word count string
+	if (str::StartsWith(str::Lower(trimmed), "word count ")) {
+		string s = Trim(trimmed.substr(11));
+		if (s.empty()) {
+			return "0";
+		}
+		int count = 0;
+		bool in_word = false;
+		bool in_quotes = false;
+		for (idx_t i = 0; i < s.size(); i++) {
+			if (s[i] == '"') {
+				if (!in_word) {
+					in_word = true;
+					count++;
+				}
+				in_quotes = !in_quotes;
+			} else if (s[i] == ' ' && !in_quotes) {
+				in_word = false;
+			} else if (!in_word) {
+				in_word = true;
+				count++;
+			}
+		}
+		return to_string(count);
+	}
+
+	// :word # of string
+	if (str::StartsWith(str::Lower(trimmed), "word ")) {
+		string rest = trimmed.substr(5);
+		// Parse: # of string
+		idx_t of_pos = str::Lower(rest).find(" of ");
+		if (of_pos != string::npos) {
+			int n = 0;
+			try {
+				n = std::stoi(Trim(rest.substr(0, of_pos)));
+			} catch (...) {
+				throw DodoException("Invalid word index in macro function: " + func);
+			}
+			string s = Trim(rest.substr(of_pos + 4));
+			// Split into tokens (respecting quotes)
+			vector<string> words;
+			string current;
+			bool in_quotes = false;
+			for (idx_t i = 0; i < s.size(); i++) {
+				if (s[i] == '"') {
+					in_quotes = !in_quotes;
+				} else if (s[i] == ' ' && !in_quotes) {
+					if (!current.empty()) {
+						words.push_back(current);
+						current.clear();
+					}
+				} else {
+					current += s[i];
+				}
+			}
+			if (!current.empty()) {
+				words.push_back(current);
+			}
+			if (n >= 1 && n <= static_cast<int>(words.size())) {
+				return words[n - 1];
+			}
+			return "";
+		}
+	}
+
+	// :variable label varname
+	if (str::StartsWith(str::Lower(trimmed), "variable label ")) {
+		string varname = Trim(trimmed.substr(15));
+		auto it = state.variable_labels.find(varname);
+		if (it != state.variable_labels.end()) {
+			return it->second;
+		}
+		return "";
+	}
+
+	// :value label varname
+	if (str::StartsWith(str::Lower(trimmed), "value label ")) {
+		string varname = Trim(trimmed.substr(12));
+		auto it = state.column_labels.find(varname);
+		if (it != state.column_labels.end()) {
+			return it->second;
+		}
+		return "";
+	}
+
+	// :label labelname # [#_2]
+	if (str::StartsWith(str::Lower(trimmed), "label ")) {
+		string rest = Trim(trimmed.substr(6));
+		auto parts = str::Split(rest, ' ');
+		if (parts.size() >= 2) {
+			string label_name = parts[0];
+			int value = 0;
+			try {
+				value = std::stoi(parts[1]);
+			} catch (...) {
+				return "";
+			}
+			auto it = state.value_label_defs.find(label_name);
+			if (it != state.value_label_defs.end()) {
+				auto vit = it->second.find(value);
+				if (vit != it->second.end()) {
+					string result = vit->second;
+					// Optional max length
+					if (parts.size() >= 3) {
+						int maxlen = 0;
+						try {
+							maxlen = std::stoi(parts[2]);
+						} catch (...) {
+							maxlen = 0;
+						}
+						if (maxlen > 0 && static_cast<int>(result.size()) > maxlen) {
+							result = result.substr(0, maxlen);
+						}
+					}
+					return result;
+				}
+			}
+			// Return the number itself if no label found
+			return parts[1];
+		}
+	}
+
+	// :type varname — we don't have runtime type info at compile time, return ""
+	if (str::StartsWith(str::Lower(trimmed), "type ")) {
+		return "";
+	}
+
+	// :display fmt expr — format a number
+	if (str::StartsWith(str::Lower(trimmed), "display ")) {
+		string rest = Trim(trimmed.substr(8));
+		// Try to evaluate as expression
+		try {
+			double val = EvaluateSimpleExpr(rest);
+			return FormatNumber(val);
+		} catch (...) {
+			return rest;
+		}
+	}
+
+	throw DodoException("Unknown macro function: :" + func);
+}
+
+//===--------------------------------------------------------------------===//
+// Macro Expansion
+//===--------------------------------------------------------------------===//
+
+string ExpandMacros(const string &text, const DodoState &state) {
+	string result = text;
+	int depth = 0;
+	const int MAX_DEPTH = 50;
+
+	while (depth < MAX_DEPTH) {
+		string prev = result;
+		string expanded;
+		idx_t i = 0;
+
+		while (i < result.size()) {
+			// Local macro: `name'
+			if (result[i] == '`') {
+				// Find the matching closing quote, respecting nested backtick-quote pairs
+				// For `...', we need to find the ' that balances the nesting
+				idx_t end = string::npos;
+				int bt_depth = 1; // We've seen one opening backtick
+				for (idx_t j = i + 1; j < result.size(); j++) {
+					if (result[j] == '`') {
+						bt_depth++;
+					} else if (result[j] == '\'') {
+						bt_depth--;
+						if (bt_depth == 0) {
+							end = j;
+							break;
+						}
+					}
+				}
+
+				if (end != string::npos) {
+					string content = result.substr(i + 1, end - i - 1);
+
+					// If content contains nested backtick patterns, only expand
+					// the innermost ones this iteration (skip this pattern)
+					if (content.find('`') != string::npos) {
+						expanded += result[i];
+						i++;
+						continue;
+					}
+
+					// `=expr' — inline expression evaluation
+					if (!content.empty() && content[0] == '=') {
+						string expr = content.substr(1);
+						try {
+							double val = EvaluateSimpleExpr(expr);
+							expanded += FormatNumber(val);
+						} catch (...) {
+							expanded += expr;
+						}
+						i = end + 1;
+						continue;
+					}
+
+					// `:macro_fcn' — macro function
+					if (!content.empty() && content[0] == ':') {
+						string func = content.substr(1);
+						try {
+							expanded += EvaluateMacroFunction(func, state);
+						} catch (...) {
+							expanded += "";
+						}
+						i = end + 1;
+						continue;
+					}
+
+					// Regular local macro: `name'
+					bool valid = true;
+					for (auto c : content) {
+						if (!isalnum(c) && c != '_') {
+							valid = false;
+							break;
+						}
+					}
+					if (valid) {
+						auto it = state.local_symbols.find(content);
+						if (it != state.local_symbols.end()) {
+							expanded += DodoState::ResolveSymbol(it->second);
+						}
+						// If not found, expand to empty string (Stata behavior)
+						i = end + 1;
+						continue;
+					}
+				}
+				expanded += result[i];
+				i++;
+				continue;
+			}
+
+			// Global macro: $name or ${name}
+			if (result[i] == '$') {
+				if (i + 1 < result.size() && result[i + 1] == '{') {
+					// ${name}
+					idx_t end = result.find('}', i + 2);
+					if (end != string::npos) {
+						string name = result.substr(i + 2, end - i - 2);
+						auto it = state.global_symbols.find(name);
+						if (it != state.global_symbols.end()) {
+							expanded += DodoState::ResolveSymbol(it->second);
+						}
+						i = end + 1;
+						continue;
+					}
+				} else if (i + 1 < result.size() && (isalpha(result[i + 1]) || result[i + 1] == '_')) {
+					// $name
+					idx_t start = i + 1;
+					idx_t j = start;
+					while (j < result.size() && (isalnum(result[j]) || result[j] == '_')) {
+						j++;
+					}
+					string name = result.substr(start, j - start);
+					auto it = state.global_symbols.find(name);
+					if (it != state.global_symbols.end()) {
+						expanded += DodoState::ResolveSymbol(it->second);
+					}
+					i = j;
+					continue;
+				}
+				expanded += result[i];
+				i++;
+				continue;
+			}
+
+			expanded += result[i];
+			i++;
+		}
+
+		result = expanded;
+
+		// Bare scalar name substitution: replace standalone identifiers
+		// that match scalar names with their resolved values
+		for (auto &[sname, entry] : state.scalar_symbols) {
+			string resolved = DodoState::ResolveSymbol(entry);
+			idx_t spos = 0;
+			while ((spos = result.find(sname, spos)) != string::npos) {
+				bool start_ok = (spos == 0 || (!isalnum(result[spos - 1]) && result[spos - 1] != '_'));
+				bool end_ok = (spos + sname.size() >= result.size() ||
+				               (!isalnum(result[spos + sname.size()]) && result[spos + sname.size()] != '_'));
+				if (start_ok && end_ok) {
+					result.replace(spos, sname.size(), resolved);
+					spos += resolved.size();
+				} else {
+					spos += sname.size();
+				}
+			}
+		}
+
+		if (result == prev) {
+			break; // No more expansions
+		}
+		depth++;
+	}
+
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Numlist Parser
+//===--------------------------------------------------------------------===//
+
+vector<string> ParseNumlist(const string &spec) {
+	vector<string> result;
+	string trimmed = Trim(spec);
+
+	// Split by spaces (each token can be a number, a/b, or a(d)b)
+	auto tokens = str::Split(trimmed, ' ');
+	for (auto &token : tokens) {
+		string t = Trim(token);
+		if (t.empty()) {
+			continue;
+		}
+
+		// Check for a(d)b pattern
+		idx_t paren_open = t.find('(');
+		idx_t paren_close = t.find(')');
+		if (paren_open != string::npos && paren_close != string::npos && paren_close > paren_open) {
+			double start = std::stod(t.substr(0, paren_open));
+			double step = std::stod(t.substr(paren_open + 1, paren_close - paren_open - 1));
+			double end = std::stod(t.substr(paren_close + 1));
+			if (step == 0) {
+				throw DodoException("Step size cannot be zero in numlist: " + t);
+			}
+			if (step > 0) {
+				for (double v = start; v <= end + 1e-10; v += step) {
+					result.push_back(FormatNumber(v));
+				}
+			} else {
+				for (double v = start; v >= end - 1e-10; v += step) {
+					result.push_back(FormatNumber(v));
+				}
+			}
+			continue;
+		}
+
+		// Check for a/b pattern (step = 1)
+		idx_t slash_pos = t.find('/');
+		if (slash_pos != string::npos && slash_pos > 0 && slash_pos < t.size() - 1) {
+			int start = std::stoi(t.substr(0, slash_pos));
+			int end = std::stoi(t.substr(slash_pos + 1));
+			int step = (start <= end) ? 1 : -1;
+			for (int v = start; (step > 0 ? v <= end : v >= end); v += step) {
+				result.push_back(to_string(v));
+			}
+			continue;
+		}
+
+		// Plain number
+		result.push_back(t);
+	}
+
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
 // Command Tokenizer
 //===--------------------------------------------------------------------===//
 
 const vector<string> DODO_COMMANDS = {
-    "use",      "list",     "clear",   "keep",     "drop",      "generate",   "replace", "rename", "sort",   "order",
-    "egen",     "collapse", "count",   "describe", "summarize", "tabulate",   "head",    "tail",   "save",   "append",
-    "mvencode", "reshape",  "do",      "label",    "codebook",  "duplicates", "expand",  "export", "import", "merge",
-    "tempfile", "preserve", "restore", "xtset",    "tsset",     "bysort",     "by",      "undo",   "redo",   "history",
-    "show"};
+    "use",       "list",       "clear",    "keep",     "drop",       "generate",   "replace",
+    "rename",    "sort",       "order",    "egen",     "collapse",   "count",      "describe",
+    "summarize", "tabulate",   "head",     "tail",     "save",       "append",     "mvencode",
+    "reshape",   "do",         "label",    "codebook", "duplicates", "expand",     "export",
+    "import",    "merge",      "tempfile", "preserve", "restore",    "xtset",      "tsset",
+    "bysort",    "by",         "undo",     "redo",     "history",    "show",       "local",
+    "global",    "scalar",     "macro",    "display",  "foreach",    "forvalues",  "tempvar",
+    "tempname", "assert", "compress", "levelsof"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -188,9 +847,11 @@ const vector<string> DODO_COMMANDS = {
 // Side-effect: returns a derived result (count, stats, freq table, file write)
 bool IsTransformationCommand(const string &command) {
 	static const vector<string> TRANSFORMATION = {
-	    "use",      "clear",    "do",       "keep",    "drop",   "generate", "replace",    "rename", "sort",   "order",
-	    "egen",     "collapse", "mvencode", "reshape", "append", "label",    "duplicates", "expand", "import", "merge",
-	    "tempfile", "preserve", "restore",  "xtset",   "tsset",  "bysort",   "by",         "undo",   "redo"};
+	    "use",      "clear",    "do",        "keep",      "drop",   "generate", "replace",    "rename",
+	    "sort",     "order",    "egen",      "collapse",  "mvencode","reshape",  "append",     "label",
+	    "duplicates","expand",  "import",    "merge",     "tempfile","preserve", "restore",    "xtset",
+	    "tsset",    "bysort",   "by",        "undo",      "redo",   "local",    "global",     "scalar",
+	    "macro",    "foreach",  "forvalues", "tempvar",   "tempname", "compress"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -396,6 +1057,8 @@ string TranslateAggFunction(const string &func_name) {
 		return "FIRST";
 	if (lower == "last" || lower == "lastnm")
 		return "LAST";
+	if (lower == "total")
+		return "SUM";
 	return func_name; // pass through unknown functions
 }
 
@@ -529,10 +1192,67 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
                            const string &bysort_order) {
 	string result = expr;
 
-	// missing(x) -> (x IS NULL) — must be done BEFORE L./F./D. so that
-	// missing(L.var) becomes (L.var IS NULL), then L. is translated
-	std::regex missing_re("\\bmissing\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, missing_re, "($1 IS NULL)");
+	// missing(x) or missing(x, y, z) -> (x IS NULL) or (x IS NULL OR y IS NULL OR z IS NULL)
+	// Must be done BEFORE L./F./D. so that missing(L.var) becomes (L.var IS NULL), then L. is translated
+	{
+		std::regex missing_re("\\bmissing\\s*\\(([^)]+)\\)");
+		std::smatch m;
+		string tmp = result;
+		string out;
+		while (std::regex_search(tmp, m, missing_re)) {
+			out += m.prefix().str();
+			string args_str = m[1].str();
+			auto args = str::Split(args_str, ',');
+			if (args.size() == 1) {
+				out += "(" + Trim(args[0]) + " IS NULL)";
+			} else {
+				out += "(";
+				for (idx_t i = 0; i < args.size(); i++) {
+					if (i > 0) out += " OR ";
+					out += Trim(args[i]) + " IS NULL";
+				}
+				out += ")";
+			}
+			tmp = m.suffix().str();
+		}
+		out += tmp;
+		result = out;
+	}
+
+	// ! and ~ as NOT operator — translate before other expression handling
+	// Handle !( and !var patterns: !missing(...) -> NOT missing(...), !flag -> NOT flag
+	{
+		string out;
+		for (idx_t i = 0; i < result.size(); i++) {
+			if ((result[i] == '!' || result[i] == '~') && i + 1 < result.size() && result[i + 1] != '=') {
+				// Don't translate != or ~=
+				out += "NOT ";
+			} else {
+				out += result[i];
+			}
+		}
+		result = out;
+	}
+
+	// Bare . as Stata missing value -> NULL (e.g., generate x = .)
+	// Match . when surrounded by non-alphanumeric, non-dot characters
+	{
+		string out;
+		for (idx_t i = 0; i < result.size(); i++) {
+			if (result[i] == '.') {
+				bool prev_ok = (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_' && result[i - 1] != '.'));
+				bool next_ok = (i + 1 >= result.size() || (!isalnum(result[i + 1]) && result[i + 1] != '_' && result[i + 1] != '.'));
+				if (prev_ok && next_ok) {
+					out += "NULL";
+				} else {
+					out += '.';
+				}
+			} else {
+				out += result[i];
+			}
+		}
+		result = out;
+	}
 
 	// L., L2., F., F2., D. time-series operators (gap-aware)
 	if (!time_var.empty()) {
@@ -678,8 +1398,14 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	result = std::regex_replace(result, log_re, "LN(");
 	// missing() already handled above (before L./F./D.)
 	// substr(s, start, len) -> SUBSTRING(s, start, len)
+	// substr(s, start, .) -> SUBSTRING(s, start) — Stata . means "to end", DuckDB uses 2-arg form
 	std::regex substr_re("\\bsubstr\\s*\\(");
 	result = std::regex_replace(result, substr_re, "SUBSTRING(");
+	// Clean up SUBSTRING(x, y, NULL) -> SUBSTRING(x, y) since . was already replaced with NULL
+	{
+		std::regex substr_null_re("SUBSTRING\\(([^)]+),\\s*NULL\\)");
+		result = std::regex_replace(result, substr_null_re, "SUBSTRING($1)");
+	}
 	// strlen(s) -> LENGTH(s)
 	std::regex strlen_re("\\bstrlen\\s*\\(");
 	result = std::regex_replace(result, strlen_re, "LENGTH(");
@@ -692,12 +1418,40 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	// strtrim(s) -> TRIM(s)
 	std::regex strtrim_re("\\bstrtrim\\s*\\(");
 	result = std::regex_replace(result, strtrim_re, "TRIM(");
-	// real(s) -> CAST(s AS DOUBLE)
-	std::regex real_re("\\breal\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, real_re, "CAST($1 AS DOUBLE)");
+	// real(s) -> CAST(s AS DOUBLE) — uses paren-balancing for nested calls like real(substr(...))
 	// int(x) -> CAST(x AS INTEGER)
-	std::regex int_re("\\bint\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, int_re, "CAST($1 AS INTEGER)");
+	for (auto &[func_name, cast_type] : vector<pair<string, string>>{{"real", "DOUBLE"}, {"int", "INTEGER"}}) {
+		string out;
+		for (idx_t i = 0; i < result.size(); ) {
+			// Check for word boundary + func_name + optional spaces + (
+			if (result.substr(i, func_name.size()) == func_name &&
+			    (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_')) &&
+			    i + func_name.size() < result.size()) {
+				idx_t j = i + func_name.size();
+				while (j < result.size() && result[j] == ' ') j++;
+				if (j < result.size() && result[j] == '(') {
+					// Find matching closing paren
+					int depth = 1;
+					idx_t start = j + 1;
+					idx_t k = start;
+					while (k < result.size() && depth > 0) {
+						if (result[k] == '(') depth++;
+						else if (result[k] == ')') depth--;
+						if (depth > 0) k++;
+					}
+					if (depth == 0) {
+						string inner = result.substr(start, k - start);
+						out += "CAST(" + inner + " AS " + cast_type + ")";
+						i = k + 1;
+						continue;
+					}
+				}
+			}
+			out += result[i];
+			i++;
+		}
+		result = out;
+	}
 	// round(x) and round(x, d) — DuckDB supports ROUND natively, pass through
 	// abs(x) — DuckDB supports ABS natively, pass through
 
@@ -1286,6 +2040,343 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		return "SELECT '" + escaped + "' AS sql";
 	}
 
+	//===--------------------------------------------------------------------===//
+	// Macro / Scalar / Temp commands (do not require data)
+	//===--------------------------------------------------------------------===//
+
+	if (cmd.command == "local") {
+		string args = cmd.arguments;
+		if (!cmd.condition.empty()) {
+			args += " if " + cmd.condition;
+		}
+		if (!cmd.options.empty()) {
+			args += ", " + cmd.options;
+		}
+		args = Trim(args);
+
+		if (args.empty()) {
+			throw DodoException("'local' requires a macro name");
+		}
+
+		// local ++name / local --name
+		if (str::StartsWith(args, "++") || str::StartsWith(args, "--")) {
+			bool increment = args[0] == '+';
+			string name = Trim(args.substr(2));
+			auto it = state.local_symbols.find(name);
+			double val = 0;
+			if (it != state.local_symbols.end()) {
+				if (it->second.kind == SymbolKind::VARIABLE) {
+					// Emit SET VARIABLE for runtime increment
+					string uname = it->second.value;
+					string op = increment ? " + 1" : " - 1";
+					state.pending_sql.push_back("SET VARIABLE " + uname + " = getvariable('" + uname + "')" + op);
+					return "SELECT 'OK' AS status";
+				}
+				try {
+					val = std::stod(it->second.value);
+				} catch (...) {
+					throw DodoException("Cannot increment/decrement non-numeric macro: " + name);
+				}
+			}
+			val += increment ? 1 : -1;
+			state.local_symbols[name] = {SymbolKind::LITERAL, FormatNumber(val)};
+			return "SELECT 'OK' AS status";
+		}
+
+		// Split: name [= expr | "string" | value...]
+		idx_t space = args.find(' ');
+		idx_t eq = args.find('=');
+
+		if (space == string::npos && eq == string::npos) {
+			// local name — set to empty
+			state.local_symbols[args] = {SymbolKind::LITERAL, ""};
+			return "SELECT 'OK' AS status";
+		}
+
+		string name;
+		string value;
+
+		if (eq != string::npos && (space == string::npos || eq < space || (eq == space + 1))) {
+			// local name = expr (or local name= expr)
+			name = Trim(args.substr(0, eq));
+			name = Trim(name);
+			value = Trim(args.substr(eq + 1));
+			// Check if it's a quoted string
+			if ((value.front() == '"' && value.back() == '"') ||
+			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
+				state.local_symbols[name] = {SymbolKind::LITERAL, ExtractQuotedString(value)};
+			} else {
+				// Try compile-time evaluation first
+				try {
+					double result = EvaluateSimpleExpr(value);
+					state.local_symbols[name] = {SymbolKind::LITERAL, FormatNumber(result)};
+				} catch (...) {
+					// Expression contains runtime references — emit SET VARIABLE
+					string rt = FindRuntimeToken(value);
+					if (rt == "r()" || rt == "e()") {
+						throw DodoException("'local " + name + " = " + value +
+						                    "': expression contains runtime token '" + rt +
+						                    "' which requires M14c (stored results as tables).");
+					}
+					if (rt == "_N" && !state.HasData()) {
+						throw DodoException("'local " + name + " = " + value +
+						                    "': _N requires data. Use 'use' to load data first.");
+					}
+					string uname = DodoState::GenerateUname("l", name);
+					state.local_symbols[name] = {SymbolKind::VARIABLE, uname};
+					state.pending_sql.push_back(BuildSetVariableSQL(uname, value, state));
+				}
+			}
+		} else {
+			// local name value... (literal text assignment)
+			name = Trim(args.substr(0, space));
+			value = Trim(args.substr(space + 1));
+			// Strip surrounding quotes if present
+			if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+				value = value.substr(1, value.size() - 2);
+			} else if (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'") {
+				value = value.substr(2, value.size() - 4);
+			}
+			state.local_symbols[name] = {SymbolKind::LITERAL, value};
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "global") {
+		string args = cmd.arguments;
+		if (!cmd.condition.empty()) {
+			args += " if " + cmd.condition;
+		}
+		if (!cmd.options.empty()) {
+			args += ", " + cmd.options;
+		}
+		args = Trim(args);
+
+		if (args.empty()) {
+			throw DodoException("'global' requires a macro name");
+		}
+
+		// Split: name [= expr | "string" | value...]
+		idx_t space = args.find(' ');
+		idx_t eq = args.find('=');
+
+		if (space == string::npos && eq == string::npos) {
+			state.global_symbols[args] = {SymbolKind::LITERAL, ""};
+			return "SELECT 'OK' AS status";
+		}
+
+		string name;
+		string value;
+
+		if (eq != string::npos && (space == string::npos || eq < space || (eq == space + 1))) {
+			name = Trim(args.substr(0, eq));
+			name = Trim(name);
+			value = Trim(args.substr(eq + 1));
+			if ((value.front() == '"' && value.back() == '"') ||
+			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
+				state.global_symbols[name] = {SymbolKind::LITERAL, ExtractQuotedString(value)};
+			} else {
+				// Try compile-time evaluation first
+				try {
+					double result = EvaluateSimpleExpr(value);
+					state.global_symbols[name] = {SymbolKind::LITERAL, FormatNumber(result)};
+				} catch (...) {
+					// Expression contains runtime references — emit SET VARIABLE
+					string rt = FindRuntimeToken(value);
+					if (rt == "r()" || rt == "e()") {
+						throw DodoException("'global " + name + " = " + value +
+						                    "': expression contains runtime token '" + rt +
+						                    "' which requires M14c (stored results as tables).");
+					}
+					if (rt == "_N" && !state.HasData()) {
+						throw DodoException("'global " + name + " = " + value +
+						                    "': _N requires data. Use 'use' to load data first.");
+					}
+					string uname = DodoState::GenerateUname("g", name);
+					state.global_symbols[name] = {SymbolKind::VARIABLE, uname};
+					state.pending_sql.push_back(BuildSetVariableSQL(uname, value, state));
+				}
+			}
+		} else {
+			name = Trim(args.substr(0, space));
+			value = Trim(args.substr(space + 1));
+			if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+				value = value.substr(1, value.size() - 2);
+			} else if (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'") {
+				value = value.substr(2, value.size() - 4);
+			}
+			state.global_symbols[name] = {SymbolKind::LITERAL, value};
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "macro") {
+		string lower_args = str::Lower(Trim(cmd.arguments));
+		if (str::StartsWith(lower_args, "drop ")) {
+			string rest = Trim(cmd.arguments.substr(5));
+			if (rest == "_all") {
+				state.local_symbols.clear();
+				state.global_symbols.clear();
+			} else {
+				auto names = str::Split(rest, ' ');
+				for (auto &n : names) {
+					string name = Trim(n);
+					state.local_symbols.erase(name);
+					state.global_symbols.erase(name);
+				}
+			}
+			return "SELECT 'OK' AS status";
+		}
+		throw DodoException("'macro' supports: macro drop name [name ...] | macro drop _all");
+	}
+
+	if (cmd.command == "scalar") {
+		string args = cmd.arguments;
+		if (!cmd.condition.empty()) {
+			args += " if " + cmd.condition;
+		}
+		if (!cmd.options.empty()) {
+			args += ", " + cmd.options;
+		}
+		args = Trim(args);
+		string lower_args = str::Lower(args);
+
+		// scalar list [names | _all]
+		if (str::StartsWith(lower_args, "list") || str::StartsWith(lower_args, "dir")) {
+			string sql = "SELECT * FROM (VALUES ";
+			bool has_rows = false;
+			for (auto &[sn, entry] : state.scalar_symbols) {
+				if (has_rows) {
+					sql += ", ";
+				}
+				string display_val = (entry.kind == SymbolKind::VARIABLE) ? "<runtime:" + entry.value + ">" : entry.value;
+				string escaped_val = display_val;
+				size_t qpos = 0;
+				while ((qpos = escaped_val.find('\'', qpos)) != string::npos) {
+					escaped_val.replace(qpos, 1, "''");
+					qpos += 2;
+				}
+				sql += "('" + sn + "', '" + escaped_val + "')";
+				has_rows = true;
+			}
+			if (!has_rows) {
+				sql += "('(none)', '')";
+			}
+			sql += ") AS t(name, value) ORDER BY name";
+			return sql;
+		}
+
+		// scalar drop names | _all
+		if (str::StartsWith(lower_args, "drop ")) {
+			string rest = Trim(args.substr(5));
+			if (rest == "_all") {
+				state.scalar_symbols.clear();
+			} else {
+				auto names = str::Split(rest, ' ');
+				for (auto &n : names) {
+					string sn = Trim(n);
+					state.scalar_symbols.erase(sn);
+				}
+			}
+			return "SELECT 'OK' AS status";
+		}
+
+		// scalar [define] name = expr
+		if (str::StartsWith(lower_args, "define ")) {
+			args = Trim(args.substr(7));
+		}
+
+		idx_t eq_pos = args.find('=');
+		if (eq_pos == string::npos) {
+			throw DodoException("'scalar' requires: scalar name = expression");
+		}
+		string name = Trim(args.substr(0, eq_pos));
+		string expr = Trim(args.substr(eq_pos + 1));
+
+		// Check for string scalar
+		if (expr.size() >= 2 && expr.front() == '"' && expr.back() == '"') {
+			state.scalar_symbols[name] = {SymbolKind::LITERAL, expr.substr(1, expr.size() - 2)};
+			return "SELECT 'OK' AS status";
+		}
+
+		// Try compile-time evaluation first (ExpandMacros already ran on the command line,
+		// so LITERAL scalars are already substituted into the expression)
+		try {
+			double result = EvaluateSimpleExpr(expr);
+			state.scalar_symbols[name] = {SymbolKind::LITERAL, FormatNumber(result)};
+		} catch (...) {
+			// Expression contains runtime references — emit SET VARIABLE
+			string rt = FindRuntimeToken(expr);
+			if (rt == "r()" || rt == "e()") {
+				throw DodoException("'scalar " + name + " = " + expr +
+				                    "': expression contains runtime token '" + rt +
+				                    "' which requires M14c (stored results as tables).");
+			}
+			if (rt == "_N" && !state.HasData()) {
+				throw DodoException("'scalar " + name + " = " + expr +
+				                    "': _N requires data. Use 'use' to load data first.");
+			}
+			string uname = DodoState::GenerateUname("s", name);
+			state.scalar_symbols[name] = {SymbolKind::VARIABLE, uname};
+			state.pending_sql.push_back(BuildSetVariableSQL(uname, expr, state));
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "tempvar") {
+		string args = Trim(cmd.arguments);
+		if (args.empty()) {
+			throw DodoException("'tempvar' requires at least one name");
+		}
+		auto names = str::Split(args, ' ');
+		for (auto &n : names) {
+			string lclname = Trim(n);
+			string tmpname = "__dodo_tmp_" + to_string(state.temp_counter++);
+			state.local_symbols[lclname] = {SymbolKind::LITERAL, tmpname};
+			state.tempvar_columns.push_back(tmpname);
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "tempname") {
+		string args = Trim(cmd.arguments);
+		if (args.empty()) {
+			throw DodoException("'tempname' requires at least one name");
+		}
+		auto names = str::Split(args, ' ');
+		for (auto &n : names) {
+			string lclname = Trim(n);
+			string tmpname = "__dodo_tmp_" + to_string(state.temp_counter++);
+			state.local_symbols[lclname] = {SymbolKind::LITERAL, tmpname};
+			state.tempname_names.push_back(tmpname);
+		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "display") {
+		string args = cmd.arguments;
+		if (!cmd.options.empty()) {
+			args += ", " + cmd.options;
+		}
+		args = Trim(args);
+		// Strip quotes
+		if (args.size() >= 2 && args.front() == '"' && args.back() == '"') {
+			args = args.substr(1, args.size() - 2);
+		}
+		// If args contain getvariable() calls, evaluate as expression
+		if (args.find("getvariable(") != string::npos) {
+			return "SELECT " + args + " AS display";
+		}
+		// Escape for SQL
+		string escaped = args;
+		size_t pos = 0;
+		while ((pos = escaped.find('\'', pos)) != string::npos) {
+			escaped.replace(pos, 1, "''");
+			pos += 2;
+		}
+		return "SELECT '" + escaped + "' AS display";
+	}
+
 	if (!state.HasData()) {
 		throw DodoException("No dataset in memory. Use 'use' to load data first.");
 	}
@@ -1358,9 +2449,44 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	}
 
 	if (cmd.command == "rename") {
-		auto parts = str::Split(cmd.arguments, ' ');
+		string args = Trim(cmd.arguments);
+
+		// Bulk rename: rename (old1 old2) (new1 new2)
+		if (args.size() > 0 && args[0] == '(') {
+			idx_t close_first = args.find(')');
+			if (close_first == string::npos) {
+				throw DodoException("'rename': unmatched parenthesis");
+			}
+			idx_t open_second = args.find('(', close_first);
+			idx_t close_second = args.find(')', open_second);
+			if (open_second == string::npos || close_second == string::npos) {
+				throw DodoException("'rename': expected (old names) (new names)");
+			}
+			string old_str = Trim(args.substr(1, close_first - 1));
+			string new_str = Trim(args.substr(open_second + 1, close_second - open_second - 1));
+			auto old_vars = str::Split(old_str, ' ');
+			auto new_vars = str::Split(new_str, ' ');
+			if (old_vars.size() != new_vars.size()) {
+				throw DodoException("'rename': old and new name lists must have the same length");
+			}
+			// Build: SELECT old1 AS new1, old2 AS new2, * EXCLUDE (old1, old2) FROM _prev
+			string rename_cols;
+			string exclude_cols;
+			for (idx_t i = 0; i < old_vars.size(); i++) {
+				string oid = QuoteIdent(Trim(old_vars[i]));
+				string nid = QuoteIdent(Trim(new_vars[i]));
+				if (i > 0) { rename_cols += ", "; exclude_cols += ", "; }
+				rename_cols += oid + " AS " + nid;
+				exclude_cols += oid;
+			}
+			state.AddStep("SELECT " + rename_cols + ", * EXCLUDE (" + exclude_cols + ") FROM " + prev);
+			return "SELECT 'OK' AS status";
+		}
+
+		// Simple rename: rename old new
+		auto parts = str::Split(args, ' ');
 		if (parts.size() != 2) {
-			throw DodoException("'rename' requires exactly two arguments: rename oldname newname");
+			throw DodoException("'rename' syntax: rename oldname newname OR rename (old1 old2) (new1 new2)");
 		}
 		string old_name = QuoteIdent(Trim(parts[0]));
 		string new_name = QuoteIdent(Trim(parts[1]));
@@ -1373,7 +2499,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'generate' requires an assignment: generate varname = expression");
 		}
-		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -1430,7 +2556,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'egen' requires an assignment: egen varname = function(arg)");
 		}
-		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
 		string rhs = Trim(cmd.arguments.substr(eq_pos + 1));
 
 		string func_name, func_arg;
@@ -2229,24 +3355,368 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		return "SELECT 'OK' AS status";
 	}
 
+	if (cmd.command == "levelsof") {
+		// levelsof varname [, local(macname)]
+		// Terminal command: SELECT DISTINCT varname FROM _prev ORDER BY varname
+		if (!state.HasData()) {
+			throw DodoException("No dataset in memory. Use 'use' to load data first.");
+		}
+		string args = Trim(cmd.arguments);
+		string varname;
+
+		idx_t comma = args.find(',');
+		if (comma != string::npos) {
+			varname = Trim(args.substr(0, comma));
+		} else {
+			varname = args;
+		}
+
+		if (varname.empty()) {
+			throw DodoException("'levelsof' requires a variable name");
+		}
+
+		return state.BuildQuery("SELECT DISTINCT " + QuoteIdent(varname) + " FROM " + prev +
+		                        " WHERE " + QuoteIdent(varname) + " IS NOT NULL ORDER BY " + QuoteIdent(varname));
+	}
+
+	if (cmd.command == "assert") {
+		if (cmd.arguments.empty()) {
+			throw DodoException("'assert' requires an expression");
+		}
+		string cond = TrExpr(cmd.arguments);
+		string escaped_expr = cmd.arguments;
+		// Escape single quotes for SQL string
+		idx_t qpos = 0;
+		while ((qpos = escaped_expr.find('\'', qpos)) != string::npos) {
+			escaped_expr.replace(qpos, 1, "''");
+			qpos += 2;
+		}
+		return state.BuildQuery("SELECT CASE WHEN bool_or(NOT (" + cond + ")) THEN error('Assertion failed: " +
+		       escaped_expr + "') ELSE 'OK' END AS status FROM " + prev);
+	}
+
+	if (cmd.command == "compress") {
+		return "SELECT 'OK' AS status";
+	}
+
 	throw DodoException("Unimplemented command: " + cmd.command);
 }
 
 //===--------------------------------------------------------------------===//
-// ProcessDoFile: read and execute a .do file, returning side-effect SQL
+// Brace Block Accumulation (for foreach/forvalues)
 //===--------------------------------------------------------------------===//
-vector<string> ProcessDoFile(const string &filename, DodoState &state) {
-	std::ifstream file(filename);
-	if (!file.is_open()) {
-		throw DodoException("Cannot open file: " + filename);
+
+static vector<string> AccumulateBraceBlock(LineReader reader) {
+	vector<string> body;
+	int depth = 1;
+	string line;
+	while (reader(line)) {
+		string trimmed = Trim(line);
+
+		// Strip comments
+		if (!trimmed.empty() && trimmed[0] == '*') {
+			continue;
+		}
+		idx_t comment_pos = trimmed.find("//");
+		if (comment_pos != string::npos) {
+			if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
+				// /// continuation inside block — not typical but handle gracefully
+				trimmed = Trim(trimmed.substr(0, comment_pos));
+			} else {
+				trimmed = Trim(trimmed.substr(0, comment_pos));
+			}
+		}
+
+		if (trimmed.empty()) {
+			continue;
+		}
+
+		// Track brace depth
+		for (auto c : trimmed) {
+			if (c == '{') {
+				depth++;
+			} else if (c == '}') {
+				depth--;
+			}
+		}
+
+		if (depth <= 0) {
+			// The closing } line — don't add it to body
+			// But if there's content before }, add it
+			idx_t close_pos = trimmed.find('}');
+			if (close_pos > 0) {
+				string before = Trim(trimmed.substr(0, close_pos));
+				if (!before.empty()) {
+					body.push_back(before);
+				}
+			}
+			break;
+		}
+
+		body.push_back(trimmed);
 	}
 
+	if (depth > 0) {
+		throw DodoException("Unterminated brace block in foreach/forvalues");
+	}
+
+	return body;
+}
+
+//===--------------------------------------------------------------------===//
+// Loop Parsing Helpers
+//===--------------------------------------------------------------------===//
+
+// Split a string into tokens respecting quotes
+static vector<string> SplitTokens(const string &s) {
+	vector<string> tokens;
+	string current;
+	bool in_quotes = false;
+	for (idx_t i = 0; i < s.size(); i++) {
+		if (s[i] == '"') {
+			in_quotes = !in_quotes;
+		} else if (s[i] == ' ' && !in_quotes) {
+			if (!current.empty()) {
+				tokens.push_back(current);
+				current.clear();
+			}
+		} else {
+			current += s[i];
+		}
+	}
+	if (!current.empty()) {
+		tokens.push_back(current);
+	}
+	return tokens;
+}
+
+// Parse foreach header and return (loop_var, values)
+static pair<string, vector<string>> ParseForeachHeader(const string &header, const DodoState &state) {
+	// Formats:
+	//   foreach lname in list {
+	//   foreach lname of local macname {
+	//   foreach lname of global macname {
+	//   foreach lname of numlist spec {
+	string rest = Trim(header);
+
+	// Strip trailing {
+	if (!rest.empty() && rest.back() == '{') {
+		rest = Trim(rest.substr(0, rest.size() - 1));
+	}
+
+	// Strip "foreach "
+	if (str::StartsWith(str::Lower(rest), "foreach ")) {
+		rest = Trim(rest.substr(8));
+	}
+
+	// First token is the loop variable name
+	idx_t space = rest.find(' ');
+	if (space == string::npos) {
+		throw DodoException("foreach: missing list specification");
+	}
+	string lname = Trim(rest.substr(0, space));
+	rest = Trim(rest.substr(space + 1));
+
+	string lower_rest = str::Lower(rest);
+
+	// foreach lname in list
+	if (str::StartsWith(lower_rest, "in ")) {
+		string list_str = Trim(rest.substr(3));
+		return {lname, SplitTokens(list_str)};
+	}
+
+	// foreach lname of local/global/numlist
+	if (str::StartsWith(lower_rest, "of ")) {
+		rest = Trim(rest.substr(3));
+		lower_rest = str::Lower(rest);
+
+		if (str::StartsWith(lower_rest, "local ")) {
+			string macname = Trim(rest.substr(6));
+			auto it = state.local_symbols.find(macname);
+			if (it != state.local_symbols.end()) {
+				if (it->second.kind == SymbolKind::VARIABLE) {
+					throw DodoException("'foreach " + lname + " of local " + macname +
+					                    "': cannot iterate over runtime variable at compile time.");
+				}
+				return {lname, SplitTokens(it->second.value)};
+			}
+			return {lname, {}}; // empty macro = zero iterations
+		}
+		if (str::StartsWith(lower_rest, "global ")) {
+			string macname = Trim(rest.substr(7));
+			auto it = state.global_symbols.find(macname);
+			if (it != state.global_symbols.end()) {
+				if (it->second.kind == SymbolKind::VARIABLE) {
+					throw DodoException("'foreach " + lname + " of global " + macname +
+					                    "': cannot iterate over runtime variable at compile time.");
+				}
+				return {lname, SplitTokens(it->second.value)};
+			}
+			return {lname, {}};
+		}
+		if (str::StartsWith(lower_rest, "numlist ")) {
+			string spec = Trim(rest.substr(8));
+			string rt = FindRuntimeToken(spec);
+			if (!rt.empty()) {
+				throw DodoException("'foreach " + lname + " of numlist " + spec +
+				                    "': numlist contains runtime token '" + rt +
+				                    "' which cannot be resolved at compile time. "
+				                    "Rewrite as a set-based operation (see docs/VARIABLE_SUBSTITUTION.md).");
+			}
+			return {lname, ParseNumlist(spec)};
+		}
+
+		throw DodoException("foreach: expected 'in', 'of local', 'of global', or 'of numlist'");
+	}
+
+	throw DodoException("foreach: expected 'in' or 'of' after variable name");
+}
+
+// Parse forvalues header: forvalues lname = range {
+static pair<string, vector<string>> ParseForvaluesHeader(const string &header) {
+	string rest = Trim(header);
+
+	// Strip trailing {
+	if (!rest.empty() && rest.back() == '{') {
+		rest = Trim(rest.substr(0, rest.size() - 1));
+	}
+
+	// Strip "forvalues "
+	if (str::StartsWith(str::Lower(rest), "forvalues ")) {
+		rest = Trim(rest.substr(10));
+	}
+
+	// Parse: lname = range
+	idx_t eq_pos = rest.find('=');
+	if (eq_pos == string::npos) {
+		throw DodoException("forvalues: expected '=' in range specification");
+	}
+
+	string lname = Trim(rest.substr(0, eq_pos));
+	string range = Trim(rest.substr(eq_pos + 1));
+
+	// Check for runtime tokens in range — loop bounds must be compile-time known
+	string rt = FindRuntimeToken(range);
+	if (!rt.empty()) {
+		throw DodoException("'forvalues " + lname + " = " + range +
+		                    "': loop bound contains runtime token '" + rt +
+		                    "' which cannot be resolved at compile time. "
+		                    "Rewrite as a set-based operation (see docs/VARIABLE_SUBSTITUTION.md).");
+	}
+
+	return {lname, ParseNumlist(range)};
+}
+
+//===--------------------------------------------------------------------===//
+// ProcessLines: shared line-processing engine
+//===--------------------------------------------------------------------===//
+
+vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_terminal) {
 	string line;
 	bool in_block_comment = false;
 	string continued_line;
 	vector<string> side_effect_sql;
 
-	while (std::getline(file, line)) {
+	// Process a single command line (used by main loop and loop iterations)
+	auto process_command = [&](const string &trimmed) {
+		string sub_command;
+		if (!IsDodoCommand(trimmed, sub_command)) {
+			return;
+		}
+
+		if (skip_terminal && !IsTransformationCommand(sub_command) && !IsSideEffectCommand(sub_command)) {
+			return;
+		}
+
+		auto sub_cmd = TokenizeCommand(trimmed);
+		state.pending_command = trimmed;
+		string sql = ProcessCommand(sub_cmd, state);
+
+		// In do-file context, use/import cannot materialize
+		if ((sub_command == "use" || sub_command == "import") && state.materialized) {
+			string source = ExtractQuotedString(sub_cmd.arguments);
+			string read_expr = FileReadFunction(source);
+			if (sub_command == "import") {
+				string imp_rest = Trim(sub_cmd.arguments.substr(10));
+				read_expr = "read_csv('" + ExtractQuotedString(imp_rest) + "')";
+			}
+			state.cte_steps.clear();
+			state.step_counter = 0;
+			state.AddStep("SELECT * FROM " + read_expr);
+			state.materialized = false;
+		}
+
+		if (IsSideEffectCommand(sub_command)) {
+			side_effect_sql.push_back(sql);
+		}
+
+		// Drain any pending SQL (SET VARIABLE from M14b)
+		for (auto &psql : state.pending_sql) {
+			side_effect_sql.push_back(psql);
+		}
+		state.pending_sql.clear();
+	};
+
+	// Execute a loop body with the given variable name bound to each value
+	std::function<void(const string &, const vector<string> &, const vector<string> &)> execute_loop;
+	execute_loop = [&](const string &lname, const vector<string> &values, const vector<string> &body) {
+		for (auto &val : values) {
+			state.local_symbols[lname] = {SymbolKind::LITERAL, val};
+			for (auto &body_line : body) {
+				// Expand macros in body line
+				string expanded = ExpandMacros(body_line, state);
+				if (expanded.empty()) {
+					continue;
+				}
+
+				string lower = str::Lower(expanded);
+
+				// Nested foreach
+				if (str::StartsWith(lower, "foreach ")) {
+					auto [inner_lname, inner_values] = ParseForeachHeader(expanded, state);
+					// Check if body is on same line (single-line loop)
+					idx_t brace = expanded.find('{');
+					idx_t close = expanded.find('}');
+					vector<string> inner_body;
+					if (brace != string::npos && close != string::npos && close > brace) {
+						// Single-line: foreach x in a b { cmd }
+						string inline_body = Trim(expanded.substr(brace + 1, close - brace - 1));
+						if (!inline_body.empty()) {
+							inner_body.push_back(inline_body);
+						}
+					}
+					// Note: nested multi-line loops within a loop body are already accumulated
+					// because the outer body was accumulated from the stream. Inner braces
+					// within the body lines need special handling — for now, we support
+					// single-line nested loops and multi-line via pre-accumulated body.
+					execute_loop(inner_lname, inner_values, inner_body);
+					continue;
+				}
+
+				// Nested forvalues
+				if (str::StartsWith(lower, "forvalues ")) {
+					auto [inner_lname, inner_values] = ParseForvaluesHeader(expanded);
+					idx_t brace = expanded.find('{');
+					idx_t close = expanded.find('}');
+					vector<string> inner_body;
+					if (brace != string::npos && close != string::npos && close > brace) {
+						string inline_body = Trim(expanded.substr(brace + 1, close - brace - 1));
+						if (!inline_body.empty()) {
+							inner_body.push_back(inline_body);
+						}
+					}
+					execute_loop(inner_lname, inner_values, inner_body);
+					continue;
+				}
+
+				process_command(expanded);
+			}
+		}
+		// Loop index variable is scoped to the loop body — erase it
+		state.local_symbols.erase(lname);
+	};
+
+	while (reader(line)) {
 		string trimmed = Trim(line);
 
 		// Handle block comments /* ... */
@@ -2265,7 +3735,6 @@ vector<string> ProcessDoFile(const string &filename, DodoState &state) {
 		if (block_start != string::npos) {
 			idx_t block_end = trimmed.find("*/", block_start + 2);
 			if (block_end != string::npos) {
-				// Single-line block comment — remove it
 				trimmed = Trim(trimmed.substr(0, block_start) + trimmed.substr(block_end + 2));
 			} else {
 				trimmed = Trim(trimmed.substr(0, block_start));
@@ -2273,35 +3742,32 @@ vector<string> ProcessDoFile(const string &filename, DodoState &state) {
 			}
 		}
 
-		// Strip // line comments (not inside quotes)
+		// Strip // line comments
 		idx_t comment_pos = trimmed.find("//");
 		if (comment_pos != string::npos) {
-			// Check it's not /// (line continuation)
 			if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
-				// Line continuation: strip /// and join with next line
 				continued_line += Trim(trimmed.substr(0, comment_pos)) + " ";
 				continue;
 			}
 			trimmed = Trim(trimmed.substr(0, comment_pos));
 		}
 
-		// Strip * line-start comments (do-file convention)
+		// Strip * line-start comments
 		if (!trimmed.empty() && trimmed[0] == '*') {
 			continue;
 		}
 
-		// Handle line continuation from previous line
+		// Handle line continuation
 		if (!continued_line.empty()) {
 			trimmed = continued_line + trimmed;
 			continued_line.clear();
 		}
 
-		// Skip empty lines
 		if (trimmed.empty()) {
 			continue;
 		}
 
-		// Strip trailing semicolons (in case the .do file has them)
+		// Strip trailing semicolons
 		if (!trimmed.empty() && trimmed.back() == ';') {
 			trimmed.pop_back();
 			trimmed = Trim(trimmed);
@@ -2310,47 +3776,72 @@ vector<string> ProcessDoFile(const string &filename, DodoState &state) {
 			continue;
 		}
 
-		// Check if this is a command we know
-		string sub_command;
-		if (!IsDodoCommand(trimmed, sub_command)) {
-			// Not a known command — skip
+		// Expand macros before command recognition
+		trimmed = ExpandMacros(trimmed, state);
+		if (trimmed.empty()) {
 			continue;
 		}
 
-		// In do-file execution, run transformation and side-effect commands
-		// Terminal (list, head, tail, describe) and query commands (count,
-		// summarize, tabulate) are skipped — user runs them interactively after
-		if (!IsTransformationCommand(sub_command) && !IsSideEffectCommand(sub_command)) {
-			continue;
-		}
-
-		auto sub_cmd = TokenizeCommand(trimmed);
-		state.pending_command = trimmed;
-		string sql = ProcessCommand(sub_cmd, state);
-
-		// In do-file context, use/import cannot materialize (table creation
-		// SQL can't execute mid-script). Rewrite to lazy if needed.
-		if ((sub_command == "use" || sub_command == "import") && state.materialized) {
-			// Undo materialization: replace dodo._current reference with direct file read
-			string source = ExtractQuotedString(sub_cmd.arguments);
-			string read_expr = FileReadFunction(source);
-			if (sub_command == "import") {
-				string rest = Trim(sub_cmd.arguments.substr(10));
-				read_expr = "read_csv('" + ExtractQuotedString(rest) + "')";
+		// Check for foreach/forvalues loops
+		string lower = str::Lower(trimmed);
+		if (str::StartsWith(lower, "foreach ")) {
+			auto [lname, values] = ParseForeachHeader(trimmed, state);
+			// Check for single-line loop: foreach x in a b { cmd }
+			idx_t brace = trimmed.find('{');
+			idx_t close = trimmed.rfind('}');
+			vector<string> body;
+			if (brace != string::npos && close != string::npos && close > brace + 1) {
+				// Single-line: body is between { and }
+				string inline_body = Trim(trimmed.substr(brace + 1, close - brace - 1));
+				if (!inline_body.empty()) {
+					body.push_back(inline_body);
+				}
+			} else {
+				// Multi-line: accumulate until }
+				body = AccumulateBraceBlock(reader);
 			}
-			state.cte_steps.clear();
-			state.step_counter = 0;
-			state.AddStep("SELECT * FROM " + read_expr);
-			state.materialized = false;
+			execute_loop(lname, values, body);
+			continue;
+		}
+		if (str::StartsWith(lower, "forvalues ")) {
+			auto [lname, values] = ParseForvaluesHeader(trimmed);
+			idx_t brace = trimmed.find('{');
+			idx_t close = trimmed.rfind('}');
+			vector<string> body;
+			if (brace != string::npos && close != string::npos && close > brace + 1) {
+				string inline_body = Trim(trimmed.substr(brace + 1, close - brace - 1));
+				if (!inline_body.empty()) {
+					body.push_back(inline_body);
+				}
+			} else {
+				body = AccumulateBraceBlock(reader);
+			}
+			execute_loop(lname, values, body);
+			continue;
 		}
 
-		// Side-effect commands (export, save) return SQL that must be executed
-		if (IsSideEffectCommand(sub_command)) {
-			side_effect_sql.push_back(sql);
-		}
+		process_command(trimmed);
 	}
 
 	return side_effect_sql;
+}
+
+//===--------------------------------------------------------------------===//
+// ProcessDoFile: thin wrapper around ProcessLines
+//===--------------------------------------------------------------------===//
+vector<string> ProcessDoFile(const string &filename, DodoState &state) {
+	std::ifstream file(filename);
+	if (!file.is_open()) {
+		throw DodoException("Cannot open file: " + filename);
+	}
+	string line;
+	LineReader reader = [&](string &out) -> bool {
+		if (std::getline(file, out)) {
+			return true;
+		}
+		return false;
+	};
+	return ProcessLines(reader, state, /*skip_terminal=*/true);
 }
 
 } // namespace dodo

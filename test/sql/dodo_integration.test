@@ -1,0 +1,101 @@
+# name: test/sql/dodo_integration.test
+# description: integration test: balance-sheet-style workflow with macros, loops, panel ops
+# group: [sql]
+
+require dodo
+
+# =============================================================
+# Integration test: balance-sheet-style workflow
+# =============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Parameterize with locals
+statement ok
+local start_year 2017
+
+statement ok
+local end_year 2018
+
+statement ok
+keep if inrange(year, `start_year', `end_year')
+
+query I
+count
+----
+5
+
+# Define variable lists and use in foreach
+statement ok
+local dimensions id name year
+
+statement ok
+local facts revenue
+
+statement ok
+keep `dimensions' `facts'
+
+statement ok
+order `dimensions' `facts'
+
+statement ok
+rename revenue sales
+
+# Generate typed columns
+statement ok
+generate long sales_sq = sales * sales
+
+# Loop over variables to check missing values
+statement ok
+local core_vars sales
+
+statement ok
+foreach var of local core_vars {
+    count if missing(`var')
+}
+
+# Panel operations
+statement ok
+xtset id year
+
+statement ok
+generate long lag_sales = L.sales
+
+query I
+count if missing(lag_sales)
+----
+5
+
+# Replace missing with zero
+statement ok
+mvencode lag_sales, mv(0)
+
+query I
+count if lag_sales == 0
+----
+5
+
+# Verify final dataset structure
+statement ok
+sort id
+
+query IRIIII
+list
+----
+1	Acme	2017	1000	1000000	0
+2	Beta	2018	2000	4000000	0
+3	Gamma	2017	1500	2250000	0
+4	Delta	2018	3000	9000000	0
+5	Epsilon	2018	500	250000	0
+
+# --- cleanup ---
+
+statement ok
+clear
+
+statement ok
+scalar drop _all
+
+statement ok
+macro drop _all

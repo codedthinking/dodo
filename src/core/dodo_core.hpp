@@ -2,6 +2,7 @@
 
 #include "string_utils.hpp"
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -9,6 +10,16 @@
 #include <vector>
 
 namespace dodo {
+
+//===--------------------------------------------------------------------===//
+// SymbolEntry — unified symbol table entry (LITERAL text or VARIABLE ref)
+//===--------------------------------------------------------------------===//
+enum class SymbolKind { LITERAL, VARIABLE };
+
+struct SymbolEntry {
+	SymbolKind kind;
+	std::string value; //! LITERAL: the text; VARIABLE: the DuckDB variable name (_dodo_l_x etc.)
+};
 
 //===--------------------------------------------------------------------===//
 // DodoCommand — parsed .do command representation
@@ -46,6 +57,19 @@ struct DodoState {
 	//! Column-to-value-label mapping: column_name -> label_name
 	std::unordered_map<std::string, std::string> column_labels;
 
+	//! Unified symbol tables — four namespaces, each name → SymbolEntry
+	std::unordered_map<std::string, SymbolEntry> local_symbols;
+	std::unordered_map<std::string, SymbolEntry> global_symbols;
+	std::unordered_map<std::string, SymbolEntry> scalar_symbols;
+
+	//! Pending SET VARIABLE SQL to emit (drained by ProcessLines / extension)
+	std::vector<std::string> pending_sql;
+
+	//! Tempvar/tempname tracking
+	std::vector<std::string> tempvar_columns;  //! columns to exclude at scope end
+	std::vector<std::string> tempname_names;   //! scalar/macro names to drop at scope end
+	int temp_counter = 0;                      //! unique name generator
+
 	//! Tempfile names (registered via tempfile command)
 	std::unordered_set<std::string> tempfile_names;
 	//! Whether _tempfiles schema has been created
@@ -66,6 +90,19 @@ struct DodoState {
 	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
 	int preserve_checkpoint = -1;
 	int preserve_step_counter = -1;
+
+	//! Generate a unique DuckDB variable name for SET VARIABLE
+	static std::string GenerateUname(const std::string &prefix, const std::string &name) {
+		return "_dodo_" + prefix + "_" + name;
+	}
+
+	//! Resolve a symbol entry for substitution
+	static std::string ResolveSymbol(const SymbolEntry &entry) {
+		if (entry.kind == SymbolKind::LITERAL) {
+			return entry.value;
+		}
+		return "getvariable('" + entry.value + "')";
+	}
 
 	std::string LatestStep() const {
 		return cte_steps.empty() ? "" : "_s" + std::to_string(step_counter - 1);
@@ -115,10 +152,21 @@ struct DodoState {
 		variable_labels.clear();
 		value_label_defs.clear();
 		column_labels.clear();
+		// Macros, scalars, and tempnames persist across clear (Stata behavior)
+		tempvar_columns.clear();
 		tempfile_names.clear();
 		preserve_checkpoint = -1;
 		preserve_step_counter = -1;
 		materialized = false;
+	}
+
+	//! Full reset: also clears macros, scalars, and tempnames
+	void ClearMacros() {
+		local_symbols.clear();
+		global_symbols.clear();
+		scalar_symbols.clear();
+		tempname_names.clear();
+		temp_counter = 0;
 	}
 
 	void ClearAll() {
@@ -151,6 +199,24 @@ DodoCommand TokenizeCommand(const std::string &query);
 std::string TranslateExpression(const std::string &expr, const std::string &by_cols = "",
                                 const std::string &panel_var = "", const std::string &time_var = "",
                                 const std::string &bysort_order = "");
+
+//! Expand Stata macros in text: `name' for locals, $name/${name} for globals, scalar(name)
+std::string ExpandMacros(const std::string &text, const DodoState &state);
+
+//! Evaluate a simple numeric expression (for local x = expr, scalar x = expr)
+double EvaluateSimpleExpr(const std::string &expr);
+
+//! Evaluate a macro function (e.g., :variable label varname, :word count string)
+std::string EvaluateMacroFunction(const std::string &func, const DodoState &state);
+
+//! Parse a Stata numlist specification (e.g., "1/5", "1(2)10")
+std::vector<std::string> ParseNumlist(const std::string &spec);
+
+//! Line reader callback: returns true and fills line, or false at EOF
+using LineReader = std::function<bool(std::string &line)>;
+
+//! Process lines from a source, returning side-effect SQL statements
+std::vector<std::string> ProcessLines(LineReader reader, DodoState &state, bool skip_terminal);
 
 //! Process a single parsed command, returning SQL (or empty string)
 std::string ProcessCommand(const DodoCommand &cmd, DodoState &state);

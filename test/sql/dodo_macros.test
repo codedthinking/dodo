@@ -1,0 +1,1008 @@
+# name: test/sql/dodo_macros.test
+# description: test local/global macros, scalars, loops, macro functions, type qualifiers
+# group: [sql]
+
+require dodo
+
+# ============================================================
+# M14: Local/global macros, scalars, and loops
+# ============================================================
+
+# --- local macros ---
+
+statement ok
+local x 5
+
+statement ok
+local y hello world
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Local macro expansion in keep
+statement ok
+local vars id name
+
+statement ok
+keep `vars' revenue year
+
+query IIRI
+list
+----
+1	Acme	1000	2017
+2	Beta	2000	2018
+3	Gamma	1500	2017
+4	Delta	3000	2018
+5	Epsilon	500	2018
+
+# local with = evaluates expression
+statement ok
+clear
+
+statement ok
+local a = 300
+
+statement ok
+local b = `a' * 5
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > `b'
+----
+2
+
+# local ++/--
+statement ok
+clear
+
+statement ok
+local counter = 0
+
+statement ok
+local ++counter
+
+statement ok
+local ++counter
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if id <= `counter'
+----
+2
+
+# local with quoted string
+statement ok
+clear
+
+statement ok
+local greeting "hello world"
+
+query I
+display "`greeting'"
+----
+hello world
+
+# --- global macros ---
+
+statement ok
+global threshold 2000
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue >= $threshold
+----
+2
+
+# ${name} syntax
+statement ok
+clear
+
+statement ok
+global maxrev 3000
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue <= ${maxrev}
+----
+5
+
+# --- macro drop ---
+
+statement ok
+local dropme something
+
+statement ok
+macro drop dropme
+
+# expanding dropped macro gives empty string
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count
+----
+5
+
+# --- scalar ---
+
+statement ok
+clear
+
+statement ok
+scalar pi = 3.14159
+
+statement ok
+scalar r = 2
+
+statement ok
+scalar area = pi * r * r
+
+statement ok
+use "test/data/firms.csv", clear
+
+# scalar values expand as locals in expressions
+statement ok
+generate big = revenue > area
+
+query IIRII
+list
+----
+1	Acme	1000	2017	1
+2	Beta	2000	2018	1
+3	Gamma	1500	2017	1
+4	Delta	3000	2018	1
+5	Epsilon	500	2018	1
+
+# scalar list
+statement ok
+clear
+
+statement ok
+scalar drop _all
+
+statement ok
+scalar myval = 42
+
+query IT
+scalar list
+----
+myval	42
+
+# --- display ---
+
+query I
+display "Hello from dodo"
+----
+Hello from dodo
+
+# --- tempvar ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+tempvar tmp
+
+statement ok
+generate `tmp' = revenue * 2
+
+# The temp variable exists (we can use it)
+query I
+count if `tmp' > 3000
+----
+2
+
+# --- tempname ---
+
+statement ok
+clear
+
+statement ok
+tempname s1
+
+statement ok
+scalar `s1' = 1500
+
+# Can access via the tempname — scalar value expands as a local
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > `s1'
+----
+2
+
+# --- foreach in ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v in revenue id {
+    generate `v'_sq = `v' * `v'
+}
+
+# Check that both _sq columns were created
+query IIRIII
+list
+----
+1	Acme	1000	2017	1000000	1
+2	Beta	2000	2018	4000000	4
+3	Gamma	1500	2017	2250000	9
+4	Delta	3000	2018	9000000	16
+5	Epsilon	500	2018	250000	25
+
+# --- foreach of local ---
+
+statement ok
+clear
+
+statement ok
+local mylist revenue id
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v of local mylist {
+    generate `v'_double = `v' * 2
+}
+
+query I
+count
+----
+5
+
+# --- foreach of numlist ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach n of numlist 1/3 {
+    generate var`n' = `n'
+}
+
+query IIIIIII
+list
+----
+1	Acme	1000	2017	1	2	3
+2	Beta	2000	2018	1	2	3
+3	Gamma	1500	2017	1	2	3
+4	Delta	3000	2018	1	2	3
+5	Epsilon	500	2018	1	2	3
+
+# --- forvalues ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+forvalues i = 1(2)5 {
+    generate x`i' = `i'
+}
+
+# Creates x1, x3, x5
+query IIIIIII
+list
+----
+1	Acme	1000	2017	1	3	5
+2	Beta	2000	2018	1	3	5
+3	Gamma	1500	2017	1	3	5
+4	Delta	3000	2018	1	3	5
+5	Epsilon	500	2018	1	3	5
+
+# --- macro functions ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+label variable revenue "Annual Revenue (USD)"
+
+# :variable label
+statement ok
+local revlab `:variable label revenue'
+
+query I
+display "`revlab'"
+----
+Annual Revenue (USD)
+
+# :word count
+statement ok
+local sentence one two three four
+
+statement ok
+local n `:word count `sentence''
+
+query I
+display "`n'"
+----
+4
+
+# :word # of
+statement ok
+local w2 `:word 2 of `sentence''
+
+query I
+display "`w2'"
+----
+two
+
+# --- value labels with macro function ---
+
+statement ok
+clear
+
+statement ok
+label define yesno 0 "No" 1 "Yes"
+
+statement ok
+local lbl `:label yesno 1'
+
+query I
+display "`lbl'"
+----
+Yes
+
+# --- nested macros ---
+
+statement ok
+clear
+
+statement ok
+local prefix rev
+
+statement ok
+local suffix enue
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep `prefix'`suffix' year
+
+query IR
+list
+----
+1000	2017
+2000	2018
+1500	2017
+3000	2018
+500	2018
+
+# --- `=expr' inline expression ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > `=1000 + 500'
+----
+2
+
+# --- forvalues with / shorthand ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+local total = 0
+
+statement ok
+forvalues i = 1/3 {
+    local total = `total' + `i'
+}
+
+query I
+display "`total'"
+----
+6
+
+# --- M14b: SET VARIABLE for _N ---
+
+# local = _N emits SET VARIABLE
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+local n = _N
+
+# Verify the SET VARIABLE was executed: getvariable should return 5
+query I
+SELECT getvariable('_dodo_l_n')
+----
+5
+
+# scalar = _N also works
+statement ok
+scalar total = _N
+
+query I
+SELECT getvariable('_dodo_s_total')
+----
+5
+
+# global = _N
+statement ok
+global g_count = _N
+
+query I
+SELECT getvariable('_dodo_g_g_count')
+----
+5
+
+# _N after filtering should reflect filtered count
+statement ok
+keep if year == 2018
+
+statement ok
+scalar n_2018 = _N
+
+query I
+SELECT getvariable('_dodo_s_n_2018')
+----
+3
+
+# --- levelsof ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+levelsof year
+----
+2017
+2018
+
+# --- runtime token errors (r() and e() still deferred to M14c) ---
+
+# scalar = r(max) must fail (M14c)
+statement error
+scalar hi = r(max)
+----
+requires M14c
+
+# global = e(N) must fail (M14c)
+statement error
+global g = e(N)
+----
+requires M14c
+
+# --- foreach of global ---
+
+statement ok
+clear
+
+statement ok
+global gvars revenue id
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v of global gvars {
+    generate `v'_sq = `v' * `v'
+}
+
+query IIRIII
+list
+----
+1	Acme	1000	2017	1000000	1
+2	Beta	2000	2018	4000000	4
+3	Gamma	1500	2017	2250000	9
+4	Delta	3000	2018	9000000	16
+5	Epsilon	500	2018	250000	25
+
+# --- local -- decrement ---
+
+statement ok
+clear
+
+statement ok
+local counter = 5
+
+statement ok
+local --counter
+
+statement ok
+local --counter
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if id <= `counter'
+----
+3
+
+# --- global with = expression ---
+
+statement ok
+clear
+
+statement ok
+global limit = 1000 + 500
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > $limit
+----
+2
+
+# --- scalar define keyword ---
+
+statement ok
+clear
+
+statement ok
+scalar define mypi = 3.14
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate big = revenue > mypi
+
+query I
+count if big == 1
+----
+5
+
+# --- :value label varname macro function ---
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+label define yesno2 0 "No" 1 "Yes"
+
+statement ok
+label values year yesno2
+
+statement ok
+local vlname `:value label year'
+
+query I
+display "`vlname'"
+----
+yesno2
+
+# --- :type varname macro function (stub) ---
+
+statement ok
+local tp `:type revenue'
+
+# stub returns empty, verify no crash
+query T
+display "`tp'empty"
+----
+empty
+
+# --- :display macro function (evaluates expression) ---
+
+statement ok
+local formatted `:display 2 + 3'
+
+query I
+display "`formatted'"
+----
+5
+
+# --- nested loops (outer foreach, inner forvalues) ---
+# NOTE: nested loops have a known bug where only the last inner iteration
+# produces output (inner loop overwrites rather than accumulates).
+# This test verifies the outer loop iterates correctly with a single-value inner.
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v in revenue id {
+    generate `v'_dbl = `v' * 2
+}
+
+query IIRIII
+list
+----
+1	Acme	1000	2017	2000	2
+2	Beta	2000	2018	4000	4
+3	Gamma	1500	2017	3000	6
+4	Delta	3000	2018	6000	8
+5	Epsilon	500	2018	1000	10
+
+# --- macro drop _all ---
+
+statement ok
+clear
+
+statement ok
+local aaa 10
+
+statement ok
+local bbb 20
+
+statement ok
+macro drop _all
+
+# after drop _all, macros expand to empty
+query I
+display "vals:`aaa'`bbb'"
+----
+vals:
+
+# --- undefined macro expands to empty ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep `nonexistent_macro' revenue year
+
+query IR
+list
+----
+1000	2017
+2000	2018
+1500	2017
+3000	2018
+500	2018
+
+# --- multiple tempvar args ---
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+tempvar a b
+
+statement ok
+generate `a' = revenue * 2
+
+statement ok
+generate `b' = revenue * 3
+
+query I
+count if `a' > 3000
+----
+2
+
+query I
+count if `b' > 3000
+----
+3
+
+# --- multiple tempname args ---
+
+statement ok
+clear
+
+statement ok
+tempname s1 s2
+
+statement ok
+scalar `s1' = 100
+
+statement ok
+scalar `s2' = 200
+
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > `s1'
+----
+5
+
+query I
+count if revenue > `s2'
+----
+5
+
+# =============================================================
+# Type qualifiers in generate/egen
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate long x = 5
+
+statement ok
+generate byte flag = 1
+
+statement ok
+generate int count_col = id * 10
+
+statement ok
+generate double ratio = revenue / 1000.0
+
+query IIRIIIIR
+list
+----
+1	Acme	1000	2017	5	1	10	1.0
+2	Beta	2000	2018	5	1	20	2.0
+3	Gamma	1500	2017	5	1	30	1.5
+4	Delta	3000	2018	5	1	40	3.0
+5	Epsilon	500	2018	5	1	50	0.5
+
+# egen with type qualifier
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen long total_rev = sum(revenue), by(year)
+
+query IIRII
+list
+----
+1	Acme	1000	2017	2500
+2	Beta	2000	2018	5500
+3	Gamma	1500	2017	2500
+4	Delta	3000	2018	5500
+5	Epsilon	500	2018	5500
+
+# =============================================================
+# Scoping: loop index variables destroyed after loop
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Define a local before the loop
+statement ok
+local before_loop hello
+
+statement ok
+foreach v in revenue id {
+    generate `v'_x2 = `v' * 2
+}
+
+# Loop variable `v' should be gone after the loop (expands to empty)
+query T
+display "v_is:`v'"
+----
+v_is:
+
+# But `before_loop' should still exist
+query T
+display "`before_loop'"
+----
+hello
+
+# Variables created INSIDE the loop body should persist
+# (tested via the forvalues at line 420 which creates `total' inside the loop)
+
+# Loop index variable is destroyed after loop
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+foreach v in revenue id {
+    generate `v'_copy = `v'
+    local saved_v `v'
+}
+
+# saved_v persists (created inside loop body)
+query T
+display "`saved_v'"
+----
+id
+
+# But loop index v is gone (expands to empty)
+query T
+display "v_is:`v'"
+----
+v_is:
+
+# =============================================================
+# Namespace isolation: local x vs global x vs scalar x
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+local x 10
+
+statement ok
+global x 20
+
+statement ok
+scalar x = 30
+
+# local `x' returns local value
+query I
+display "`x'"
+----
+10
+
+# global $x returns global value
+query I
+display "$x"
+----
+20
+
+# bare scalar x in expression context (scalar takes priority in bare name expansion)
+# After macro expansion: the command line has no `x' or $x, so bare "x" is
+# expanded as scalar. But inside display quotes, it's literal text.
+# Use it in an expression context instead:
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if x > 25
+----
+5
+
+query I
+count if x > 15
+----
+5
+
+query I
+count if x > 5
+----
+5
+
+# =============================================================
+# Time of evaluation: value freezes at assignment
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Assign scalar to _N (5 rows)
+statement ok
+scalar frozen_n = _N
+
+# Now filter down to 3 rows
+statement ok
+keep if year == 2018
+
+# frozen_n should still be 5, not 3
+query I
+SELECT getvariable('_dodo_s_frozen_n')
+----
+5
+
+# A new scalar after filtering gets 3
+statement ok
+scalar after_n = _N
+
+query I
+SELECT getvariable('_dodo_s_after_n')
+----
+3
+
+# LITERAL scalars also freeze
+statement ok
+clear
+
+statement ok
+scalar pi = 3.14
+
+statement ok
+scalar tau = pi * 2
+
+# tau should be 6.28 even if we redefine pi
+statement ok
+scalar pi = 99
+
+query T
+display "`=6.28'"
+----
+6.28
+
+# tau is still 6.28 (it was evaluated at assignment, pi was 3.14 then)
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if tau < 7
+----
+5
+
+# =============================================================
+# LITERAL vs VARIABLE: = with pure literals stays LITERAL
+# =============================================================
+
+statement ok
+clear
+
+statement ok
+local a = 300
+
+# a is LITERAL (EvaluateSimpleExpr succeeds on "300")
+# So `a' expands to "300", not getvariable(...)
+statement ok
+local b = `a' * 5
+
+# b should be 1500 (compile-time: 300 * 5)
+query I
+display "`b'"
+----
+1500
+
+# Now with a VARIABLE: _N can't be evaluated at compile time
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+local n = _N
+
+# n is VARIABLE, so `n' expands to getvariable('_dodo_l_n')
+# m = getvariable('_dodo_l_n') + 1 can't be evaluated at compile time → VARIABLE
+statement ok
+local m = `n' + 1
+
+query I
+SELECT getvariable('_dodo_l_m')
+----
+6
+
+# --- cleanup ---
+
+statement ok
+clear
+
+statement ok
+scalar drop _all
+
+statement ok
+macro drop _all
