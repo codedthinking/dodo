@@ -196,16 +196,24 @@ generate hi = revenue == r(max)  // → (revenue = (SELECT max FROM _r)) AS hi
 
 **Volatility:** Each new r-class command replaces the `_r` table.
 
-### Named result structs via `let`
+### Named result structs via `scalar`
 
 ```stata
-let result = summarize employment
+scalar result = summarize employment
 keep if employment > result.min
 generate z = (employment - result.mean) / result.sd
 ```
 
-`let` stores the result table under a named alias. `result.min` compiles to
-`(SELECT min FROM _result)`.
+`scalar name = command` stores the result table under a named alias.
+`result.min` compiles to `(SELECT min FROM _result)`.
+
+**Why `scalar`?** In Stata, "scalar" means any named value that is not a
+column — it can hold a number, a string, or (in our extension) a whole row of
+results. This is a misnomer from the SQL perspective, where "scalar" means a
+single value. We keep the keyword because Stata users expect it, and because
+it already exists in the language. The compiler distinguishes the two forms by
+the RHS: `scalar x = expr` stores a single value via `SET VARIABLE` (M14b),
+while `scalar x = command` stores a result table (M14c).
 
 Advantages over `r()`:
 1. **Not volatile.** Multiple result tables coexist.
@@ -248,7 +256,7 @@ std::unordered_set<std::string> set_variables;
 ### Result table state (M14c)
 
 ```cpp
-// Named result tables: "r" → "_r", "result" → "_result"
+// Named result tables: "r" → "_r", "result" → "_result" (from scalar result = ...)
 std::unordered_map<std::string, std::string> result_tables;
 
 // Known columns per result table, for compile-time field validation
@@ -271,7 +279,7 @@ raw line(s)
                       └─ ProcessCommand              (exists)
                            ├─ scalar / local =       → emit SET VARIABLE         ── M14b
                            ├─ terminal cmd           → emit result table          ── M14c
-                           ├─ let name = cmd         → emit named result table    ── M14c
+                           ├─ scalar name = cmd      → emit named result table    ── M14c
                            └─ TranslateExpression    (exists)
                                 └─ r(max)            → (SELECT max FROM _r)       ── M14c
                                 └─ result.field      → (SELECT field FROM _name)  ── M14c
@@ -289,7 +297,7 @@ raw line(s)
   No use-site `getvariable()` emission yet.
 - **M14c — Stored results as single-row tables.** Terminal commands emit
   `CREATE OR REPLACE TEMP TABLE _r AS (SELECT ...)`. `r(field)` compiles to
-  `(SELECT field FROM _r)`. `let name = cmd` stores named result tables.
+  `(SELECT field FROM _r)`. `scalar name = cmd` stores named result tables.
   `name.field` compiles to `(SELECT field FROM _name)`.
 
 ---
@@ -308,7 +316,7 @@ raw line(s)
 **M14c:**
 - `summarize revenue` → `CREATE OR REPLACE TEMP TABLE _r AS (SELECT count(...) AS N, avg(...) AS mean, ...)`
 - `keep if revenue == r(max)` → `WHERE revenue = (SELECT max FROM _r)`
-- `let result = summarize employment; keep if employment > result.min` →
+- `scalar result = summarize employment; keep if employment > result.min` →
   result table + `WHERE employment > (SELECT min FROM _result)`
 - Stale `r()`: `summarize a; count; keep if x > r(max)` → error (volatility)
 - `r(nonexistent)` → compile-time error (field validation)
