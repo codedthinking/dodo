@@ -1618,10 +1618,6 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	}
 
 	if (cmd.command == "use") {
-		// Drop previous materialized table if switching datasets
-		if (state.materialized) {
-			state.pending_sql.push_back("DROP TABLE IF EXISTS dodo._current");
-		}
 		string saved_cmd = state.pending_command;
 		state.Clear();
 		state.pending_command = saved_cmd;
@@ -1632,9 +1628,15 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		bool is_file = (read_expr != source);
 
 		if (!lazy && is_file) {
-			// Materialize: create table, then reference it in CTE chain
+			// Materialize: create node table + VIEW, reference VIEW in CTE chain
+			string hash = HashString(std::string("\0", 1) + source);
+			string node_name = "dodo.__node_" + hash;
 			state.pending_sql.push_back("CREATE SCHEMA IF NOT EXISTS dodo");
-			state.pending_sql.push_back("CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM " + read_expr);
+			state.pending_sql.push_back("CREATE TABLE IF NOT EXISTS " + node_name +
+			                            " AS SELECT * FROM " + read_expr);
+			state.pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name);
+			state.current_node_hash = hash;
+			state.node_tables.insert(node_name);
 			state.AddStep("SELECT * FROM dodo._current");
 			state.materialized = true;
 		} else {
@@ -1695,8 +1697,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (state.preserve_checkpoint >= 0) {
 			throw DodoException("'preserve' called while already preserved. Use 'restore' first.");
 		}
+		// Materialize current state so restore can just rebind the VIEW
+		state.MaybeCheckpoint();
 		state.preserve_checkpoint = static_cast<int>(state.cte_steps.size());
 		state.preserve_step_counter = state.step_counter;
+		state.preserve_node_hash = state.current_node_hash;
 		return "SELECT 'OK' AS status";
 	}
 
@@ -1711,6 +1716,12 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		state.preserve_checkpoint = -1;
 		state.preserve_step_counter = -1;
 		state.redo_stack.clear();
+		// Rebind VIEW to the preserved node table
+		if (state.current_node_hash != state.preserve_node_hash && !state.preserve_node_hash.empty()) {
+			state.current_node_hash = state.preserve_node_hash;
+			state.pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM dodo.__node_" +
+			                            state.current_node_hash);
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -1946,19 +1957,20 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string lower_opts = str::Lower(cmd.options);
 		bool lazy = (lower_opts.find("lazy") != string::npos);
 
-		// Drop previous materialized table if switching datasets
-		string pre_cleanup;
-		if (state.materialized) {
-			pre_cleanup = "DROP TABLE IF EXISTS dodo._current; ";
-		}
 		string saved_cmd = state.pending_command;
 		state.Clear();
 		state.pending_command = saved_cmd;
 
 		string result_sql;
 		if (!lazy) {
+			string hash = HashString(std::string("\0", 1) + filename);
+			string node_name = "dodo.__node_" + hash;
 			result_sql = "CREATE SCHEMA IF NOT EXISTS dodo; ";
-			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM read_csv('" + filename + "'); ";
+			result_sql += "CREATE TABLE IF NOT EXISTS " + node_name +
+			              " AS SELECT * FROM read_csv('" + filename + "'); ";
+			result_sql += "CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name + "; ";
+			state.current_node_hash = hash;
+			state.node_tables.insert(node_name);
 			state.AddStep("SELECT * FROM dodo._current");
 			state.materialized = true;
 		} else {
@@ -1966,7 +1978,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		state.current_source = filename;
 		result_sql += "SELECT 'OK' AS status";
-		return pre_cleanup + result_sql;
+		return result_sql;
 	}
 
 	if (cmd.command == "history") {
@@ -3038,6 +3050,10 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		return "SELECT 'OK' AS status";
 	}
+
+	// --- Checkpoint before terminal/side-effect commands ---
+	state.MaybeCheckpoint();
+	prev = state.LatestStep();
 
 	// --- Side-effect commands ---
 	if (cmd.command == "export") {

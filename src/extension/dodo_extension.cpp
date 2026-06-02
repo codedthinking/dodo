@@ -21,13 +21,22 @@ static string BuildHistorySQL(const DodoStateInfo &state) {
 	if (!state.core.materialized) {
 		return "";
 	}
+	// Combine accumulated (checkpointed) + current commands for full history
+	vector<string> all_commands;
+	all_commands.insert(all_commands.end(),
+	                    state.core.accumulated_commands.begin(),
+	                    state.core.accumulated_commands.end());
+	all_commands.insert(all_commands.end(),
+	                    state.core.cte_commands.begin(),
+	                    state.core.cte_commands.end());
+
 	string sql = "CREATE OR REPLACE TABLE dodo._history AS SELECT * FROM (VALUES ";
 	bool first = true;
-	for (idx_t i = 0; i < state.core.cte_commands.size(); i++) {
+	for (idx_t i = 0; i < all_commands.size(); i++) {
 		if (!first) {
 			sql += ", ";
 		}
-		string escaped_cmd = state.core.cte_commands[i];
+		string escaped_cmd = all_commands[i];
 		size_t pos = 0;
 		while ((pos = escaped_cmd.find('\'', pos)) != string::npos) {
 			escaped_cmd.replace(pos, 1, "''");
@@ -46,7 +55,7 @@ static string BuildHistorySQL(const DodoStateInfo &state) {
 			escaped_cmd.replace(pos, 1, "''");
 			pos += 2;
 		}
-		int step_id = static_cast<int>(state.core.cte_commands.size()) + static_cast<int>(i);
+		int step_id = static_cast<int>(all_commands.size()) + static_cast<int>(i);
 		sql += "(" + to_string(step_id) + ", '" + escaped_cmd + "', true)";
 		first = false;
 	}

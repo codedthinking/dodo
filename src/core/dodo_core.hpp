@@ -2,6 +2,7 @@
 
 #include "string_utils.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -10,6 +11,22 @@
 #include <vector>
 
 namespace dodo {
+
+//===--------------------------------------------------------------------===//
+// FNV-1a hash → 12-char hex string (dependency-free, for content addressing)
+//===--------------------------------------------------------------------===//
+inline std::string HashString(const std::string &input) {
+	constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+	constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+	uint64_t hash = FNV_OFFSET;
+	for (unsigned char c : input) {
+		hash ^= c;
+		hash *= FNV_PRIME;
+	}
+	char buf[13];
+	snprintf(buf, sizeof(buf), "%012llx", (unsigned long long)(hash & 0xFFFFFFFFFFFFULL));
+	return std::string(buf);
+}
 
 //===--------------------------------------------------------------------===//
 // SymbolEntry — unified symbol table entry (LITERAL text or VARIABLE ref)
@@ -87,9 +104,15 @@ struct DodoState {
 	//! Whether live view is enabled (set by extension, used by clear)
 	bool live_view_enabled = false;
 
+	//! Materialization checkpoint state
+	std::string current_node_hash;                     //! Hash of current materialized node table
+	std::vector<std::string> accumulated_commands;     //! Command history across checkpoints
+	std::unordered_set<std::string> node_tables;       //! Tracked __node_<hash> tables for cleanup
+
 	//! Preserve checkpoint: index into cte_steps (-1 = no active preserve)
 	int preserve_checkpoint = -1;
 	int preserve_step_counter = -1;
+	std::string preserve_node_hash;
 
 	//! Generate a unique DuckDB variable name for SET VARIABLE
 	static std::string GenerateUname(const std::string &prefix, const std::string &name) {
@@ -125,6 +148,41 @@ struct DodoState {
 	//! Build full query: CTE prefix + final SELECT
 	std::string BuildQuery(const std::string &final_select) const;
 
+	//! Returns true if CTE chain has transformation steps beyond the base
+	bool NeedsCheckpoint() const {
+		return materialized && cte_steps.size() > 1;
+	}
+
+	//! Flush CTE chain after materialization: save history, restart from VIEW
+	void FlushCTEChain() {
+		for (auto &cmd : cte_commands) {
+			accumulated_commands.push_back(cmd);
+		}
+		cte_steps.clear();
+		cte_commands.clear();
+		redo_stack.clear();
+		cte_steps.push_back("SELECT * FROM dodo._current");
+		cte_commands.push_back("");
+		step_counter = 1;
+	}
+
+	//! Materialize CTE chain as a checkpoint table, flush, and restart
+	void MaybeCheckpoint() {
+		if (!NeedsCheckpoint()) {
+			return;
+		}
+		std::string full_query = BuildQuery("SELECT * FROM " + LatestStep());
+		std::string hash = HashString(current_node_hash + std::string("\0", 1) + full_query);
+		std::string node_name = "dodo.__node_" + hash;
+
+		pending_sql.push_back("CREATE TABLE IF NOT EXISTS " + node_name + " AS (" + full_query + ")");
+		pending_sql.push_back("CREATE OR REPLACE VIEW dodo._current AS SELECT * FROM " + node_name);
+
+		current_node_hash = hash;
+		node_tables.insert(node_name);
+		FlushCTEChain();
+	}
+
 	//! Get SQL to drop tempfile tables, materialized table, and schemas
 	std::string BuildCleanupSQL() const {
 		std::string sql;
@@ -136,8 +194,11 @@ struct DodoState {
 		}
 		if (materialized) {
 			sql += "DROP TABLE IF EXISTS dodo._history; ";
-			sql += "DROP TABLE IF EXISTS dodo._current; ";
-			sql += "DROP SCHEMA IF EXISTS dodo; ";
+			sql += "DROP VIEW IF EXISTS dodo._current; ";
+			for (auto &node : node_tables) {
+				sql += "DROP TABLE IF EXISTS " + node + "; ";
+			}
+			sql += "DROP SCHEMA IF EXISTS dodo CASCADE; ";
 		}
 		return sql;
 	}
@@ -158,6 +219,10 @@ struct DodoState {
 		preserve_checkpoint = -1;
 		preserve_step_counter = -1;
 		materialized = false;
+		current_node_hash.clear();
+		accumulated_commands.clear();
+		node_tables.clear();
+		preserve_node_hash.clear();
 	}
 
 	//! Full reset: also clears macros, scalars, and tempnames
