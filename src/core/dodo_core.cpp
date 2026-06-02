@@ -226,13 +226,23 @@ static string FindRuntimeToken(const string &expr) {
 			}
 		}
 	}
-	// r(...) stored results
-	if (lower.find("r(") != string::npos) {
-		return "r()";
+	// r(...) stored results — must be standalone, not part of another word like getvariable()
+	for (idx_t ri = 0; ri < lower.size(); ri++) {
+		if (lower[ri] == 'r' && ri + 1 < lower.size() && lower[ri + 1] == '(') {
+			bool start_ok = (ri == 0 || (!isalnum(lower[ri - 1]) && lower[ri - 1] != '_'));
+			if (start_ok) {
+				return "r()";
+			}
+		}
 	}
-	// e(...) estimation results
-	if (lower.find("e(") != string::npos) {
-		return "e()";
+	// e(...) estimation results — must be standalone, not part of another word like getvariable()
+	for (idx_t ei = 0; ei < lower.size(); ei++) {
+		if (lower[ei] == 'e' && ei + 1 < lower.size() && lower[ei + 1] == '(') {
+			bool start_ok = (ei == 0 || (!isalnum(lower[ei - 1]) && lower[ei - 1] != '_'));
+			if (start_ok) {
+				return "e()";
+			}
+		}
 	}
 	return "";
 }
