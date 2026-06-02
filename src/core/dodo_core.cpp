@@ -794,7 +794,7 @@ const vector<string> DODO_COMMANDS = {
     "import",    "merge",      "tempfile", "preserve", "restore",    "xtset",      "tsset",
     "bysort",    "by",         "undo",     "redo",     "history",    "show",       "local",
     "global",    "scalar",     "macro",    "display",  "foreach",    "forvalues",  "tempvar",
-    "tempname"};
+    "tempname", "assert", "compress"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -806,7 +806,7 @@ bool IsTransformationCommand(const string &command) {
 	    "sort",     "order",    "egen",      "collapse",  "mvencode","reshape",  "append",     "label",
 	    "duplicates","expand",  "import",    "merge",     "tempfile","preserve", "restore",    "xtset",
 	    "tsset",    "bysort",   "by",        "undo",      "redo",   "local",    "global",     "scalar",
-	    "macro",    "foreach",  "forvalues", "tempvar",   "tempname"};
+	    "macro",    "foreach",  "forvalues", "tempvar",   "tempname", "compress"};
 	for (auto &cmd : TRANSFORMATION) {
 		if (command == cmd) {
 			return true;
@@ -1012,6 +1012,8 @@ string TranslateAggFunction(const string &func_name) {
 		return "FIRST";
 	if (lower == "last" || lower == "lastnm")
 		return "LAST";
+	if (lower == "total")
+		return "SUM";
 	return func_name; // pass through unknown functions
 }
 
@@ -1145,10 +1147,67 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
                            const string &bysort_order) {
 	string result = expr;
 
-	// missing(x) -> (x IS NULL) — must be done BEFORE L./F./D. so that
-	// missing(L.var) becomes (L.var IS NULL), then L. is translated
-	std::regex missing_re("\\bmissing\\s*\\(([^)]+)\\)");
-	result = std::regex_replace(result, missing_re, "($1 IS NULL)");
+	// missing(x) or missing(x, y, z) -> (x IS NULL) or (x IS NULL OR y IS NULL OR z IS NULL)
+	// Must be done BEFORE L./F./D. so that missing(L.var) becomes (L.var IS NULL), then L. is translated
+	{
+		std::regex missing_re("\\bmissing\\s*\\(([^)]+)\\)");
+		std::smatch m;
+		string tmp = result;
+		string out;
+		while (std::regex_search(tmp, m, missing_re)) {
+			out += m.prefix().str();
+			string args_str = m[1].str();
+			auto args = str::Split(args_str, ',');
+			if (args.size() == 1) {
+				out += "(" + Trim(args[0]) + " IS NULL)";
+			} else {
+				out += "(";
+				for (idx_t i = 0; i < args.size(); i++) {
+					if (i > 0) out += " OR ";
+					out += Trim(args[i]) + " IS NULL";
+				}
+				out += ")";
+			}
+			tmp = m.suffix().str();
+		}
+		out += tmp;
+		result = out;
+	}
+
+	// ! and ~ as NOT operator — translate before other expression handling
+	// Handle !( and !var patterns: !missing(...) -> NOT missing(...), !flag -> NOT flag
+	{
+		string out;
+		for (idx_t i = 0; i < result.size(); i++) {
+			if ((result[i] == '!' || result[i] == '~') && i + 1 < result.size() && result[i + 1] != '=') {
+				// Don't translate != or ~=
+				out += "NOT ";
+			} else {
+				out += result[i];
+			}
+		}
+		result = out;
+	}
+
+	// Bare . as Stata missing value -> NULL (e.g., generate x = .)
+	// Match . when surrounded by non-alphanumeric, non-dot characters
+	{
+		string out;
+		for (idx_t i = 0; i < result.size(); i++) {
+			if (result[i] == '.') {
+				bool prev_ok = (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_' && result[i - 1] != '.'));
+				bool next_ok = (i + 1 >= result.size() || (!isalnum(result[i + 1]) && result[i + 1] != '_' && result[i + 1] != '.'));
+				if (prev_ok && next_ok) {
+					out += "NULL";
+				} else {
+					out += '.';
+				}
+			} else {
+				out += result[i];
+			}
+		}
+		result = out;
+	}
 
 	// L., L2., F., F2., D. time-series operators (gap-aware)
 	if (!time_var.empty()) {
@@ -2305,9 +2364,44 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	}
 
 	if (cmd.command == "rename") {
-		auto parts = str::Split(cmd.arguments, ' ');
+		string args = Trim(cmd.arguments);
+
+		// Bulk rename: rename (old1 old2) (new1 new2)
+		if (args.size() > 0 && args[0] == '(') {
+			idx_t close_first = args.find(')');
+			if (close_first == string::npos) {
+				throw DodoException("'rename': unmatched parenthesis");
+			}
+			idx_t open_second = args.find('(', close_first);
+			idx_t close_second = args.find(')', open_second);
+			if (open_second == string::npos || close_second == string::npos) {
+				throw DodoException("'rename': expected (old names) (new names)");
+			}
+			string old_str = Trim(args.substr(1, close_first - 1));
+			string new_str = Trim(args.substr(open_second + 1, close_second - open_second - 1));
+			auto old_vars = str::Split(old_str, ' ');
+			auto new_vars = str::Split(new_str, ' ');
+			if (old_vars.size() != new_vars.size()) {
+				throw DodoException("'rename': old and new name lists must have the same length");
+			}
+			// Build: SELECT old1 AS new1, old2 AS new2, * EXCLUDE (old1, old2) FROM _prev
+			string rename_cols;
+			string exclude_cols;
+			for (idx_t i = 0; i < old_vars.size(); i++) {
+				string oid = QuoteIdent(Trim(old_vars[i]));
+				string nid = QuoteIdent(Trim(new_vars[i]));
+				if (i > 0) { rename_cols += ", "; exclude_cols += ", "; }
+				rename_cols += oid + " AS " + nid;
+				exclude_cols += oid;
+			}
+			state.AddStep("SELECT " + rename_cols + ", * EXCLUDE (" + exclude_cols + ") FROM " + prev);
+			return "SELECT 'OK' AS status";
+		}
+
+		// Simple rename: rename old new
+		auto parts = str::Split(args, ' ');
 		if (parts.size() != 2) {
-			throw DodoException("'rename' requires exactly two arguments: rename oldname newname");
+			throw DodoException("'rename' syntax: rename oldname newname OR rename (old1 old2) (new1 new2)");
 		}
 		string old_name = QuoteIdent(Trim(parts[0]));
 		string new_name = QuoteIdent(Trim(parts[1]));
@@ -3173,6 +3267,26 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			return "__PIVOT__:CREATE OR REPLACE TEMP TABLE _dodo_pivot AS (PIVOT " + subquery + " ON " + qj +
 			       " USING FIRST(" + QuoteIdent(value_var) + ") GROUP BY " + i_cols + ");" + "||STATE||_dodo_pivot";
 		}
+		return "SELECT 'OK' AS status";
+	}
+
+	if (cmd.command == "assert") {
+		if (cmd.arguments.empty()) {
+			throw DodoException("'assert' requires an expression");
+		}
+		string cond = TrExpr(cmd.arguments);
+		string escaped_expr = cmd.arguments;
+		// Escape single quotes for SQL string
+		idx_t qpos = 0;
+		while ((qpos = escaped_expr.find('\'', qpos)) != string::npos) {
+			escaped_expr.replace(qpos, 1, "''");
+			qpos += 2;
+		}
+		return state.BuildQuery("SELECT CASE WHEN bool_or(NOT (" + cond + ")) THEN error('Assertion failed: " +
+		       escaped_expr + "') ELSE 'OK' END AS status FROM " + prev);
+	}
+
+	if (cmd.command == "compress") {
 		return "SELECT 'OK' AS status";
 	}
 

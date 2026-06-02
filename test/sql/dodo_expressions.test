@@ -96,5 +96,166 @@ list
 2017	Acme	1250.0
 2018	Beta	1833.3333333333333
 
+# ============================================================
+# M19: ! as NOT, . as missing, multi-arg missing(), assert, compress
+# ============================================================
+
+# ! as NOT in conditions
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if !inrange(revenue, 1000, 2000)
+
+query I
+count
+----
+2
+
+# ! with missing()
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+replace revenue = NULL if year == 2017
+
+statement ok
+keep if !missing(revenue)
+
+query I
+count
+----
+3
+
+# ~ as NOT (Stata alias)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if ~(year == 2017)
+
+query I
+count
+----
+3
+
+# . as Stata missing value -> NULL
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate byte flag = .
+
+query I
+count if missing(flag)
+----
+5
+
+# . in replace condition
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+generate byte big = .
+
+statement ok
+replace big = 1 if revenue > 1500
+
+statement ok
+replace big = 0 if big == . | revenue <= 1500
+
+# multi-arg missing(a, b, c)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+replace revenue = NULL if id == 1
+
+statement ok
+replace year = NULL if id == 2
+
+statement ok
+drop if missing(revenue, year)
+
+query I
+count
+----
+3
+
+# egen total() as alias for sum()
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+egen long total_rev = total(revenue), by(year)
+
+statement ok
+sort year id
+
+query I
+list total_rev
+----
+2500
+2500
+5500
+5500
+5500
+
+# rename (old1 old2) (new1 new2) bulk rename
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+rename (revenue year) (sales fiscal_year)
+
+query II
+list sales fiscal_year
+----
+1000	2017
+2000	2018
+1500	2017
+3000	2018
+500	2018
+
+# rename with 3 variables
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+rename (id name revenue) (firm_id firm_name sales)
+
+query I
+count
+----
+5
+
+# assert (passes)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+assert revenue > 0
+
+# assert (fails)
+statement ok
+use "test/data/firms.csv", clear
+
+statement error
+assert revenue > 1000
+----
+Assertion failed
+
+# compress (no-op)
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+compress
+
+query I
+count
+----
+5
+
 statement ok
 clear
