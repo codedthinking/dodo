@@ -684,10 +684,26 @@ Shows the full history including undone steps, so users can see what happened.
 - `clear` — history table dropped
 - `SELECT * FROM dodo._history` — queryable from SQL
 
-### M19: Polish phase 2
+### M19: Polish phase 2 — real-world compatibility fixes
+
+Six high-impact fixes based on reviewing production .do files from ceo-value:
+
+**Expression translation:**
+- `!` as NOT → translate `!expr` to `NOT (expr)` in `TranslateExpression`. Appears in nearly every real script (`!missing()`, `!inlist()`, `!flag`). Currently DuckDB errors on `!(x IS NULL)`.
+- `.` as Stata missing → translate bare `.` in value position to `NULL`. Every script that initializes variables to missing uses `generate byte x = .`. Currently `.` passes through as a literal and errors.
+- Multi-arg `missing(a, b, c)` → translate to `(a IS NULL OR b IS NULL OR c IS NULL)`. Very common data cleaning pattern. Currently produces invalid SQL `(a, b, c IS NULL)`.
+
+**Commands:**
+- `rename (old1 old2) (new1 new2)` — bulk rename with parenthesized lists. Currently only `rename old new` is supported. Parse matched parens, zip old/new names, emit chained `EXCLUDE`/`AS` renames.
+- `egen total()` — add `total` as alias for `sum` in `TranslateAggFunction()`. Stata's `total()` is identical to `sum()` and used frequently.
+- `assert expr` → `SELECT CASE WHEN NOT (expr) THEN error('Assertion failed: expr') END FROM _sN`. Common in data validation. Should check every row and error if any fails.
+
+**Already done:**
 - `compress` → no-op (DuckDB doesn't need storage type optimization)
 - `display` → `SELECT 'message'` (informational output)
-- `assert` → `SELECT CASE WHEN NOT (expr) THEN error('Assertion failed') END`
+- `generate long/byte/int/float/double` — type qualifiers stripped
+
+**Remaining:**
 - `set seed N` → `SELECT setseed(N)`
 - Error messages: improve error reporting for unsupported commands
 - **Test:** comprehensive test with real .do file fragments from ceo-value
@@ -734,7 +750,7 @@ Key files:
 - `src/dta/read_dta_function.hpp/cpp` — DuckDB `read_dta()` table function
 - `src/dta/write_dta_function.hpp/cpp` — DuckDB `COPY TO (FORMAT dta)` CopyFunction
 - `src/cli/dodoc.cpp` — CLI compiler entry point
-- `test/sql/dodo.test` — sqllogictest suite (1233 assertions)
+- `test/sql/dodo.test` — sqllogictest suite (1486 assertions)
 - `test/sql/read_dta.test` — read_dta tests
 - `test/sql/write_dta.test` — write_dta + round-trip tests
 
@@ -760,12 +776,12 @@ Key files:
 | M13 | `duplicates drop`, `expand`, `export`/`import delimited` | Done |
 | M14a | Compile-time macros & loops | Done |
 | M14b | Runtime stored results (`r()`→subquery, `levelsof`) | Planned — see `docs/VARIABLE_SUBSTITUTION.md` |
-| M14c | Named result structs via `let` | Planned (stretch) — see `docs/VARIABLE_SUBSTITUTION.md` |
+| M14c | Stored results as single-row tables, `scalar name = cmd` | Planned (stretch) — see `docs/VARIABLE_SUBSTITUTION.md` |
 | M15 | `save` to tables, `tempfile`, `preserve`/`restore` | Done |
 | M16 | `xtset`/`tsset` + `L.`/`F.`/`D.` | Done |
 | M17 | `bysort` prefix, `var[_n-1]` | Done |
 | M18 | `undo`/`redo`, `history` | Done |
-| M19 | Polish phase 2 | Partial (`display` done, `compress` pending) |
+| M19 | Polish phase 2: `!` NOT, `.` missing, multi-arg `missing()`, bulk `rename`, `total`, `assert` | Partial (`display`, `compress`, type qualifiers done) |
 
 ### Added in v0.2.0 (not in original plan)
 
@@ -784,7 +800,7 @@ See `docs/DBT_RESEARCH.md` for research on bipartite DAG execution, build system
 ## Verification
 
 1. `make` — builds successfully
-2. `./build/release/test/unittest --test-dir . "test/sql/dodo.test"` — 1233 assertions pass
+2. `./build/release/test/unittest --test-dir . "test/sql/dodo.test"` — 1486 assertions pass
 3. `echo 'use "data.csv", clear' | ./build/release/extension/dodo/dodoc` — compiler works
 4. Manual test:
    ```sql
