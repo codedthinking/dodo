@@ -34,4 +34,26 @@ FitStats ComputeFitStats(double ess, double tss, int n, int k);
 // Compute p-value from t-statistic using normal approximation.
 double NormalPValue(double t_stat);
 
+//===--------------------------------------------------------------------===//
+// MAP demeaning for high-dimensional fixed effects
+//===--------------------------------------------------------------------===//
+
+// Demean variables with respect to multiple FE dimensions using
+// Method of Alternating Projections (symmetric Kaczmarz).
+// vars: n_obs x n_vars column-major matrix (modified in-place).
+// fe_groups: n_obs x n_fe matrix of integer group IDs (0-based).
+// n_fe_levels: number of unique levels per FE dimension.
+// tolerance: convergence threshold (default 1e-8).
+// max_iter: maximum iterations (default 16000).
+// Returns number of iterations used.
+int MapDemean(std::vector<double> &vars, int n_obs, int n_vars,
+              const std::vector<std::vector<int>> &fe_groups,
+              const std::vector<int> &n_fe_levels,
+              double tolerance = 1e-8, int max_iter = 16000);
+
+// Count connected components in bipartite graph between two FE dimensions.
+// Returns number of connected components (= number of redundant parameters).
+int CountConnectedComponents(const std::vector<int> &fe1, const std::vector<int> &fe2,
+                             int n_levels1, int n_levels2, int n_obs);
+
 } // namespace dodo

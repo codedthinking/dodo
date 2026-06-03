@@ -1629,6 +1629,112 @@ static string GenerateRegressionSQL(const DodoCommand &cmd, DodoState &state, co
 		where_clause = " WHERE " + TranslateExpression(cmd.condition);
 	}
 
+	//===--------------------------------------------------------------------===//
+	// reghdfe: absorb(fe1 fe2 ...) [cluster(id)] [robust]
+	//===--------------------------------------------------------------------===//
+	if (cmd.command == "reghdfe") {
+		// Parse absorb() option
+		vector<string> absorb_vars;
+		{
+			idx_t abs_pos = lower_opts.find("absorb(");
+			if (abs_pos == string::npos) {
+				abs_pos = lower_opts.find("a(");
+			}
+			if (abs_pos == string::npos) {
+				throw DodoException("'reghdfe' requires absorb() option");
+			}
+			idx_t open = lower_opts.find('(', abs_pos);
+			idx_t close = lower_opts.find(')', open);
+			if (close == string::npos) {
+				throw DodoException("'reghdfe': unclosed absorb()");
+			}
+			string absorb_str = cmd.options.substr(open + 1, close - open - 1);
+			auto parts = str::Split(absorb_str, ' ');
+			for (auto &p : parts) {
+				string t = Trim(p);
+				if (!t.empty()) {
+					absorb_vars.push_back(t);
+				}
+			}
+		}
+		if (absorb_vars.empty()) {
+			throw DodoException("'reghdfe': absorb() requires at least one variable");
+		}
+
+		// Parse cluster() option
+		string cluster_var;
+		{
+			idx_t cl_pos = lower_opts.find("cluster(");
+			if (cl_pos == string::npos) {
+				cl_pos = lower_opts.find("cl(");
+			}
+			if (cl_pos != string::npos) {
+				idx_t open = lower_opts.find('(', cl_pos);
+				idx_t close = lower_opts.find(')', open);
+				if (close != string::npos) {
+					cluster_var = Trim(cmd.options.substr(open + 1, close - open - 1));
+				}
+			}
+		}
+
+		// Build the data query: SELECT depvar, x1..xk, fe1..feG [, cluster] FROM data
+		string select_cols = "CAST(" + QuoteIdent(depvar) + " AS DOUBLE) AS " + QuoteIdent(depvar);
+		for (auto &v : indepvars) {
+			select_cols += ", CAST(" + QuoteIdent(v) + " AS DOUBLE) AS " + QuoteIdent(v);
+		}
+		for (auto &fe : absorb_vars) {
+			select_cols += ", " + QuoteIdent(fe);
+		}
+		if (!cluster_var.empty()) {
+			select_cols += ", " + QuoteIdent(cluster_var);
+		}
+
+		string data_query = state.BuildQuery("SELECT " + select_cols + " FROM " + prev + where_clause);
+
+		// Build var_names array: [depvar, x1, x2, ...]
+		string var_arr = "array['" + EscapeSQL(depvar) + "'";
+		for (auto &v : indepvars) {
+			var_arr += ", '" + EscapeSQL(v) + "'";
+		}
+		var_arr += "]::VARCHAR[]";
+
+		// Build fe_names array
+		string fe_arr = "array['" + EscapeSQL(absorb_vars[0]) + "'";
+		for (idx_t i = 1; i < absorb_vars.size(); i++) {
+			fe_arr += ", '" + EscapeSQL(absorb_vars[i]) + "'";
+		}
+		fe_arr += "]::VARCHAR[]";
+
+		string cluster_arg = cluster_var.empty() ? "''" : "'" + EscapeSQL(cluster_var) + "'";
+		string robust_arg = robust ? "true" : "false";
+
+		// Build the full SELECT with all needed columns for the data load
+		string full_data_select = "SELECT " + select_cols + " FROM " + prev + where_clause;
+
+		// Encode all parameters into a single __REGHDFE__ marker string
+		// The parser override will: execute data query, run C++ demeaning+OLS, return VALUES
+		string params;
+		params += depvar;
+		for (auto &v : indepvars) {
+			params += "\t" + v;
+		}
+		params += "\n"; // separator between var_names and fe_names
+		for (idx_t i = 0; i < absorb_vars.size(); i++) {
+			if (i > 0) params += "\t";
+			params += absorb_vars[i];
+		}
+		params += "\n" + cluster_var;
+		params += "\n" + string(robust ? "1" : "0");
+
+		// Store full CTE query as data source
+		string data_sql = state.BuildQuery(full_data_select);
+
+		return "__REGHDFE__:" + data_sql + "||PARAMS||" + params;
+	}
+
+	//===--------------------------------------------------------------------===//
+	// regress: OLS with optional robust SE
+	//===--------------------------------------------------------------------===//
 	int k = static_cast<int>(indepvars.size()) + 1; // +1 for intercept
 	string k_str = to_string(k);
 

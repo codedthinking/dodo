@@ -6,6 +6,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 
@@ -120,6 +123,10 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 		}
 		// show — SQL SHOW keyword conflicts
 		if (StringUtil::StartsWith(trimmed, "show") && (trimmed.size() == 4 || trimmed[4] == ' ')) {
+			has_conflict_commands = true;
+		}
+		// reghdfe — needs parser override for __REGHDFE__ marker handling
+		if (StringUtil::StartsWith(trimmed, "reghdfe ")) {
 			has_conflict_commands = true;
 		}
 
@@ -241,6 +248,230 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 					state.core.AddStep("SELECT * FROM " + table_name);
 					for (auto &stmt : parser.statements) {
 						all_statements.push_back(std::move(stmt));
+					}
+					continue;
+				}
+
+				// Handle __REGHDFE__ marker: execute data, demean, OLS, return VALUES
+				if (StringUtil::StartsWith(sql, "__REGHDFE__:")) {
+					string rest = sql.substr(12);
+					idx_t params_pos = rest.find("||PARAMS||");
+					string data_sql = rest.substr(0, params_pos);
+					string params_str = rest.substr(params_pos + 10);
+
+					// Parse parameters: var_names\tfe_names\tcluster\trobust
+					auto param_lines = StringUtil::Split(params_str, '\n');
+					auto var_names_list = StringUtil::Split(param_lines[0], '\t');
+					auto fe_names_list = StringUtil::Split(param_lines[1], '\t');
+					string cluster_name = param_lines.size() > 2 ? param_lines[2] : "";
+					bool is_robust = param_lines.size() > 3 && param_lines[3] == "1";
+
+					// Drain pending SQL first
+					for (auto &psql : state.core.pending_sql) {
+						Parser pend_parser;
+						pend_parser.ParseQuery(psql);
+						for (auto &st : pend_parser.statements) {
+							all_statements.push_back(std::move(st));
+						}
+					}
+					state.core.pending_sql.clear();
+
+					// Execute data query on a separate connection (avoids deadlock)
+					if (!state.db_instance) {
+						throw std::runtime_error("reghdfe: database instance not available");
+					}
+					Connection conn(*state.db_instance);
+					auto qresult = conn.Query(data_sql);
+					if (qresult->HasError()) {
+						throw std::runtime_error("reghdfe: " + qresult->GetError());
+					}
+
+					int n_vars = static_cast<int>(var_names_list.size());
+					int n_fe = static_cast<int>(fe_names_list.size());
+					bool has_cluster = !cluster_name.empty();
+
+					// Load data into arrays
+					std::vector<std::vector<double>> var_cols(n_vars);
+					std::vector<std::vector<int>> fe_groups(n_fe);
+					std::vector<int> cluster_ids;
+					std::vector<std::unordered_map<int64_t, int>> fe_maps(n_fe);
+					std::unordered_map<int64_t, int> cluster_map;
+					idx_t n_obs = 0;
+
+					unique_ptr<DataChunk> dchunk;
+					while ((dchunk = qresult->Fetch()) != nullptr) {
+						for (idx_t r = 0; r < dchunk->size(); r++) {
+							for (int v = 0; v < n_vars; v++) {
+								auto val = dchunk->data[v].GetValue(r);
+								var_cols[v].push_back(val.IsNull() ? 0.0 : val.GetValue<double>());
+							}
+							for (int g = 0; g < n_fe; g++) {
+								auto val = dchunk->data[n_vars + g].GetValue(r);
+								int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+								auto it = fe_maps[g].find(raw);
+								int id;
+								if (it == fe_maps[g].end()) {
+									id = static_cast<int>(fe_maps[g].size());
+									fe_maps[g][raw] = id;
+								} else {
+									id = it->second;
+								}
+								fe_groups[g].push_back(id);
+							}
+							if (has_cluster) {
+								auto val = dchunk->data[n_vars + n_fe].GetValue(r);
+								int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+								auto it = cluster_map.find(raw);
+								int id;
+								if (it == cluster_map.end()) {
+									id = static_cast<int>(cluster_map.size());
+									cluster_map[raw] = id;
+								} else {
+									id = it->second;
+								}
+								cluster_ids.push_back(id);
+							}
+							n_obs++;
+						}
+					}
+
+					if (n_obs == 0) {
+						Parser ok_p;
+						ok_p.ParseQuery("SELECT 'No observations' AS error");
+						for (auto &st : ok_p.statements) all_statements.push_back(std::move(st));
+						continue;
+					}
+
+					// Convert to column-major for MapDemean
+					std::vector<double> vars_flat(static_cast<size_t>(n_obs) * n_vars);
+					for (int v = 0; v < n_vars; v++) {
+						for (idx_t i = 0; i < n_obs; i++) {
+							vars_flat[static_cast<size_t>(v) * n_obs + i] = var_cols[v][i];
+						}
+					}
+					var_cols.clear();
+
+					std::vector<int> n_fe_levels(n_fe);
+					for (int g = 0; g < n_fe; g++) {
+						n_fe_levels[g] = static_cast<int>(fe_maps[g].size());
+					}
+
+					// Demean
+					dodo::MapDemean(vars_flat, static_cast<int>(n_obs), n_vars, fe_groups, n_fe_levels);
+
+					// OLS on demeaned data (no intercept)
+					int n = static_cast<int>(n_obs);
+					int kx = n_vars - 1;
+					std::vector<double> xtx(static_cast<size_t>(kx) * kx, 0.0);
+					std::vector<double> xty(kx, 0.0);
+					double yty = 0.0;
+					double *yp = &vars_flat[0];
+
+					for (int i = 0; i < kx; i++) {
+						double *xi = &vars_flat[static_cast<size_t>(i + 1) * n_obs];
+						for (idx_t obs = 0; obs < n_obs; obs++) xty[i] += xi[obs] * yp[obs];
+						for (int j = 0; j < kx; j++) {
+							double *xj = &vars_flat[static_cast<size_t>(j + 1) * n_obs];
+							double s = 0.0;
+							for (idx_t obs = 0; obs < n_obs; obs++) s += xi[obs] * xj[obs];
+							xtx[i * kx + j] = s;
+						}
+					}
+					for (idx_t obs = 0; obs < n_obs; obs++) yty += yp[obs] * yp[obs];
+
+					auto beta = dodo::OlsSolve(xtx, xty, kx);
+
+					// Residuals
+					std::vector<double> resid(n_obs);
+					double ess = 0.0;
+					for (idx_t obs = 0; obs < n_obs; obs++) {
+						double yhat = 0.0;
+						for (int j = 0; j < kx; j++) {
+							yhat += beta[j] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+						}
+						resid[obs] = yp[obs] - yhat;
+						ess += resid[obs] * resid[obs];
+					}
+					double tss = yty;
+
+					// Degrees of freedom
+					int df_a = 0;
+					for (int g = 0; g < n_fe; g++) df_a += n_fe_levels[g];
+					if (n_fe >= 2) {
+						for (int g = 1; g < n_fe; g++) {
+							df_a -= dodo::CountConnectedComponents(fe_groups[0], fe_groups[g],
+							                                      n_fe_levels[0], n_fe_levels[g], n);
+						}
+					} else {
+						df_a -= 1;
+					}
+					int df_r = n - kx - df_a;
+					if (df_r <= 0) df_r = 1;
+
+					double s2 = ess / df_r;
+					double r2_val = 1.0 - ess / tss;
+					double r2_adj = 1.0 - (ess / df_r) / (tss / (n - 1));
+					double f_val = ((tss - ess) / kx) / s2;
+
+					// Standard errors
+					std::vector<double> var_diag;
+					if (has_cluster) {
+						int n_cl = static_cast<int>(cluster_map.size());
+						std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+						std::vector<std::vector<double>> cl_scores(n_cl, std::vector<double>(kx, 0.0));
+						for (idx_t obs = 0; obs < n_obs; obs++) {
+							int cl = cluster_ids[obs];
+							for (int j = 0; j < kx; j++)
+								cl_scores[cl][j] += resid[obs] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+						}
+						for (int cl = 0; cl < n_cl; cl++)
+							for (int i = 0; i < kx; i++)
+								for (int j = 0; j < kx; j++)
+									meat[i * kx + j] += cl_scores[cl][i] * cl_scores[cl][j];
+						double qc = ((double)(n - 1) / (n - kx)) * ((double)n_cl / (n_cl - 1));
+						for (auto &m : meat) m *= qc;
+						var_diag = dodo::SandwichDiag(xtx, meat, kx);
+					} else if (is_robust) {
+						std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+						for (idx_t obs = 0; obs < n_obs; obs++) {
+							double e2 = resid[obs] * resid[obs];
+							for (int i = 0; i < kx; i++) {
+								double xi = vars_flat[static_cast<size_t>(i + 1) * n_obs + obs];
+								for (int j = 0; j < kx; j++)
+									meat[i * kx + j] += e2 * xi * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+							}
+						}
+						double hc1 = (double)n / (n - kx);
+						for (auto &m : meat) m *= hc1;
+						var_diag = dodo::SandwichDiag(xtx, meat, kx);
+					} else {
+						auto inv_d = dodo::OlsInvDiag(xtx, kx);
+						var_diag.resize(kx);
+						for (int j = 0; j < kx; j++) var_diag[j] = s2 * inv_d[j];
+					}
+
+					// Build VALUES SQL
+					string values_sql = "SELECT * FROM (VALUES ";
+					for (int j = 0; j < kx; j++) {
+						if (j > 0) values_sql += ", ";
+						double se_j = std::sqrt(var_diag[j]);
+						double t_j = se_j > 0 ? beta[j] / se_j : 0.0;
+						double p_j = dodo::NormalPValue(t_j);
+						values_sql += "('" + var_names_list[j + 1] + "', " +
+						              to_string(beta[j]) + ", " + to_string(se_j) + ", " +
+						              to_string(t_j) + ", " + to_string(p_j) + ", " +
+						              to_string(beta[j] - 1.96 * se_j) + ", " +
+						              to_string(beta[j] + 1.96 * se_j) + ", " +
+						              to_string(n) + ", " +
+						              to_string(r2_val) + ", " + to_string(r2_adj) + ", " +
+						              to_string(f_val) + ")";
+					}
+					values_sql += ") AS _t(variable, coefficient, std_err, t, p, ci_low, ci_high, N, r2, r2_adj, F)";
+
+					Parser vals_parser;
+					vals_parser.ParseQuery(values_sql);
+					for (auto &st : vals_parser.statements) {
+						all_statements.push_back(std::move(st));
 					}
 					continue;
 				}
@@ -454,6 +685,338 @@ static void SandwichDiagFunction(DataChunk &args, ExpressionState &state, Vector
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// reghdfe table function: dodo_reghdfe(query, var_names, fe_names, cluster_name, robust)
+// Loads data, demeans w.r.t. FEs, runs OLS, returns coefficient table.
+//===--------------------------------------------------------------------===//
+
+struct ReghdfeBindData : public FunctionData {
+	string query;
+	vector<string> var_names;
+	vector<string> fe_names;
+	string cluster_name;
+	bool robust = false;
+
+	// Results computed in bind
+	vector<string> result_names;
+	vector<double> coefs;
+	vector<double> se;
+	vector<double> t_stat;
+	vector<double> p_val;
+	vector<double> ci_low;
+	vector<double> ci_high;
+	int n_obs = 0;
+	double r2 = 0;
+	double r2_adj = 0;
+	double f_stat = 0;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ReghdfeBindData>();
+		*result = *this;
+		return std::move(result);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ReghdfeBindData>();
+		return query == other.query && var_names == other.var_names &&
+		       fe_names == other.fe_names && cluster_name == other.cluster_name;
+	}
+};
+
+struct ReghdfeGlobalState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> ReghdfeBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ReghdfeBindData>();
+	bind_data->query = input.inputs[0].ToString();
+
+	auto &var_list = ListValue::GetChildren(input.inputs[1]);
+	for (auto &v : var_list) {
+		bind_data->var_names.push_back(v.ToString());
+	}
+	auto &fe_list = ListValue::GetChildren(input.inputs[2]);
+	for (auto &f : fe_list) {
+		bind_data->fe_names.push_back(f.ToString());
+	}
+	bind_data->cluster_name = input.inputs[3].ToString();
+	bind_data->robust = input.inputs[4].GetValue<bool>();
+
+	// Output schema: coefficient table
+	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::INTEGER, LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE};
+	names = {"variable", "coefficient", "std_err", "t", "p", "ci_low", "ci_high",
+	         "N", "r2", "r2_adj", "F"};
+
+	// Do all computation in bind (we have context access here without deadlock)
+	// Read from the pre-materialized temp table
+	auto result = context.Query("SELECT * FROM " + bind_data->query, QueryParameters(false));
+	if (result->HasError()) {
+		throw InvalidInputException("reghdfe: failed to execute data query: %s", result->GetError());
+	}
+
+	int n_vars = static_cast<int>(bind_data->var_names.size());
+	int n_fe = static_cast<int>(bind_data->fe_names.size());
+	bool has_cluster = !bind_data->cluster_name.empty();
+
+	// First pass: count rows and collect data
+	// We use Fetch() to iterate chunks
+	std::vector<std::vector<double>> var_cols(n_vars); // one vector per variable
+	std::vector<std::vector<int>> fe_groups(n_fe);
+	std::vector<int> cluster_ids;
+	std::vector<std::unordered_map<int64_t, int>> fe_maps(n_fe);
+	std::unordered_map<int64_t, int> cluster_map;
+
+	idx_t n_obs = 0;
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			for (int v = 0; v < n_vars; v++) {
+				auto val = chunk->data[v].GetValue(r);
+				if (val.IsNull()) {
+					throw InvalidInputException("reghdfe: NULL values not supported (variable '%s', row %d)",
+					                           bind_data->var_names[v], (int)n_obs);
+				}
+				var_cols[v].push_back(val.GetValue<double>());
+			}
+			for (int g = 0; g < n_fe; g++) {
+				auto val = chunk->data[n_vars + g].GetValue(r);
+				int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+				auto it = fe_maps[g].find(raw);
+				int id;
+				if (it == fe_maps[g].end()) {
+					id = static_cast<int>(fe_maps[g].size());
+					fe_maps[g][raw] = id;
+				} else {
+					id = it->second;
+				}
+				fe_groups[g].push_back(id);
+			}
+			if (has_cluster) {
+				auto val = chunk->data[n_vars + n_fe].GetValue(r);
+				int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+				auto it = cluster_map.find(raw);
+				int id;
+				if (it == cluster_map.end()) {
+					id = static_cast<int>(cluster_map.size());
+					cluster_map[raw] = id;
+				} else {
+					id = it->second;
+				}
+				cluster_ids.push_back(id);
+			}
+			n_obs++;
+		}
+	}
+
+	if (n_obs == 0) {
+		return std::move(bind_data);
+	}
+
+	// Convert to column-major flat array for MapDemean
+	std::vector<double> vars(static_cast<size_t>(n_obs) * n_vars);
+	for (int v = 0; v < n_vars; v++) {
+		for (idx_t i = 0; i < n_obs; i++) {
+			vars[static_cast<size_t>(v) * n_obs + i] = var_cols[v][i];
+		}
+	}
+	var_cols.clear(); // free memory
+
+	// Number of FE levels
+	std::vector<int> n_fe_levels(n_fe);
+	for (int g = 0; g < n_fe; g++) {
+		n_fe_levels[g] = static_cast<int>(fe_maps[g].size());
+	}
+
+	// Demean all variables (y and x's) w.r.t. FE dimensions
+	dodo::MapDemean(vars, static_cast<int>(n_obs), n_vars, fe_groups, n_fe_levels);
+
+	// OLS on demeaned data (no intercept)
+	// Build X'X and X'y from demeaned data
+	// x columns are vars[1..k-1], y is vars[0]
+	int n = static_cast<int>(n_obs);
+	int kx = n_vars - 1; // number of x variables (excluding y)
+	if (kx == 0) {
+		throw InvalidInputException("reghdfe: need at least one independent variable");
+	}
+
+	std::vector<double> xtx(static_cast<size_t>(kx) * kx, 0.0);
+	std::vector<double> xty(kx, 0.0);
+	double yty = 0.0;
+
+	double *y = &vars[0]; // first column is y
+	for (int i = 0; i < kx; i++) {
+		double *xi = &vars[static_cast<size_t>(i + 1) * n_obs];
+		for (idx_t obs = 0; obs < n_obs; obs++) {
+			xty[i] += xi[obs] * y[obs];
+		}
+		for (int j = 0; j < kx; j++) {
+			double *xj = &vars[static_cast<size_t>(j + 1) * n_obs];
+			double s = 0.0;
+			for (idx_t obs = 0; obs < n_obs; obs++) {
+				s += xi[obs] * xj[obs];
+			}
+			xtx[i * kx + j] = s;
+		}
+	}
+	for (idx_t obs = 0; obs < n_obs; obs++) {
+		yty += y[obs] * y[obs];
+	}
+
+	auto beta = dodo::OlsSolve(xtx, xty, kx);
+
+	// Residuals and fit stats
+	std::vector<double> resid(n_obs);
+	double ess = 0.0;
+	for (idx_t obs = 0; obs < n_obs; obs++) {
+		double yhat = 0.0;
+		for (int j = 0; j < kx; j++) {
+			yhat += beta[j] * vars[static_cast<size_t>(j + 1) * n_obs + obs];
+		}
+		resid[obs] = y[obs] - yhat;
+		ess += resid[obs] * resid[obs];
+	}
+	double tss = yty; // demeaned y, so TSS = y'y
+
+	// Degrees of freedom
+	int df_a = 0;
+	for (int g = 0; g < n_fe; g++) {
+		df_a += n_fe_levels[g];
+	}
+	// Subtract redundant parameters (connected components for pairs of FEs)
+	if (n_fe >= 2) {
+		for (int g = 1; g < n_fe; g++) {
+			int comps = dodo::CountConnectedComponents(fe_groups[0], fe_groups[g],
+			                                          n_fe_levels[0], n_fe_levels[g], n);
+			df_a -= comps;
+		}
+	} else {
+		df_a -= 1; // intercept is redundant with a single FE
+	}
+
+	int df_r = n - kx - df_a;
+	if (df_r <= 0) {
+		throw InvalidInputException("reghdfe: insufficient degrees of freedom (N=%d, k=%d, df_a=%d)", n, kx, df_a);
+	}
+
+	double s2 = ess / df_r;
+	double r2 = 1.0 - ess / tss;
+	double r2_adj = 1.0 - (ess / df_r) / (tss / (n - 1));
+	double f_stat = ((tss - ess) / kx) / s2;
+
+	// Standard errors
+	std::vector<double> var_diag;
+	bool use_cluster = !bind_data->cluster_name.empty();
+
+	if (use_cluster) {
+		// Cluster-robust SE
+		int n_clusters = static_cast<int>(cluster_map.size());
+		// Meat: sum of (sum_g e_i * x_i)(sum_g e_i * x_i)' over clusters
+		std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+		// Accumulate score vectors per cluster
+		std::vector<std::vector<double>> cluster_scores(n_clusters, std::vector<double>(kx, 0.0));
+		for (idx_t obs = 0; obs < n_obs; obs++) {
+			int cl = cluster_ids[obs];
+			for (int j = 0; j < kx; j++) {
+				cluster_scores[cl][j] += resid[obs] * vars[static_cast<size_t>(j + 1) * n_obs + obs];
+			}
+		}
+		for (int cl = 0; cl < n_clusters; cl++) {
+			for (int i = 0; i < kx; i++) {
+				for (int j = 0; j < kx; j++) {
+					meat[i * kx + j] += cluster_scores[cl][i] * cluster_scores[cl][j];
+				}
+			}
+		}
+		// Finite-sample correction: (N-1)/(N-k) * M/(M-1)
+		double qc = ((double)(n - 1) / (n - kx)) * ((double)n_clusters / (n_clusters - 1));
+		for (auto &m : meat) {
+			m *= qc;
+		}
+		var_diag = dodo::SandwichDiag(xtx, meat, kx);
+	} else if (bind_data->robust) {
+		// HC1 robust SE
+		std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+		for (idx_t obs = 0; obs < n_obs; obs++) {
+			double e2 = resid[obs] * resid[obs];
+			for (int i = 0; i < kx; i++) {
+				double xi = vars[static_cast<size_t>(i + 1) * n_obs + obs];
+				for (int j = 0; j < kx; j++) {
+					double xj = vars[static_cast<size_t>(j + 1) * n_obs + obs];
+					meat[i * kx + j] += e2 * xi * xj;
+				}
+			}
+		}
+		double hc1 = (double)n / (n - kx);
+		for (auto &m : meat) {
+			m *= hc1;
+		}
+		var_diag = dodo::SandwichDiag(xtx, meat, kx);
+	} else {
+		// Conventional SE
+		auto inv_diag = dodo::OlsInvDiag(xtx, kx);
+		var_diag.resize(kx);
+		for (int j = 0; j < kx; j++) {
+			var_diag[j] = s2 * inv_diag[j];
+		}
+	}
+
+	// Build result
+	for (int j = 0; j < kx; j++) {
+		bind_data->result_names.push_back(bind_data->var_names[j + 1]); // skip depvar
+		bind_data->coefs.push_back(beta[j]);
+		double se_j = std::sqrt(var_diag[j]);
+		bind_data->se.push_back(se_j);
+		double t_j = se_j > 0 ? beta[j] / se_j : 0.0;
+		bind_data->t_stat.push_back(t_j);
+		bind_data->p_val.push_back(dodo::NormalPValue(t_j));
+		bind_data->ci_low.push_back(beta[j] - 1.96 * se_j);
+		bind_data->ci_high.push_back(beta[j] + 1.96 * se_j);
+	}
+	bind_data->n_obs = n;
+	bind_data->r2 = r2;
+	bind_data->r2_adj = r2_adj;
+	bind_data->f_stat = f_stat;
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> ReghdfeInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<ReghdfeGlobalState>();
+}
+
+static void ReghdfeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &gstate = data.global_state->Cast<ReghdfeGlobalState>();
+	if (gstate.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	gstate.done = true;
+
+	auto &bd = data.bind_data->Cast<ReghdfeBindData>();
+	idx_t n_rows = bd.result_names.size();
+	if (n_rows == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	output.SetCardinality(n_rows);
+	for (idx_t i = 0; i < n_rows; i++) {
+		output.data[0].SetValue(i, Value(bd.result_names[i]));
+		output.data[1].SetValue(i, Value::DOUBLE(bd.coefs[i]));
+		output.data[2].SetValue(i, Value::DOUBLE(bd.se[i]));
+		output.data[3].SetValue(i, Value::DOUBLE(bd.t_stat[i]));
+		output.data[4].SetValue(i, Value::DOUBLE(bd.p_val[i]));
+		output.data[5].SetValue(i, Value::DOUBLE(bd.ci_low[i]));
+		output.data[6].SetValue(i, Value::DOUBLE(bd.ci_high[i]));
+		output.data[7].SetValue(i, Value::INTEGER(bd.n_obs));
+		output.data[8].SetValue(i, Value::DOUBLE(bd.r2));
+		output.data[9].SetValue(i, Value::DOUBLE(bd.r2_adj));
+		output.data[10].SetValue(i, Value::DOUBLE(bd.f_stat));
+	}
+}
+
 static void RegisterOlsFunctions(ExtensionLoader &loader) {
 	// dodo_ols_solve(xtx, xty, k) -> DOUBLE[]
 	ScalarFunction ols_solve("dodo_ols_solve",
@@ -474,6 +1037,16 @@ static void RegisterOlsFunctions(ExtensionLoader &loader) {
 	                              LogicalType::INTEGER},
 	                             LogicalType::LIST(LogicalType::DOUBLE), SandwichDiagFunction);
 	loader.RegisterFunction(sandwich_diag);
+
+	// dodo_reghdfe(query, var_names, fe_names, cluster_name, robust) -> coefficient table
+	TableFunction reghdfe_func("dodo_reghdfe",
+	                           {LogicalType::VARCHAR,
+	                            LogicalType::LIST(LogicalType::VARCHAR),
+	                            LogicalType::LIST(LogicalType::VARCHAR),
+	                            LogicalType::VARCHAR,
+	                            LogicalType::BOOLEAN},
+	                           ReghdfeExecute, ReghdfeBind, ReghdfeInit);
+	loader.RegisterFunction(reghdfe_func);
 }
 
 //===--------------------------------------------------------------------===//
@@ -488,6 +1061,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto shared_state = make_shared_ptr<DodoStateInfo>();
 	g_dodo_state = shared_state.get();
+	shared_state->db_instance = &instance;
 
 	ParserExtension parser_ext;
 	parser_ext.parse_function = dodo_parse;

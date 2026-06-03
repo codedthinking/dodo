@@ -68,6 +68,44 @@ statement ok
 regress lnR lnY
 
 # ============================================================
+# reghdfe: one-way fixed effects
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear;
+
+statement ok
+reghdfe revenue id, absorb(year);
+
+# ============================================================
+# reghdfe: robust standard errors
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear;
+
+statement ok
+reghdfe revenue id, absorb(year) robust;
+
+# ============================================================
+# reghdfe: with cluster
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear;
+
+statement ok
+reghdfe revenue id, absorb(year) cluster(year);
+
+# ============================================================
+# reghdfe: error — missing absorb
+# ============================================================
+
+statement error
+reghdfe revenue id;
+----
+
+# ============================================================
 # Error: no arguments
 # ============================================================
 

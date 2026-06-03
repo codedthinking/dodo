@@ -17,6 +17,9 @@ struct DodoStateInfo : public ParserExtensionInfo {
 	//! Live view: CREATE OR REPLACE VIEW _dodo_data after each transformation
 	bool live_view_enabled = false;
 
+	//! Database instance pointer (for reghdfe to create a separate connection)
+	optional_ptr<DatabaseInstance> db_instance;
+
 	// Convenience forwarders for the extension glue
 	bool HasData() const {
 		return core.HasData();

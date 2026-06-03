@@ -1,6 +1,8 @@
 #include "regression.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace dodo {
@@ -128,6 +130,168 @@ double NormalPValue(double t_stat) {
 	// Two-sided p-value using normal approximation: 2 * Phi(-|t|)
 	// erfc(x/sqrt(2))/2 = Phi(-x) for x >= 0
 	return std::erfc(std::abs(t_stat) / std::sqrt(2.0));
+}
+
+//===--------------------------------------------------------------------===//
+// MAP demeaning (Method of Alternating Projections)
+//===--------------------------------------------------------------------===//
+
+int MapDemean(std::vector<double> &vars, int n_obs, int n_vars,
+              const std::vector<std::vector<int>> &fe_groups,
+              const std::vector<int> &n_fe_levels,
+              double tolerance, int max_iter) {
+	int n_fe = static_cast<int>(fe_groups.size());
+	if (n_fe == 0 || n_obs == 0) {
+		return 0;
+	}
+
+	// Scratch: group sums and counts per FE dimension
+	// We recompute per iteration (counts are constant but sums change)
+	std::vector<std::vector<double>> group_sums; // n_fe x max_levels
+	std::vector<std::vector<int>> group_counts;  // n_fe x max_levels
+
+	for (int g = 0; g < n_fe; g++) {
+		group_sums.emplace_back(n_fe_levels[g], 0.0);
+		group_counts.emplace_back(n_fe_levels[g], 0);
+	}
+
+	// Precompute counts (constant across iterations)
+	for (int g = 0; g < n_fe; g++) {
+		auto &counts = group_counts[g];
+		auto &groups = fe_groups[g];
+		for (int i = 0; i < n_obs; i++) {
+			counts[groups[i]]++;
+		}
+	}
+
+	// Store previous values for convergence check
+	std::vector<double> prev(vars.size());
+
+	int iter;
+	for (iter = 0; iter < max_iter; iter++) {
+		// Save current state
+		prev = vars;
+
+		// Symmetric Kaczmarz: forward sweep 0..n_fe-1, backward n_fe-2..0
+		// Forward sweep
+		for (int g = 0; g < n_fe; g++) {
+			auto &sums = group_sums[g];
+			auto &counts = group_counts[g];
+			auto &groups = fe_groups[g];
+
+			for (int v = 0; v < n_vars; v++) {
+				double *col = &vars[static_cast<size_t>(v) * n_obs];
+				// Compute group sums
+				std::fill(sums.begin(), sums.end(), 0.0);
+				for (int i = 0; i < n_obs; i++) {
+					sums[groups[i]] += col[i];
+				}
+				// Subtract group means
+				for (int i = 0; i < n_obs; i++) {
+					col[i] -= sums[groups[i]] / counts[groups[i]];
+				}
+			}
+		}
+
+		// Backward sweep (for symmetric Kaczmarz, needed for CG later)
+		for (int g = n_fe - 2; g >= 0; g--) {
+			auto &sums = group_sums[g];
+			auto &counts = group_counts[g];
+			auto &groups = fe_groups[g];
+
+			for (int v = 0; v < n_vars; v++) {
+				double *col = &vars[static_cast<size_t>(v) * n_obs];
+				std::fill(sums.begin(), sums.end(), 0.0);
+				for (int i = 0; i < n_obs; i++) {
+					sums[groups[i]] += col[i];
+				}
+				for (int i = 0; i < n_obs; i++) {
+					col[i] -= sums[groups[i]] / counts[groups[i]];
+				}
+			}
+		}
+
+		// Convergence: max relative difference across all variables
+		double max_reldif = 0.0;
+		for (size_t j = 0; j < vars.size(); j++) {
+			double denom = std::max(std::abs(prev[j]), 1e-15);
+			double rd = std::abs(vars[j] - prev[j]) / denom;
+			if (rd > max_reldif) {
+				max_reldif = rd;
+			}
+		}
+
+		if (max_reldif < tolerance) {
+			break;
+		}
+	}
+
+	return iter + 1;
+}
+
+//===--------------------------------------------------------------------===//
+// Connected components (for df_a redundancy in 2+ FE)
+//===--------------------------------------------------------------------===//
+
+int CountConnectedComponents(const std::vector<int> &fe1, const std::vector<int> &fe2,
+                             int n_levels1, int n_levels2, int n_obs) {
+	// Union-Find on the bipartite graph
+	int total = n_levels1 + n_levels2;
+	std::vector<int> parent(total);
+	std::vector<int> rank(total, 0);
+	for (int i = 0; i < total; i++) {
+		parent[i] = i;
+	}
+
+	// Find with path compression
+	std::function<int(int)> find = [&](int x) -> int {
+		if (parent[x] != x) {
+			parent[x] = find(parent[x]);
+		}
+		return parent[x];
+	};
+
+	// Union by rank
+	auto unite = [&](int a, int b) {
+		a = find(a);
+		b = find(b);
+		if (a == b) {
+			return;
+		}
+		if (rank[a] < rank[b]) {
+			std::swap(a, b);
+		}
+		parent[b] = a;
+		if (rank[a] == rank[b]) {
+			rank[a]++;
+		}
+	};
+
+	// Connect fe1[i] with fe2[i] + n_levels1
+	for (int i = 0; i < n_obs; i++) {
+		unite(fe1[i], fe2[i] + n_levels1);
+	}
+
+	// Count unique roots among used levels
+	std::vector<bool> used(total, false);
+	for (int i = 0; i < n_obs; i++) {
+		used[fe1[i]] = true;
+		used[fe2[i] + n_levels1] = true;
+	}
+
+	std::vector<bool> root_seen(total, false);
+	int components = 0;
+	for (int i = 0; i < total; i++) {
+		if (used[i]) {
+			int r = find(i);
+			if (!root_seen[r]) {
+				root_seen[r] = true;
+				components++;
+			}
+		}
+	}
+
+	return components;
 }
 
 } // namespace dodo
