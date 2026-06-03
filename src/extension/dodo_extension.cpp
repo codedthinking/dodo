@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "dodo_extension.hpp"
+#include "regression.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -356,12 +357,134 @@ BoundStatement dodo_bind(ClientContext &context, Binder &binder, OperatorExtensi
 }
 
 //===--------------------------------------------------------------------===//
+// OLS UDFs
+//===--------------------------------------------------------------------===//
+
+// dodo_ols_solve(xtx DOUBLE[], xty DOUBLE[], k INTEGER) -> DOUBLE[]
+// Solves b = (X'X)^{-1} X'y via Cholesky decomposition
+static void OlsSolveFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &xtx_vec = args.data[0];
+	auto &xty_vec = args.data[1];
+	auto &k_vec = args.data[2];
+
+	idx_t count = args.size();
+	for (idx_t i = 0; i < count; i++) {
+		auto xtx_val = xtx_vec.GetValue(i);
+		auto xty_val = xty_vec.GetValue(i);
+		int k = k_vec.GetValue(i).GetValue<int32_t>();
+
+		auto &xtx_children = ListValue::GetChildren(xtx_val);
+		auto &xty_children = ListValue::GetChildren(xty_val);
+
+		std::vector<double> xtx(static_cast<size_t>(k) * k);
+		std::vector<double> xty(k);
+		for (int j = 0; j < k * k; j++) {
+			xtx[j] = xtx_children[j].GetValue<double>();
+		}
+		for (int j = 0; j < k; j++) {
+			xty[j] = xty_children[j].GetValue<double>();
+		}
+
+		auto beta = dodo::OlsSolve(xtx, xty, k);
+
+		vector<Value> result_values;
+		for (int j = 0; j < k; j++) {
+			result_values.push_back(Value::DOUBLE(beta[j]));
+		}
+		result.SetValue(i, Value::LIST(LogicalType::DOUBLE, std::move(result_values)));
+	}
+}
+
+// dodo_ols_invdiag(xtx DOUBLE[], k INTEGER) -> DOUBLE[]
+// Returns diagonal of (X'X)^{-1}
+static void OlsInvDiagFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &xtx_vec = args.data[0];
+	auto &k_vec = args.data[1];
+
+	idx_t count = args.size();
+	for (idx_t i = 0; i < count; i++) {
+		auto xtx_val = xtx_vec.GetValue(i);
+		int k = k_vec.GetValue(i).GetValue<int32_t>();
+
+		auto &xtx_children = ListValue::GetChildren(xtx_val);
+		std::vector<double> xtx(static_cast<size_t>(k) * k);
+		for (int j = 0; j < k * k; j++) {
+			xtx[j] = xtx_children[j].GetValue<double>();
+		}
+
+		auto diag = dodo::OlsInvDiag(xtx, k);
+
+		vector<Value> result_values;
+		for (int j = 0; j < k; j++) {
+			result_values.push_back(Value::DOUBLE(diag[j]));
+		}
+		result.SetValue(i, Value::LIST(LogicalType::DOUBLE, std::move(result_values)));
+	}
+}
+
+// dodo_sandwich_diag(xtx DOUBLE[], meat DOUBLE[], k INTEGER) -> DOUBLE[]
+// Returns diagonal of (X'X)^{-1} M (X'X)^{-1} (sandwich variance)
+static void SandwichDiagFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &xtx_vec = args.data[0];
+	auto &meat_vec = args.data[1];
+	auto &k_vec = args.data[2];
+
+	idx_t count = args.size();
+	for (idx_t i = 0; i < count; i++) {
+		auto xtx_val = xtx_vec.GetValue(i);
+		auto meat_val = meat_vec.GetValue(i);
+		int k = k_vec.GetValue(i).GetValue<int32_t>();
+
+		auto &xtx_children = ListValue::GetChildren(xtx_val);
+		auto &meat_children = ListValue::GetChildren(meat_val);
+		std::vector<double> xtx(static_cast<size_t>(k) * k);
+		std::vector<double> meat(static_cast<size_t>(k) * k);
+		for (int j = 0; j < k * k; j++) {
+			xtx[j] = xtx_children[j].GetValue<double>();
+			meat[j] = meat_children[j].GetValue<double>();
+		}
+
+		auto diag = dodo::SandwichDiag(xtx, meat, k);
+
+		vector<Value> result_values;
+		for (int j = 0; j < k; j++) {
+			result_values.push_back(Value::DOUBLE(diag[j]));
+		}
+		result.SetValue(i, Value::LIST(LogicalType::DOUBLE, std::move(result_values)));
+	}
+}
+
+static void RegisterOlsFunctions(ExtensionLoader &loader) {
+	// dodo_ols_solve(xtx, xty, k) -> DOUBLE[]
+	ScalarFunction ols_solve("dodo_ols_solve",
+	                         {LogicalType::LIST(LogicalType::DOUBLE), LogicalType::LIST(LogicalType::DOUBLE),
+	                          LogicalType::INTEGER},
+	                         LogicalType::LIST(LogicalType::DOUBLE), OlsSolveFunction);
+	loader.RegisterFunction(ols_solve);
+
+	// dodo_ols_invdiag(xtx, k) -> DOUBLE[]
+	ScalarFunction ols_invdiag("dodo_ols_invdiag",
+	                           {LogicalType::LIST(LogicalType::DOUBLE), LogicalType::INTEGER},
+	                           LogicalType::LIST(LogicalType::DOUBLE), OlsInvDiagFunction);
+	loader.RegisterFunction(ols_invdiag);
+
+	// dodo_sandwich_diag(xtx, meat, k) -> DOUBLE[]
+	ScalarFunction sandwich_diag("dodo_sandwich_diag",
+	                             {LogicalType::LIST(LogicalType::DOUBLE), LogicalType::LIST(LogicalType::DOUBLE),
+	                              LogicalType::INTEGER},
+	                             LogicalType::LIST(LogicalType::DOUBLE), SandwichDiagFunction);
+	loader.RegisterFunction(sandwich_diag);
+}
+
+//===--------------------------------------------------------------------===//
 // Extension Loading
 //===--------------------------------------------------------------------===//
 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(instance);
+
+	RegisterOlsFunctions(loader);
 
 	auto shared_state = make_shared_ptr<DodoStateInfo>();
 	g_dodo_state = shared_state.get();

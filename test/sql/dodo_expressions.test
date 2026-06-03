@@ -229,6 +229,40 @@ count
 ----
 5
 
+# & as logical AND in conditions
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > 1000 & year == 2018
+----
+2
+
+# | as logical OR in conditions
+statement ok
+use "test/data/firms.csv", clear
+
+query I
+count if revenue > 2000 | year == 2017
+----
+3
+
+# & in keep: generated columns should be visible after keep with &
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if revenue > 0 & year > 2016
+
+statement ok
+generate lnR = ln(revenue)
+
+query IIRIR
+head 2
+----
+1	Acme	1000	2017	6.907755278982137
+2	Beta	2000	2018	7.600902459542082
+
 # assert (passes)
 statement ok
 use "test/data/firms.csv", clear

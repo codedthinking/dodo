@@ -1,0 +1,84 @@
+# name: test/sql/dodo_regress.test
+# description: test regress command (OLS with conventional and robust SE)
+# group: [sql]
+
+require dodo
+
+# ============================================================
+# Simple bivariate regression
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+# Basic regression returns results
+query TRRRRRRIRRR
+regress revenue year
+----
+year	583.3333336953503	956.2174713000994	0.6100425386520436	0.541833515803466	-1290.8529100528444	2457.519577443545	5	0.11036036036036023	-0.1861861861861862	0.3721518987341769
+_cons	-1175333.3340637388	1929264.4269676493	-0.6092131890448459	0.5423830265613777	-4956691.610920331	2606024.9427928533	5	0.11036036036036023	-0.1861861861861862	0.3721518987341769
+
+# ============================================================
+# Multivariate regression
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+regress revenue id year
+
+# ============================================================
+# Robust standard errors
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+regress revenue year, robust
+
+# ============================================================
+# Regression with if condition
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+regress revenue year if id <= 4
+
+# ============================================================
+# Regression after keep with & (bug fix: & -> AND translation)
+# ============================================================
+
+statement ok
+use "test/data/firms.csv", clear
+
+statement ok
+keep if revenue > 0 & year > 2016
+
+statement ok
+generate lnR = ln(revenue)
+
+statement ok
+generate lnY = ln(year)
+
+statement ok
+regress lnR lnY
+
+# ============================================================
+# Error: no arguments
+# ============================================================
+
+statement error
+regress
+----
+
+# ============================================================
+# Error: no independent variable
+# ============================================================
+
+statement error
+regress revenue
+----

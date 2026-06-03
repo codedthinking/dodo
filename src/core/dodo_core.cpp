@@ -839,7 +839,7 @@ const vector<string> DODO_COMMANDS = {
     "import",    "merge",      "tempfile", "preserve", "restore",    "xtset",      "tsset",
     "bysort",    "by",         "undo",     "redo",     "history",    "show",       "local",
     "global",    "scalar",     "macro",    "display",  "foreach",    "forvalues",  "tempvar",
-    "tempname", "assert", "compress", "levelsof"};
+    "tempname", "assert", "compress", "levelsof", "regress", "reghdfe"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -1234,6 +1234,26 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 		result = out;
 	}
 
+	// & -> AND, | -> OR (Stata logical operators)
+	// Only replace when surrounded by spaces or expression boundaries (not inside strings)
+	{
+		string out;
+		bool in_str = false;
+		for (idx_t i = 0; i < result.size(); i++) {
+			if (result[i] == '"') {
+				in_str = !in_str;
+			}
+			if (!in_str && result[i] == '&') {
+				out += "AND";
+			} else if (!in_str && result[i] == '|') {
+				out += "OR";
+			} else {
+				out += result[i];
+			}
+		}
+		result = out;
+	}
+
 	// Bare . as Stata missing value -> NULL (e.g., generate x = .)
 	// Match . when surrounded by non-alphanumeric, non-dot characters
 	{
@@ -1536,6 +1556,204 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	}
 
 	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Regression SQL generation
+//===--------------------------------------------------------------------===//
+
+// Build a flat SQL array literal: array[prefix0_0, prefix0_1, ..., prefixK_K]
+static string BuildMatrixArray(const string &prefix, int k) {
+	string arr = "array[";
+	for (int i = 0; i < k; i++) {
+		for (int j = 0; j < k; j++) {
+			if (i > 0 || j > 0) {
+				arr += ", ";
+			}
+			arr += prefix + to_string(i) + "_" + to_string(j);
+		}
+	}
+	return arr + "]";
+}
+
+static string BuildVectorArray(const string &prefix, int k) {
+	string arr = "array[";
+	for (int i = 0; i < k; i++) {
+		if (i > 0) {
+			arr += ", ";
+		}
+		arr += prefix + to_string(i);
+	}
+	return arr + "]";
+}
+
+static string EscapeSQL(const string &s) {
+	string out;
+	for (char c : s) {
+		if (c == '\'') {
+			out += "''";
+		} else {
+			out += c;
+		}
+	}
+	return out;
+}
+
+// Generate the full SQL for `regress y x1 x2 ...[, robust]`.
+// Calls dodo_ols_solve / dodo_ols_invdiag / dodo_sandwich_diag UDFs
+// which delegate to the pure-math functions in regression.cpp.
+static string GenerateRegressionSQL(const DodoCommand &cmd, DodoState &state, const string &prev) {
+	if (cmd.arguments.empty()) {
+		throw DodoException("'" + cmd.command + "' requires: " + cmd.command + " depvar indepvar1 [indepvar2 ...]");
+	}
+
+	auto vars = str::Split(cmd.arguments, ' ');
+	if (vars.size() < 2) {
+		throw DodoException("'" + cmd.command + "' requires at least one independent variable");
+	}
+
+	string depvar = Trim(vars[0]);
+	vector<string> indepvars;
+	for (idx_t i = 1; i < vars.size(); i++) {
+		string v = Trim(vars[i]);
+		if (!v.empty()) {
+			indepvars.push_back(v);
+		}
+	}
+
+	string lower_opts = str::Lower(cmd.options);
+	bool robust = (lower_opts.find("robust") != string::npos || lower_opts == "r");
+
+	string where_clause;
+	if (!cmd.condition.empty()) {
+		where_clause = " WHERE " + TranslateExpression(cmd.condition);
+	}
+
+	int k = static_cast<int>(indepvars.size()) + 1; // +1 for intercept
+	string k_str = to_string(k);
+
+	// Design matrix: column 0 = 1 (intercept), columns 1..k-1 = indepvars
+	vector<string> xcols;
+	xcols.push_back("1.0");
+	for (auto &v : indepvars) {
+		xcols.push_back("CAST(" + QuoteIdent(v) + " AS DOUBLE)");
+	}
+	string y_expr = "CAST(" + QuoteIdent(depvar) + " AS DOUBLE)";
+	string data_query = state.BuildQuery("SELECT * FROM " + prev + where_clause);
+
+	// --- Phase A: sufficient statistics (single pass) ---
+	string stats = "SELECT COUNT(*) AS _n";
+	for (int i = 0; i < k; i++) {
+		for (int j = 0; j < k; j++) {
+			stats += ", SUM((" + xcols[i] + ") * (" + xcols[j] + ")) AS _xtx_" + to_string(i) + "_" + to_string(j);
+		}
+	}
+	for (int i = 0; i < k; i++) {
+		stats += ", SUM((" + xcols[i] + ") * (" + y_expr + ")) AS _xty_" + to_string(i);
+	}
+	stats += ", AVG(" + y_expr + ") AS _ybar FROM (" + data_query + ") _d";
+
+	// --- Phase B: solve beta ---
+	string xtx = BuildMatrixArray("_xtx_", k);
+	string xty = BuildVectorArray("_xty_", k);
+	string beta = "SELECT *, dodo_ols_solve(" + xtx + ", " + xty + ", " + k_str + ") AS _beta"
+	              " FROM (" + stats + ") _stats";
+
+	// --- Phase C: residual aggregates (second pass) ---
+	string yhat = "_beta[1]";
+	for (int i = 1; i < k; i++) {
+		yhat += " + _beta[" + to_string(i + 1) + "] * " + xcols[i];
+	}
+	string resid = "(" + y_expr + " - (" + yhat + "))";
+
+	string resid_agg = "SELECT _n, _ybar, _beta, " + xtx + " AS _xtx_arr, "
+	                   "SUM(" + resid + " * " + resid + ") AS _ess, "
+	                   "SUM((" + y_expr + " - _ybar) * (" + y_expr + " - _ybar)) AS _tss";
+	if (robust) {
+		for (int i = 0; i < k; i++) {
+			for (int j = 0; j < k; j++) {
+				resid_agg += ", SUM(" + resid + " * " + resid + " * (" + xcols[i] + ") * (" + xcols[j] +
+				             ")) AS _meat_" + to_string(i) + "_" + to_string(j);
+			}
+		}
+	}
+	resid_agg += " FROM (" + data_query + ") _d2, (" + beta + ") _b GROUP BY _n, _ybar, _beta, _xtx_arr";
+
+	// --- Phase D: variance estimates ---
+	string se_expr;
+	if (robust) {
+		string meat = "array[";
+		for (int i = 0; i < k; i++) {
+			for (int j = 0; j < k; j++) {
+				if (i > 0 || j > 0) {
+					meat += ", ";
+				}
+				meat += "(_n::DOUBLE / (_n - " + k_str + ")) * _meat_" + to_string(i) + "_" + to_string(j);
+			}
+		}
+		meat += "]";
+		se_expr = "dodo_sandwich_diag(_xtx_arr, " + meat + ", " + k_str + ")";
+	} else {
+		se_expr = "list_transform(dodo_ols_invdiag(_xtx_arr, " + k_str + "), lambda _d : _d * _ess / (_n - " + k_str + "))";
+	}
+
+	// --- Phase E: fit stats + SE array ---
+	string fit = "SELECT _n, _ess, _tss, "
+	             "_tss - _ess AS _mss, "
+	             "_ess / (_n - " + k_str + ") AS _s2, "
+	             "1.0 - _ess / _tss AS _r2, "
+	             "1.0 - (_ess / (_n - " + k_str + ")) / (_tss / (_n - 1)) AS _r2_adj, "
+	             "((_tss - _ess) / " + to_string(k - 1) + ") / (_ess / (_n - " + k_str + ")) AS _f, "
+	             "_beta, " + se_expr + " AS _se_arr "
+	             "FROM (" + resid_agg + ") _r";
+
+	// --- Phase F: coefficient table (one row per variable) ---
+	// Order: indepvars first, then _cons
+	vector<string> var_names;
+	var_names.push_back("_cons");
+	for (auto &v : indepvars) {
+		var_names.push_back(v);
+	}
+
+	vector<int> var_order;
+	for (int i = 1; i < k; i++) {
+		var_order.push_back(i);
+	}
+	var_order.push_back(0);
+
+	// Normal CDF p-value helper (Abramowitz-Stegun approximation, max error 7.5e-8)
+	// Two-sided p = 2 * (1 - Phi(|t|))
+	auto PValueExpr = [](const string &t_expr) -> string {
+		// _pt = 1/(1 + 0.2316419*|t|)
+		// p = 2 * phi(|t|) * _pt * polynomial(_pt)
+		// where phi(x) = 0.3989422804014327 * exp(-x^2/2)
+		return "(SELECT 2.0 * (0.3989422804014327 * exp(-_at*_at/2.0)) * _pt * "
+		       "(0.319381530 + _pt*(-0.356563782 + _pt*(1.781477937 + _pt*(-1.821255978 + _pt*1.330274429)))) "
+		       "FROM (SELECT abs(" + t_expr + ") AS _at) _pv1, "
+		       "LATERAL (SELECT 1.0/(1.0 + 0.2316419 * _at) AS _pt) _pv2)";
+	};
+
+	string coef_sql = "SELECT * FROM (";
+	bool first = true;
+	for (int idx : var_order) {
+		if (!first) {
+			coef_sql += " UNION ALL ";
+		}
+		string i1 = to_string(idx + 1); // DuckDB arrays are 1-indexed
+		string t_expr = "_beta[" + i1 + "] / sqrt(_se_arr[" + i1 + "])";
+		coef_sql += "SELECT '" + EscapeSQL(var_names[idx]) + "' AS variable, "
+		            "_beta[" + i1 + "] AS coefficient, "
+		            "sqrt(_se_arr[" + i1 + "]) AS std_err, "
+		            + t_expr + " AS t, "
+		            "CASE WHEN _se_arr[" + i1 + "] > 0 THEN " + PValueExpr(t_expr) + " ELSE NULL END AS p, "
+		            "_beta[" + i1 + "] - 1.96 * sqrt(_se_arr[" + i1 + "]) AS ci_low, "
+		            "_beta[" + i1 + "] + 1.96 * sqrt(_se_arr[" + i1 + "]) AS ci_high, "
+		            "_n AS N, _r2 AS r2, _r2_adj AS r2_adj, _f AS F "
+		            "FROM (" + fit + ") _fit";
+		first = false;
+	}
+	coef_sql += ") _coef_table";
+	return coef_sql;
 }
 
 //===--------------------------------------------------------------------===//
@@ -3318,6 +3536,10 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		return state.BuildQuery("SELECT " + group_cols + ", COUNT(*) AS freq FROM " + prev + where_clause +
 		                        " GROUP BY " + group_cols + " ORDER BY " + group_cols);
+	}
+
+	if (cmd.command == "regress" || cmd.command == "reghdfe") {
+		return GenerateRegressionSQL(cmd, state, prev);
 	}
 
 	if (cmd.command == "save") {

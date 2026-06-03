@@ -18,6 +18,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/extension ${CMAKE_CURRENT_SO
 set(EXTENSION_SOURCES
     src/extension/dodo_extension.cpp
     src/core/dodo_core.cpp
+    src/core/regression.cpp
     duckdb-dta/src/dta_reader.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
