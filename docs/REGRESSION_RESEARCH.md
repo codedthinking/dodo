@@ -240,9 +240,227 @@ Compute X'X and X'y as a single SQL query using `regr_sxx`, `regr_sxy`, etc. Pas
 
 ---
 
+## 8. Stata `regress` internals
+
+### Notation
+
+- **v**: column vector of user-specified weights (v = 1 if no weights)
+- **w**: normalized weights
+- **n**: number of observations (1'w; truncated to integer for iweights)
+- **c**: 1 if constant in regression, 0 otherwise
+- **k**: number of RHS variables including constant
+- **D**: diagonal matrix of weights; all cross-products become X'DX, X'Dy, y'Dy
+
+### Coefficient computation
+
+- **A** = X'X, **a** = X'y, **b** = A^{-1} a
+- With instruments (2SLS): **A** = X'Z(Z'Z)^{-1}(X'Z)', **a** = X'Z(Z'Z)^{-1}Z'y
+- When `hascons` is not specified, A and a are accumulated in deviation form (subtract means) for numerical stability; constant calculated separately.
+
+### ANOVA and fit statistics
+
+- **TSS** = y'y - (1'y)^2/n (with constant); y'y (without constant). df = n - c.
+- **ESS** = y'y - b'X'y (no instruments); y'y - 2b'X'y + b'X'Xb (with instruments). df = n - k.
+- **MSS** = TSS - ESS. df = k - c.
+- **s^2** = ESS / (n - k) (mean squared error)
+- **R^2** = 1 - ESS/TSS
+- **R_a^2** = 1 - (1 - R^2)(n - c)/(n - k)
+- **F** = MSS / ((k - c) * s^2), with k-c and n-k df
+
+### Variance-covariance
+
+**Conventional**: V = s^2 * A^{-1}
+
+**Robust (sandwich)**: V = q_c * A^{-1} * (Σ u_k u_k') * A^{-1}
+
+Score vectors by VCE type:
+- **HC1 (robust)**: u_j = (y_j - x_j'b) * x_j
+- **HC2**: u_j = (1/√(1-h_jj)) * (y_j - x_j'b) * x_j, where h_jj = x_j(X'X)^{-1}x_j'
+- **HC3**: u_j = (1/(1-h_jj)) * (y_j - x_j'b) * x_j
+
+**Clustered**: aggregate scores by cluster before forming outer product:
+u_k^(G) = Σ_{j ∈ G_k} w_j * u_j
+
+**Finite-sample correction**: q_c = (N-1)/(N-k) * M/(M-1), where M = number of clusters.
+
+### Weight types
+
+- **fweights**: treat as expanded dataset
+- **aweights**: for group means; multiply data by √(n_j)
+- **pweights**: sampling weights
+
+### Key implementation insights
+
+1. Core is b = (X'X)^{-1} X'y; everything else is bookkeeping
+2. Deviation-form accumulation when constant present (numerical stability)
+3. Degrees of freedom (n-k, k-c) affect TSS, R^2, adjusted R^2, F
+4. Robust SEs are post-estimation sandwich — compute OLS first, swap V
+5. HC2/HC3 require hat matrix diagonal h_jj (most expensive robust variant)
+6. Cluster-robust aggregates scores by group; q_c depends on both M and k
+
+---
+
+## 9. reghdfe internals (from source code)
+
+### Architecture
+
+reghdfe (Correia 2016) implements linear regression absorbing multiple high-dimensional fixed effects. The Stata front-end (`reghdfe5.ado`, `reghdfe5_parse.ado`) handles parsing and display; the computational core is in Mata (`reghdfe.mata`).
+
+**Key classes:**
+- **`FE_Factor`**: stores one FE dimension — group IDs, counts, slope variables, preconditioners. Methods: `mult()`, `mult_transpose()` for matrix-vector products.
+- **`FixedEffects`**: orchestrates the full pipeline — holds vector of `FE_Factor` objects, sample indices, weights, solver parameters.
+- **`Solution`**: stores results — b, V, fit statistics, FE estimates (alphas).
+- **`BipartiteGraph`**: tracks connectivity between two FE dimensions for singleton detection and mobility group computation.
+
+### Overall flow
+
+1. **Parse** `absorb()` via `ms_parse_absvars` → create `FE_Factor` objects
+2. **Drop singletons** (iterative): for each FE, count obs per group; drop groups with count=1; repeat until stable
+3. **Panelsetup**: compute group boundaries, load/standardize slope variables
+4. **Load weights**: rescale, compute weighted counts, initialize preconditioners
+5. **Partial out** (`partial_out()`): load y and X, standardize, run solver (MAP or LSMR) to demean w.r.t. all FEs
+6. **OLS on residuals**: b = (X̃'X̃)^{-1} X̃'ỹ where tildes denote partialled-out variables
+7. **Standard errors**: compute V with chosen VCE (conventional, robust, clustered, Driscoll-Kraay)
+8. **Store alphas** (optional): recover FE estimates from residuals
+9. **Post results**: store in e-class (e(b), e(V), e(N), e(r2), etc.)
+
+### MAP algorithm (Method of Alternating Projections)
+
+The core demeaning algorithm iteratively projects out each FE:
+
+```
+repeat until convergence:
+    for g = 1 to G:
+        r ← r - FE_g.mult(FE_g.mult_transpose(r))
+        // i.e., subtract group means for FE dimension g
+```
+
+Where:
+- `mult_transpose(r)` computes group sums/means (via `panelsum`/`panelmean`)
+- `mult(coeffs)` expands group-level values back to observation level
+- For intercept-only FE: this simply subtracts group means
+- For slope FEs (continuous interactions): projects onto group-specific slopes
+
+**Transforms** (single sweep through FEs):
+- **Symmetric Kaczmarz** (default): forward sweep FEs 1→G, then backward G-1→1. Makes the operator self-adjoint, required for CG acceleration.
+- **Kaczmarz**: sequential projection 1→G only.
+- **Cimmino**: simultaneous — project onto each FE independently, average results.
+
+**Convergence**: default tolerance 1e-8, max iterations 16000. Two criteria:
+- "vectors": max(mean(reldif(y_new, y_old), weight))
+- "hestenes" (used by CG): sqrt(max(SSR / improvement_potential))
+
+**Acceleration**:
+- **Conjugate Gradient** (default): Hestenes-Stiefel CG with Fletcher-Reeves formula. Requires symmetric transform.
+- **Hybrid**: 6 unaccelerated iterations with user's transform, then switches to CG with symmetric Kaczmarz.
+- **Aitken's Δ²**: Macleod (1986) method 3, extrapolates every `accel_freq` iterations (default 3), starting at `accel_start` (default 6).
+- **Steep descent**: optimal step size t = (y'proj)/(proj'proj) each iteration. Includes randomization hack (10% chance t=1 to avoid getting stuck).
+- **None**: bare fixed-point iteration.
+
+**Alternative solver — LSMR**: Fong & Saunders (2011) least-squares solver with Golub-Kahan bidiagonalization and Givens rotations. Operates on the stacked system Ax = b where A represents all FE design matrices. Generally faster for many FE dimensions.
+
+### Singleton detection and removal
+
+Singletons (groups with only one observation) are iteratively removed because:
+1. They are perfectly predicted by their FE → zero residual → inflate fit statistics
+2. Removing one singleton can create new singletons in other FE dimensions
+
+**Algorithm**: iterative k-core pruning:
+1. For each FE, find groups with count = 1
+2. Drop those observations
+3. Recompute all FE group counts
+4. Repeat until no new singletons
+
+For individual-level FEs with group outcomes, uses Batagelj & Zaversnik k-core decomposition on the bipartite graph.
+
+**K-core pruning optimization** (for G=2 intercept-only FEs): degree-1 vertices (firms with one worker, workers with one firm) can be solved triangularly without iteration. `prune_1core()` zeros their weights during MAP; after convergence, `expand_1core()` recovers full solution by back-substitution in reverse order. Significantly speeds up convergence.
+
+**Collinearity detection**: post-demeaning, variables whose 2-norm ratio (post/pre) falls below `collinear_tol = min(1e-6, tolerance/10)` are flagged as absorbed by the FEs and zeroed out. In OLS stage, `reghdfe_rmcoll()` uses `invsym()` with prescribed sweep order.
+
+### Degrees of freedom
+
+With G sets of fixed effects:
+- **df_a** = Σ_g (levels_g × (1 + num_slopes_g)) − redundant parameters
+- **Redundant parameters**: detected via connected components in bipartite graph between FE pairs (mobility groups). One parameter per connected component is collinear.
+- **Nesting**: if FE_g nests within FE_h (e.g., firm nests within industry), additional redundancy is counted.
+- **Cluster nesting**: if an absvar IS a cluster variable or is nested within one, all its levels are redundant (don't reduce effective DoF — already accounted for in cluster VCE).
+- **Continuous variable adjustment**: for slope FEs (e.g., `i.firm#c.year`), checks if the slope variable is constant (with intercept) or zero (without) within each level — those levels don't reduce DoF.
+- **df_r** = N − k − df_a (residual degrees of freedom)
+
+Key variables: `doflist_K[g]` (coefficients per FE), `doflist_M[g]` (redundant per FE), `df_a_redundant` (total mobility-based redundancy), `df_a_nested` (nesting-based redundancy).
+
+### Standard errors
+
+Supported VCE types:
+- **unadjusted**: V = s^2 (X̃'X̃)^{-1}
+- **robust (HC1)**: sandwich with observation-level scores
+- **cluster**: one-way or multi-way clustering; scores aggregated by cluster
+- **Driscoll-Kraay**: HAC-type for panel data with spatial/temporal dependence, parameterized by bandwidth
+
+Multi-way clustering uses the Cameron-Gelbach-Miller (2011) inclusion-exclusion formula.
+
+### Preconditioning for numerical stability
+
+Three schemes:
+- **Diagonal**: D_ii = 1/√(A'A)_ii
+- **Block-diagonal**: D = block_diag(inv(X'X)) per group, accounting for within-FE covariation
+- **None**: raw matrix
+
+After solving, `undo_preconditioning()` recovers original scale.
+
+### Supported absorb() syntax
+
+Via `ms_parse_absvars`:
+- Simple FEs: `absorb(firm year)`
+- Interactions: `absorb(firm#year)`
+- Continuous interactions (slopes): `absorb(firm c.x)` — absorbs firm-specific slopes on x
+- Individual FEs within groups: nested specifications
+
+---
+
+## 10. Revised implementation assessment
+
+### What dodo needs
+
+Given the reghdfe architecture and Stata `regress` internals, the implementation strategy for dodo becomes clearer:
+
+**For `regress y x1 x2 [, robust cluster(id)]`:**
+1. Compute X'X and X'y via DuckDB SQL aggregates (single pass, streaming)
+2. Solve b = (X'X)^{-1} X'y in C++ (small k×k matrix — Cholesky decomposition)
+3. Compute residuals e = y - Xb in SQL
+4. Compute V via sandwich formula in SQL + C++ depending on VCE type
+
+**For `reghdfe y x1 x2, absorb(fe1 fe2) [cluster(id)]`:**
+1. Load data from DuckDB into memory (the FE dimensions and regression variables)
+2. Run MAP/LSMR demeaning in C++ (iterative, needs random access to data)
+3. Solve OLS on demeaned data
+4. Compute df_a accounting for singletons, redundant FEs, mobility groups
+5. Compute clustered SE
+
+### Key architectural insight
+
+The demeaning step (MAP) requires iterative random access to the data — it cannot be expressed as a single SQL pass. This means reghdfe-style absorption must happen in C++ (or another procedural language), not in generated SQL. The data transfer from DuckDB to C++ is the bottleneck for large datasets.
+
+However, the OLS solve after demeaning is trivial (small matrix), and the sufficient statistics for SE computation can be accumulated during the residual computation pass.
+
+### Comparison with duckreg approach
+
+| Aspect | reghdfe-style | duckreg-style |
+|--------|--------------|---------------|
+| FE absorption | Iterative demeaning (MAP/LSMR) | Mundlak/double-demeaning via SQL |
+| Continuous regressors | Exact | Requires discretization |
+| Standard errors | Exact analytical | Bootstrap (approximate) |
+| Data location | In-memory C++ | DuckDB SQL |
+| Scalability | Limited by RAM | Limited by unique FE combos |
+
+---
+
 ## References
 
 - Lal, A., Fischer, N., & Wardrop, M. (2024). Large Scale Longitudinal Experiments: Estimation and Inference. arXiv:2410.09952.
 - Mundlak, Y. (1978). On the pooling of time series and cross section data. Econometrica 46(1), 69-85.
 - Correia, S. (2016). A feasible estimator for linear models with multi-way fixed effects. Working paper. (reghdfe)
 - Berge, L. (2018). Efficient estimation of maximum likelihood models with multiple fixed-effects: the R package fixest.
+- Cameron, A. C., Gelbach, J. B., & Miller, D. L. (2011). Robust inference with multiway clustering. Journal of Business & Economic Statistics, 29(2), 238-249.
+- Batagelj, V. & Zaversnik, M. (2003). An O(m) algorithm for cores decomposition of networks. arXiv:cs/0310049.
+- Davidson, R. & MacKinnon, J. G. (1993). Estimation and Inference in Econometrics. Oxford University Press.
