@@ -1678,9 +1678,9 @@ static string GenerateRegressionSQL(const DodoCommand &cmd, DodoState &state, co
 		}
 
 		// Build the data query: SELECT depvar, x1..xk, fe1..feG [, cluster] FROM data
-		string select_cols = "CAST(" + QuoteIdent(depvar) + " AS DOUBLE) AS " + QuoteIdent(depvar);
+		string select_cols = "CAST(" + QuoteIdent(depvar) + " AS DOUBLE)";
 		for (auto &v : indepvars) {
-			select_cols += ", CAST(" + QuoteIdent(v) + " AS DOUBLE) AS " + QuoteIdent(v);
+			select_cols += ", CAST(" + QuoteIdent(v) + " AS DOUBLE)";
 		}
 		for (auto &fe : absorb_vars) {
 			select_cols += ", " + QuoteIdent(fe);

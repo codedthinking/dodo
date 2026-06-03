@@ -79,6 +79,233 @@ static string BuildLiveViewSQL(const DodoStateInfo &state) {
 }
 
 //===--------------------------------------------------------------------===//
+// ExecuteReghdfe: parse __REGHDFE__ marker, run data query, demean, OLS
+// Returns a VALUES SQL string with the coefficient table.
+//===--------------------------------------------------------------------===//
+// Execute reghdfe using a new Connection on the given DatabaseInstance.
+// For the parser_override path (no ClientContext available).
+static string ExecuteReghdfeViaConnection(const string &marker_sql, DodoStateInfo &state, DatabaseInstance &db);
+
+// Execute reghdfe using an existing ClientContext.
+// For the dodo_plan path (ClientContext available).
+static string ExecuteReghdfeViaContext(const string &marker_sql, DodoStateInfo &state, ClientContext &context);
+
+// Core implementation: parse marker, load data from query result, demean, OLS, return VALUES SQL.
+static string ExecuteReghdfeCore(const string &marker_sql, unique_ptr<QueryResult> qresult) {
+	string rest = marker_sql.substr(12);
+	idx_t params_pos = rest.find("||PARAMS||");
+	string params_str = rest.substr(params_pos + 10);
+
+	auto param_lines = StringUtil::Split(params_str, '\n');
+	auto var_names_list = StringUtil::Split(param_lines[0], '\t');
+	auto fe_names_list = StringUtil::Split(param_lines[1], '\t');
+	string cluster_name = param_lines.size() > 2 ? param_lines[2] : "";
+	bool is_robust = param_lines.size() > 3 && param_lines[3] == "1";
+	if (qresult->HasError()) {
+		throw std::runtime_error("reghdfe: " + qresult->GetError());
+	}
+
+	int n_vars = static_cast<int>(var_names_list.size());
+	int n_fe = static_cast<int>(fe_names_list.size());
+	bool has_cluster = !cluster_name.empty();
+
+	std::vector<std::vector<double>> var_cols(n_vars);
+	std::vector<std::vector<int>> fe_groups(n_fe);
+	std::vector<int> cluster_ids;
+	std::vector<std::unordered_map<int64_t, int>> fe_maps(n_fe);
+	std::unordered_map<int64_t, int> cluster_map;
+	idx_t n_obs = 0;
+
+	unique_ptr<DataChunk> dchunk;
+	while ((dchunk = qresult->Fetch()) != nullptr) {
+		for (idx_t r = 0; r < dchunk->size(); r++) {
+			for (int v = 0; v < n_vars; v++) {
+				auto val = dchunk->data[v].GetValue(r);
+				var_cols[v].push_back(val.IsNull() ? 0.0 : val.GetValue<double>());
+			}
+			for (int g = 0; g < n_fe; g++) {
+				auto val = dchunk->data[n_vars + g].GetValue(r);
+				int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+				auto it = fe_maps[g].find(raw);
+				int id;
+				if (it == fe_maps[g].end()) {
+					id = static_cast<int>(fe_maps[g].size());
+					fe_maps[g][raw] = id;
+				} else {
+					id = it->second;
+				}
+				fe_groups[g].push_back(id);
+			}
+			if (has_cluster) {
+				auto val = dchunk->data[n_vars + n_fe].GetValue(r);
+				int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
+				auto it = cluster_map.find(raw);
+				int id;
+				if (it == cluster_map.end()) {
+					id = static_cast<int>(cluster_map.size());
+					cluster_map[raw] = id;
+				} else {
+					id = it->second;
+				}
+				cluster_ids.push_back(id);
+			}
+			n_obs++;
+		}
+	}
+
+	if (n_obs == 0) {
+		return "SELECT 'No observations' AS error";
+	}
+
+	std::vector<double> vars_flat(static_cast<size_t>(n_obs) * n_vars);
+	for (int v = 0; v < n_vars; v++) {
+		for (idx_t i = 0; i < n_obs; i++) {
+			vars_flat[static_cast<size_t>(v) * n_obs + i] = var_cols[v][i];
+		}
+	}
+	var_cols.clear();
+
+	std::vector<int> n_fe_levels(n_fe);
+	for (int g = 0; g < n_fe; g++) {
+		n_fe_levels[g] = static_cast<int>(fe_maps[g].size());
+	}
+
+	dodo::MapDemean(vars_flat, static_cast<int>(n_obs), n_vars, fe_groups, n_fe_levels);
+
+	int n = static_cast<int>(n_obs);
+	int kx = n_vars - 1;
+	std::vector<double> xtx(static_cast<size_t>(kx) * kx, 0.0);
+	std::vector<double> xty(kx, 0.0);
+	double yty = 0.0;
+	double *yp = &vars_flat[0];
+
+	for (int i = 0; i < kx; i++) {
+		double *xi = &vars_flat[static_cast<size_t>(i + 1) * n_obs];
+		for (idx_t obs = 0; obs < n_obs; obs++) xty[i] += xi[obs] * yp[obs];
+		for (int j = 0; j < kx; j++) {
+			double *xj = &vars_flat[static_cast<size_t>(j + 1) * n_obs];
+			double s = 0.0;
+			for (idx_t obs = 0; obs < n_obs; obs++) s += xi[obs] * xj[obs];
+			xtx[i * kx + j] = s;
+		}
+	}
+	for (idx_t obs = 0; obs < n_obs; obs++) yty += yp[obs] * yp[obs];
+
+	auto beta = dodo::OlsSolve(xtx, xty, kx);
+
+	std::vector<double> resid(n_obs);
+	double ess = 0.0;
+	for (idx_t obs = 0; obs < n_obs; obs++) {
+		double yhat = 0.0;
+		for (int j = 0; j < kx; j++) {
+			yhat += beta[j] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+		}
+		resid[obs] = yp[obs] - yhat;
+		ess += resid[obs] * resid[obs];
+	}
+	double tss = yty;
+
+	int df_a = 0;
+	for (int g = 0; g < n_fe; g++) df_a += n_fe_levels[g];
+	if (n_fe >= 2) {
+		for (int g = 1; g < n_fe; g++) {
+			df_a -= dodo::CountConnectedComponents(fe_groups[0], fe_groups[g],
+			                                      n_fe_levels[0], n_fe_levels[g], n);
+		}
+	} else {
+		df_a -= 1;
+	}
+	int df_r = n - kx - df_a;
+	if (df_r <= 0) df_r = 1;
+
+	double s2 = ess / df_r;
+	double r2_val = 1.0 - ess / tss;
+	double r2_adj = 1.0 - (ess / df_r) / (tss / (n - 1));
+	double f_val = ((tss - ess) / kx) / s2;
+
+	std::vector<double> var_diag;
+	if (has_cluster) {
+		int n_cl = static_cast<int>(cluster_map.size());
+		std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+		std::vector<std::vector<double>> cl_scores(n_cl, std::vector<double>(kx, 0.0));
+		for (idx_t obs = 0; obs < n_obs; obs++) {
+			int cl = cluster_ids[obs];
+			for (int j = 0; j < kx; j++)
+				cl_scores[cl][j] += resid[obs] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+		}
+		for (int cl = 0; cl < n_cl; cl++)
+			for (int i = 0; i < kx; i++)
+				for (int j = 0; j < kx; j++)
+					meat[i * kx + j] += cl_scores[cl][i] * cl_scores[cl][j];
+		double qc = ((double)(n - 1) / (n - kx)) * ((double)n_cl / (n_cl - 1));
+		for (auto &m : meat) m *= qc;
+		var_diag = dodo::SandwichDiag(xtx, meat, kx);
+	} else if (is_robust) {
+		std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+		for (idx_t obs = 0; obs < n_obs; obs++) {
+			double e2 = resid[obs] * resid[obs];
+			for (int i = 0; i < kx; i++) {
+				double xi = vars_flat[static_cast<size_t>(i + 1) * n_obs + obs];
+				for (int j = 0; j < kx; j++)
+					meat[i * kx + j] += e2 * xi * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
+			}
+		}
+		double hc1 = (double)n / (n - kx);
+		for (auto &m : meat) m *= hc1;
+		var_diag = dodo::SandwichDiag(xtx, meat, kx);
+	} else {
+		auto inv_d = dodo::OlsInvDiag(xtx, kx);
+		var_diag.resize(kx);
+		for (int j = 0; j < kx; j++) var_diag[j] = s2 * inv_d[j];
+	}
+
+	string values_sql = "SELECT * FROM (VALUES ";
+	for (int j = 0; j < kx; j++) {
+		if (j > 0) values_sql += ", ";
+		double se_j = std::sqrt(var_diag[j]);
+		double t_j = se_j > 0 ? beta[j] / se_j : 0.0;
+		double p_j = dodo::NormalPValue(t_j);
+		values_sql += "('" + var_names_list[j + 1] + "', " +
+		              to_string(beta[j]) + ", " + to_string(se_j) + ", " +
+		              to_string(t_j) + ", " + to_string(p_j) + ", " +
+		              to_string(beta[j] - 1.96 * se_j) + ", " +
+		              to_string(beta[j] + 1.96 * se_j) + ", " +
+		              to_string(n) + ", " +
+		              to_string(r2_val) + ", " + to_string(r2_adj) + ", " +
+		              to_string(f_val) + ")";
+	}
+	values_sql += ") AS _t(variable, coefficient, std_err, t, p, ci_low, ci_high, N, r2, r2_adj, F)";
+	return values_sql;
+}
+
+static string ExecuteReghdfeViaConnection(const string &marker_sql, DodoStateInfo &state, DatabaseInstance &db) {
+	string rest = marker_sql.substr(12);
+	idx_t params_pos = rest.find("||PARAMS||");
+	string data_sql = rest.substr(0, params_pos);
+
+	Connection conn(db);
+	// Disable parser override on the inner connection to prevent interference
+	conn.Query("SET allow_parser_override_extension = 'disabled'");
+	auto qresult = conn.Query(data_sql);
+	if (qresult->HasError()) {
+		throw std::runtime_error("reghdfe: " + qresult->GetError() + "\nSQL: " + data_sql);
+	}
+	return ExecuteReghdfeCore(marker_sql, std::move(qresult));
+}
+
+static string ExecuteReghdfeViaContext(const string &marker_sql, DodoStateInfo &state, ClientContext &context) {
+	string rest = marker_sql.substr(12);
+	idx_t params_pos = rest.find("||PARAMS||");
+	string data_sql = rest.substr(0, params_pos);
+
+	auto qresult = context.Query(data_sql, QueryParameters(false));
+	if (qresult->HasError()) {
+		throw std::runtime_error("reghdfe: " + qresult->GetError());
+	}
+	return ExecuteReghdfeCore(marker_sql, std::move(qresult));
+}
+
+//===--------------------------------------------------------------------===//
 // parse_function: detect commands (called when standard parser fails)
 //===--------------------------------------------------------------------===//
 static ParserExtensionParseResult dodo_parse(ParserExtensionInfo *info, const string &query) {
@@ -252,221 +479,21 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 					continue;
 				}
 
-				// Handle __REGHDFE__ marker: execute data, demean, OLS, return VALUES
+				// Handle __REGHDFE__ marker
 				if (StringUtil::StartsWith(sql, "__REGHDFE__:")) {
-					string rest = sql.substr(12);
-					idx_t params_pos = rest.find("||PARAMS||");
-					string data_sql = rest.substr(0, params_pos);
-					string params_str = rest.substr(params_pos + 10);
-
-					// Parse parameters: var_names\tfe_names\tcluster\trobust
-					auto param_lines = StringUtil::Split(params_str, '\n');
-					auto var_names_list = StringUtil::Split(param_lines[0], '\t');
-					auto fe_names_list = StringUtil::Split(param_lines[1], '\t');
-					string cluster_name = param_lines.size() > 2 ? param_lines[2] : "";
-					bool is_robust = param_lines.size() > 3 && param_lines[3] == "1";
-
-					// Drain pending SQL first
-					for (auto &psql : state.core.pending_sql) {
-						Parser pend_parser;
-						pend_parser.ParseQuery(psql);
-						for (auto &st : pend_parser.statements) {
-							all_statements.push_back(std::move(st));
-						}
-					}
-					state.core.pending_sql.clear();
-
-					// Execute data query on a separate connection (avoids deadlock)
 					if (!state.db_instance) {
 						throw std::runtime_error("reghdfe: database instance not available");
 					}
-					Connection conn(*state.db_instance);
-					auto qresult = conn.Query(data_sql);
-					if (qresult->HasError()) {
-						throw std::runtime_error("reghdfe: " + qresult->GetError());
+					// Execute pending SQL (checkpoint) on the inner connection
+					// so the data query sees the latest materialized state
+					Connection pre_conn(*state.db_instance);
+					pre_conn.Query("SET allow_parser_override_extension = 'disabled'");
+					for (auto &psql : state.core.pending_sql) {
+						pre_conn.Query(psql);
 					}
+					state.core.pending_sql.clear();
 
-					int n_vars = static_cast<int>(var_names_list.size());
-					int n_fe = static_cast<int>(fe_names_list.size());
-					bool has_cluster = !cluster_name.empty();
-
-					// Load data into arrays
-					std::vector<std::vector<double>> var_cols(n_vars);
-					std::vector<std::vector<int>> fe_groups(n_fe);
-					std::vector<int> cluster_ids;
-					std::vector<std::unordered_map<int64_t, int>> fe_maps(n_fe);
-					std::unordered_map<int64_t, int> cluster_map;
-					idx_t n_obs = 0;
-
-					unique_ptr<DataChunk> dchunk;
-					while ((dchunk = qresult->Fetch()) != nullptr) {
-						for (idx_t r = 0; r < dchunk->size(); r++) {
-							for (int v = 0; v < n_vars; v++) {
-								auto val = dchunk->data[v].GetValue(r);
-								var_cols[v].push_back(val.IsNull() ? 0.0 : val.GetValue<double>());
-							}
-							for (int g = 0; g < n_fe; g++) {
-								auto val = dchunk->data[n_vars + g].GetValue(r);
-								int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
-								auto it = fe_maps[g].find(raw);
-								int id;
-								if (it == fe_maps[g].end()) {
-									id = static_cast<int>(fe_maps[g].size());
-									fe_maps[g][raw] = id;
-								} else {
-									id = it->second;
-								}
-								fe_groups[g].push_back(id);
-							}
-							if (has_cluster) {
-								auto val = dchunk->data[n_vars + n_fe].GetValue(r);
-								int64_t raw = val.IsNull() ? -999999 : val.GetValue<int64_t>();
-								auto it = cluster_map.find(raw);
-								int id;
-								if (it == cluster_map.end()) {
-									id = static_cast<int>(cluster_map.size());
-									cluster_map[raw] = id;
-								} else {
-									id = it->second;
-								}
-								cluster_ids.push_back(id);
-							}
-							n_obs++;
-						}
-					}
-
-					if (n_obs == 0) {
-						Parser ok_p;
-						ok_p.ParseQuery("SELECT 'No observations' AS error");
-						for (auto &st : ok_p.statements) all_statements.push_back(std::move(st));
-						continue;
-					}
-
-					// Convert to column-major for MapDemean
-					std::vector<double> vars_flat(static_cast<size_t>(n_obs) * n_vars);
-					for (int v = 0; v < n_vars; v++) {
-						for (idx_t i = 0; i < n_obs; i++) {
-							vars_flat[static_cast<size_t>(v) * n_obs + i] = var_cols[v][i];
-						}
-					}
-					var_cols.clear();
-
-					std::vector<int> n_fe_levels(n_fe);
-					for (int g = 0; g < n_fe; g++) {
-						n_fe_levels[g] = static_cast<int>(fe_maps[g].size());
-					}
-
-					// Demean
-					dodo::MapDemean(vars_flat, static_cast<int>(n_obs), n_vars, fe_groups, n_fe_levels);
-
-					// OLS on demeaned data (no intercept)
-					int n = static_cast<int>(n_obs);
-					int kx = n_vars - 1;
-					std::vector<double> xtx(static_cast<size_t>(kx) * kx, 0.0);
-					std::vector<double> xty(kx, 0.0);
-					double yty = 0.0;
-					double *yp = &vars_flat[0];
-
-					for (int i = 0; i < kx; i++) {
-						double *xi = &vars_flat[static_cast<size_t>(i + 1) * n_obs];
-						for (idx_t obs = 0; obs < n_obs; obs++) xty[i] += xi[obs] * yp[obs];
-						for (int j = 0; j < kx; j++) {
-							double *xj = &vars_flat[static_cast<size_t>(j + 1) * n_obs];
-							double s = 0.0;
-							for (idx_t obs = 0; obs < n_obs; obs++) s += xi[obs] * xj[obs];
-							xtx[i * kx + j] = s;
-						}
-					}
-					for (idx_t obs = 0; obs < n_obs; obs++) yty += yp[obs] * yp[obs];
-
-					auto beta = dodo::OlsSolve(xtx, xty, kx);
-
-					// Residuals
-					std::vector<double> resid(n_obs);
-					double ess = 0.0;
-					for (idx_t obs = 0; obs < n_obs; obs++) {
-						double yhat = 0.0;
-						for (int j = 0; j < kx; j++) {
-							yhat += beta[j] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
-						}
-						resid[obs] = yp[obs] - yhat;
-						ess += resid[obs] * resid[obs];
-					}
-					double tss = yty;
-
-					// Degrees of freedom
-					int df_a = 0;
-					for (int g = 0; g < n_fe; g++) df_a += n_fe_levels[g];
-					if (n_fe >= 2) {
-						for (int g = 1; g < n_fe; g++) {
-							df_a -= dodo::CountConnectedComponents(fe_groups[0], fe_groups[g],
-							                                      n_fe_levels[0], n_fe_levels[g], n);
-						}
-					} else {
-						df_a -= 1;
-					}
-					int df_r = n - kx - df_a;
-					if (df_r <= 0) df_r = 1;
-
-					double s2 = ess / df_r;
-					double r2_val = 1.0 - ess / tss;
-					double r2_adj = 1.0 - (ess / df_r) / (tss / (n - 1));
-					double f_val = ((tss - ess) / kx) / s2;
-
-					// Standard errors
-					std::vector<double> var_diag;
-					if (has_cluster) {
-						int n_cl = static_cast<int>(cluster_map.size());
-						std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
-						std::vector<std::vector<double>> cl_scores(n_cl, std::vector<double>(kx, 0.0));
-						for (idx_t obs = 0; obs < n_obs; obs++) {
-							int cl = cluster_ids[obs];
-							for (int j = 0; j < kx; j++)
-								cl_scores[cl][j] += resid[obs] * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
-						}
-						for (int cl = 0; cl < n_cl; cl++)
-							for (int i = 0; i < kx; i++)
-								for (int j = 0; j < kx; j++)
-									meat[i * kx + j] += cl_scores[cl][i] * cl_scores[cl][j];
-						double qc = ((double)(n - 1) / (n - kx)) * ((double)n_cl / (n_cl - 1));
-						for (auto &m : meat) m *= qc;
-						var_diag = dodo::SandwichDiag(xtx, meat, kx);
-					} else if (is_robust) {
-						std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
-						for (idx_t obs = 0; obs < n_obs; obs++) {
-							double e2 = resid[obs] * resid[obs];
-							for (int i = 0; i < kx; i++) {
-								double xi = vars_flat[static_cast<size_t>(i + 1) * n_obs + obs];
-								for (int j = 0; j < kx; j++)
-									meat[i * kx + j] += e2 * xi * vars_flat[static_cast<size_t>(j + 1) * n_obs + obs];
-							}
-						}
-						double hc1 = (double)n / (n - kx);
-						for (auto &m : meat) m *= hc1;
-						var_diag = dodo::SandwichDiag(xtx, meat, kx);
-					} else {
-						auto inv_d = dodo::OlsInvDiag(xtx, kx);
-						var_diag.resize(kx);
-						for (int j = 0; j < kx; j++) var_diag[j] = s2 * inv_d[j];
-					}
-
-					// Build VALUES SQL
-					string values_sql = "SELECT * FROM (VALUES ";
-					for (int j = 0; j < kx; j++) {
-						if (j > 0) values_sql += ", ";
-						double se_j = std::sqrt(var_diag[j]);
-						double t_j = se_j > 0 ? beta[j] / se_j : 0.0;
-						double p_j = dodo::NormalPValue(t_j);
-						values_sql += "('" + var_names_list[j + 1] + "', " +
-						              to_string(beta[j]) + ", " + to_string(se_j) + ", " +
-						              to_string(t_j) + ", " + to_string(p_j) + ", " +
-						              to_string(beta[j] - 1.96 * se_j) + ", " +
-						              to_string(beta[j] + 1.96 * se_j) + ", " +
-						              to_string(n) + ", " +
-						              to_string(r2_val) + ", " + to_string(r2_adj) + ", " +
-						              to_string(f_val) + ")";
-					}
-					values_sql += ") AS _t(variable, coefficient, std_err, t, p, ci_low, ci_high, N, r2, r2_adj, F)";
+					string values_sql = ExecuteReghdfeViaConnection(sql, state, *state.db_instance);
 
 					Parser vals_parser;
 					vals_parser.ParseQuery(values_sql);
@@ -552,6 +579,25 @@ static ParserExtensionPlanResult dodo_plan(ParserExtensionInfo *info, ClientCont
 	auto cmd = dodo::TokenizeCommand(dodo_data.raw_query);
 	state.core.pending_command = dodo_data.raw_query;
 	string sql = dodo::ProcessCommand(cmd, state.core);
+
+	// Handle __REGHDFE__ marker: execute data query, run C++ math, return VALUES
+	if (StringUtil::StartsWith(sql, "__REGHDFE__:")) {
+		// Use a separate connection — this works when dodo._current exists (materialized data)
+		// If data is only in the CTE chain (not materialized), the override path handles it instead.
+		if (!state.db_instance) {
+			throw BinderException("reghdfe: database instance not available");
+		}
+		string values_sql = ExecuteReghdfeViaConnection(sql, state, *state.db_instance);
+		Parser parser;
+		parser.ParseQuery(values_sql);
+		if (parser.statements.empty()) {
+			throw BinderException("reghdfe: generated empty result");
+		}
+		auto bind_state = make_shared_ptr<DodoBindState>(std::move(parser.statements[0]));
+		context.registered_state->Remove("dodo_bind");
+		context.registered_state->Insert("dodo_bind", bind_state);
+		throw BinderException("dodo redirect to operator bind");
+	}
 
 	Parser parser;
 	try {
