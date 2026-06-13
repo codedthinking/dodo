@@ -1,4 +1,4 @@
-# Replication Verifier — Core Compiler AST
+# dodo dna — Core Compiler AST for the Replication Verifier
 
 > What should the dodo core compiler emit so that the Replication Verifier
 > (claim verification by static analysis) can be built on top of it?
@@ -7,6 +7,16 @@ This document answers one question: **what AST/IR should `dodo` core produce**,
 and **where in the existing compiler does that emission hook in**. It is scoped
 to the deterministic layer only (steps 1–6 in the design doc's cost table). The
 LLM layers consume the artifacts defined here; they are out of scope.
+
+## Naming
+
+The module that emits this AST is **dodo dna** — it sequences each variable and
+result back through its ancestors to the raw source data. "dna" is the brand and
+the user-facing CLI verb (`dodoc --dna`); the verdict layer that consumes it is
+the **Replication Verifier** product. *Lineage* and *provenance* are the
+underlying technical concepts (and the PROV-O serialization vocabulary), used in
+this doc and the code, but never on the buyer-facing surface — the audience
+doesn't speak that language.
 
 ---
 
@@ -77,13 +87,13 @@ All three are derivable in one pass; none requires data.
 
 ```
                      ┌─────────────────────────────────────┐
-                     │   dodoc --emit-ast / --lineage       │
+                     │   dodoc --dna                        │
    .do file(s) ────► │   (existing parse, instrumented)     │
                      └───────────────┬─────────────────────┘
                                      │
         ┌────────────────────────────┼────────────────────────────┐
         ▼                            ▼                            ▼
-  ① lineage.jsonl            ② symbols.jsonl              ③ clean.sql
+  ① dna.jsonl                ② symbols.jsonl              ③ clean.sql
   (one node per stmt,        (one row per symbol,          (88% data-transform
    the AST proper)            the resolved env)             commands, already
                                                             emitted today)
@@ -304,14 +314,16 @@ the command level.
 The CLI is the natural driver (`src/cli/dodoc.cpp`). Add flags alongside
 `--annotate`:
 
-- `--lineage[=FILE]`   → write artifact ① (JSONL).
-- `--symbols[=FILE]`   → write artifact ②.
-- `--emit-ast`         → both, plus tag CTEs in ③ with `sql_ref`.
+- `--dna[=DIR]`        → emit the full dodo dna bundle: artifacts ① + ②, and
+                         tag CTEs in ③ with `sql_ref`. This is the headline verb.
+- `--symbols[=FILE]`   → artifact ② only.
+- `--lineage[=FILE]`   → artifact ① only; quiet alias for tooling that wants just
+                         the AST stream. Not advertised to end users.
 
 Implementation: after `ProcessLines` returns, `state.lineage` and
 `state.frame_vars` are fully populated; serialize them. SQL emission
 (`dodoc.cpp:131`) is unchanged except for the `sql_ref` CTE tags. The extension
-build can expose the same via a `dodo_lineage()` table function later, but the
+build can expose the same via a `dodo_dna()` table function later, but the
 **CLI is sufficient for the product** — the verifier runs as a batch tool over a
 replication package, not interactively.
 
