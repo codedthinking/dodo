@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -10,6 +11,59 @@
 #include <vector>
 
 namespace dodo {
+
+//===--------------------------------------------------------------------===//
+// Loc — source location (script name + line number)
+//===--------------------------------------------------------------------===//
+struct Loc {
+	std::string script;
+	int line = 0;
+};
+
+//===--------------------------------------------------------------------===//
+// Lineage AST — structured facts emitted by the compiler
+//===--------------------------------------------------------------------===//
+enum class Certainty { RESOLVED, ABBREV, UNKNOWN };
+
+enum class Verb { LOAD, MERGE, ASSIGN, SCALAR, FILTER, REORDER, LAG, BYOP, EMIT };
+
+struct LineageNode {
+	Verb verb;
+	Loc loc;
+	Certainty cert = Certainty::RESOLVED;
+	std::vector<std::string> targets;    //! frame.var | scalar | RS#N | >file
+	std::vector<std::string> sources;
+	std::string rowset_in;               //! RS#N consumed (across-row ops)
+	std::string rowset_out;              //! RS#N produced (new version)
+	std::string expression;              //! raw, pre-expansion text
+	std::string sql_ref;                 //! CTE step name (links to clean SQL)
+	std::map<std::string, std::string> payload;  //! verb-specific structured data
+	std::vector<std::string> warnings;
+};
+
+//===--------------------------------------------------------------------===//
+// VarSymbol — column-level symbol table entry
+//===--------------------------------------------------------------------===//
+enum class DtypeCert { KNOWN, INFERRED, UNKNOWN, CONFLICT };
+
+struct VarSymbol {
+	std::string frame;
+	std::string name;
+	std::string dtype;
+	DtypeCert dtype_cert = DtypeCert::UNKNOWN;
+	std::string note;
+	Loc declared;
+	Loc first_seen;
+};
+
+//===--------------------------------------------------------------------===//
+// ExpandResult — macro expansion with certainty tracking
+//===--------------------------------------------------------------------===//
+struct ExpandResult {
+	std::string text;
+	Certainty certainty = Certainty::RESOLVED;
+	std::vector<std::string> unresolved;  //! macro names not found
+};
 
 //===--------------------------------------------------------------------===//
 // SymbolEntry — unified symbol table entry (LITERAL text or VARIABLE ref)
@@ -31,6 +85,7 @@ struct DodoCommand {
 	std::string options;
 	std::string bysort_partition; // PARTITION BY vars, comma-separated
 	std::string bysort_order;     // ORDER BY vars, comma-separated
+	Loc loc;                      // source location (script:line)
 };
 
 //===--------------------------------------------------------------------===//
@@ -81,6 +136,12 @@ struct DodoState {
 	std::string panel_var; // empty if pure time-series
 	std::string time_var;  // empty if not set
 
+	//! Lineage AST — accumulated nodes and symbol table
+	std::vector<LineageNode> lineage;
+	std::map<std::string, VarSymbol> frame_vars;  //! key "frame.var"
+	int rowset_version = 0;                       //! RS#N, distinct from step_counter
+	std::string current_script;                   //! set by CLI / do handler
+
 	//! Whether dodo._current table exists (materialized use)
 	bool materialized = false;
 
@@ -118,6 +179,31 @@ struct DodoState {
 		step_counter++;
 		// New step invalidates redo history
 		redo_stack.clear();
+	}
+
+	//! Emit a lineage node
+	void EmitNode(Verb verb, const Loc &loc, const std::vector<std::string> &targets,
+	              const std::vector<std::string> &sources, const std::string &expression,
+	              const std::string &sql_ref = "") {
+		LineageNode node;
+		node.verb = verb;
+		node.loc = loc;
+		node.targets = targets;
+		node.sources = sources;
+		node.expression = expression;
+		node.sql_ref = sql_ref.empty() ? LatestStep() : sql_ref;
+		lineage.push_back(std::move(node));
+	}
+
+	//! Bump rowset version (only on sort/merge/filter/collapse/append/reshape)
+	std::string BumpRowset(const Loc &loc) {
+		rowset_version++;
+		return "RS#" + std::to_string(rowset_version);
+	}
+
+	//! Current rowset identifier
+	std::string CurrentRowset() const {
+		return rowset_version > 0 ? "RS#" + std::to_string(rowset_version) : "";
 	}
 
 	//! Build WITH ... AS ... prefix (defined in .cpp for formatting support)
@@ -158,6 +244,10 @@ struct DodoState {
 		preserve_checkpoint = -1;
 		preserve_step_counter = -1;
 		materialized = false;
+		// Lineage resets with data
+		lineage.clear();
+		frame_vars.clear();
+		rowset_version = 0;
 	}
 
 	//! Full reset: also clears macros, scalars, and tempnames
@@ -202,6 +292,9 @@ std::string TranslateExpression(const std::string &expr, const std::string &by_c
 
 //! Expand Stata macros in text: `name' for locals, $name/${name} for globals, scalar(name)
 std::string ExpandMacros(const std::string &text, const DodoState &state);
+
+//! Expand macros with certainty tracking (records unresolved macros)
+ExpandResult ExpandMacrosTracked(const std::string &text, const DodoState &state);
 
 //! Evaluate a simple numeric expression (for local x = expr, scalar x = expr)
 double EvaluateSimpleExpr(const std::string &expr);

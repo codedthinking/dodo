@@ -1643,6 +1643,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		state.current_source = cmd.arguments;
 
+		// Emit lineage: load creates a new rowset
+		string rs = state.BumpRowset(cmd.loc);
+		LineageNode node;
+		node.verb = Verb::LOAD;
+		node.loc = cmd.loc;
+		node.targets = {"main"};
+		node.sources = {source};
+		node.rowset_out = rs;
+		node.expression = state.pending_command;
+		node.sql_ref = state.LatestStep();
+		state.lineage.push_back(std::move(node));
+
 		// Extract variable labels from .dta files
 		if (str::EndsWith(str::Lower(source), ".dta")) {
 			try {
@@ -1965,6 +1977,21 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			state.AddStep("SELECT * FROM read_csv('" + filename + "')");
 		}
 		state.current_source = filename;
+
+		// Emit lineage: import creates a new rowset
+		{
+			string rs = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::LOAD;
+			node.loc = cmd.loc;
+			node.targets = {"main"};
+			node.sources = {filename};
+			node.rowset_out = rs;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
+
 		result_sql += "SELECT 'OK' AS status";
 		return pre_cleanup + result_sql;
 	}
@@ -2484,6 +2511,19 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			throw DodoException("Invalid 'keep' syntax");
 		}
+		// keep if = filter (new rowset); keep varlist = column selection (no new rowset)
+		if (!cmd.condition.empty()) {
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::FILTER;
+			node.loc = cmd.loc;
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2509,6 +2549,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			state.AddStep("SELECT * EXCLUDE (" + exclude_list + ") FROM " + prev);
 		} else {
 			throw DodoException("Invalid 'drop' syntax. Use 'drop var1 var2' or 'drop if condition'.");
+		}
+		if (!cmd.condition.empty()) {
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::FILTER;
+			node.loc = cmd.loc;
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
 		}
 		return "SELECT 'OK' AS status";
 	}
@@ -2564,7 +2616,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'generate' requires an assignment: generate varname = expression");
 		}
-		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
+		string raw_var = Trim(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(raw_var);
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -2575,6 +2628,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT *, (" + sql_expr + ") AS " + var_name + " FROM " + prev);
 		}
+		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {}, state.pending_command);
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2583,7 +2637,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'replace' requires an assignment: replace varname = expression");
 		}
-		string var_name = QuoteIdent(Trim(cmd.arguments.substr(0, eq_pos)));
+		string raw_var = Trim(cmd.arguments.substr(0, eq_pos));
+		string var_name = QuoteIdent(raw_var);
 		string expr = Trim(cmd.arguments.substr(eq_pos + 1));
 		string sql_expr = TrExpr(expr);
 
@@ -2594,6 +2649,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT * REPLACE ((" + sql_expr + ") AS " + var_name + ") FROM " + prev);
 		}
+		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {"main." + raw_var}, state.pending_command);
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2611,6 +2667,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			order_clause += QuoteIdent(Trim(vars[i])) + " " + order;
 		}
 		state.AddStep("SELECT * FROM " + prev + " ORDER BY " + order_clause);
+		{
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::REORDER;
+			node.loc = cmd.loc;
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2621,7 +2689,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (eq_pos == string::npos) {
 			throw DodoException("'egen' requires an assignment: egen varname = function(arg)");
 		}
-		string var_name = QuoteIdent(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
+		string raw_var = Trim(StripTypeQualifier(cmd.arguments.substr(0, eq_pos)));
+		string var_name = QuoteIdent(raw_var);
 		string rhs = Trim(cmd.arguments.substr(eq_pos + 1));
 
 		string func_name, func_arg;
@@ -2644,6 +2713,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT *, " + window_expr + " AS " + var_name + " FROM " + prev);
 		}
+		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {}, state.pending_command);
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2770,6 +2840,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 
 		state.AddStep(sql);
+		{
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::FILTER;  // collapse is a filtering/aggregation op
+			node.loc = cmd.loc;
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2971,6 +3053,22 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 
 		state.AddStep(join_sql);
+		{
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::MERGE;
+			node.loc = cmd.loc;
+			node.targets = {"main"};
+			node.sources = {filename};
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			node.payload["merge_type"] = merge_type;
+			node.payload["keys"] = key_vars_str;
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -3330,6 +3428,21 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string filename = ExtractQuotedString(args);
 		string read_expr = FileReadFunction(filename);
 		state.AddStep("SELECT * FROM " + prev + " UNION ALL BY NAME SELECT * FROM " + read_expr);
+		{
+			string rs_in = state.CurrentRowset();
+			string rs_out = state.BumpRowset(cmd.loc);
+			LineageNode node;
+			node.verb = Verb::MERGE;
+			node.loc = cmd.loc;
+			node.targets = {"main"};
+			node.sources = {filename};
+			node.rowset_in = rs_in;
+			node.rowset_out = rs_out;
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			node.payload["merge_type"] = "append";
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -3747,10 +3860,13 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 	string line;
 	bool in_block_comment = false;
 	string continued_line;
+	int continued_line_start = 0;  // line number of the statement head for continuations
+	int line_no = 0;
 	vector<string> side_effect_sql;
 
 	// Process a single command line (used by main loop and loop iterations)
-	auto process_command = [&](const string &trimmed) {
+	// cmd_line_no: the physical line of the statement head (for loop bodies, inherited from source)
+	auto process_command = [&](const string &trimmed, int cmd_line_no = 0) {
 		string sub_command;
 		if (!IsDodoCommand(trimmed, sub_command)) {
 			return;
@@ -3761,6 +3877,7 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 		}
 
 		auto sub_cmd = TokenizeCommand(trimmed);
+		sub_cmd.loc = {state.current_script, cmd_line_no};
 		state.pending_command = trimmed;
 		string sql = ProcessCommand(sub_cmd, state);
 
@@ -3779,8 +3896,9 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 	};
 
 	// Execute a loop body with the given variable name bound to each value
-	std::function<void(const string &, const vector<string> &, const vector<string> &)> execute_loop;
-	execute_loop = [&](const string &lname, const vector<string> &values, const vector<string> &body) {
+	// loop_line: source line of the foreach/forvalues statement (inherited by body commands)
+	std::function<void(const string &, const vector<string> &, const vector<string> &, int)> execute_loop;
+	execute_loop = [&](const string &lname, const vector<string> &values, const vector<string> &body, int loop_line) {
 		for (auto &val : values) {
 			state.local_symbols[lname] = {SymbolKind::LITERAL, val};
 			for (auto &body_line : body) {
@@ -3810,7 +3928,7 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 					// because the outer body was accumulated from the stream. Inner braces
 					// within the body lines need special handling — for now, we support
 					// single-line nested loops and multi-line via pre-accumulated body.
-					execute_loop(inner_lname, inner_values, inner_body);
+					execute_loop(inner_lname, inner_values, inner_body, loop_line);
 					continue;
 				}
 
@@ -3826,11 +3944,11 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 							inner_body.push_back(inline_body);
 						}
 					}
-					execute_loop(inner_lname, inner_values, inner_body);
+					execute_loop(inner_lname, inner_values, inner_body, loop_line);
 					continue;
 				}
 
-				process_command(expanded);
+				process_command(expanded, loop_line);
 			}
 		}
 		// Loop index variable is scoped to the loop body — erase it
@@ -3838,6 +3956,7 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 	};
 
 	while (reader(line)) {
+		line_no++;
 		string trimmed = Trim(line);
 
 		// Handle block comments /* ... */
@@ -3867,6 +3986,9 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 		idx_t comment_pos = trimmed.find("//");
 		if (comment_pos != string::npos) {
 			if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
+				if (continued_line.empty()) {
+					continued_line_start = line_no;  // record head of multi-line statement
+				}
 				continued_line += Trim(trimmed.substr(0, comment_pos)) + " ";
 				continue;
 			}
@@ -3878,10 +4000,12 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 			continue;
 		}
 
-		// Handle line continuation
+		// Handle line continuation — use the head line number
+		int stmt_line = line_no;
 		if (!continued_line.empty()) {
 			trimmed = continued_line + trimmed;
 			continued_line.clear();
+			stmt_line = continued_line_start;
 		}
 
 		if (trimmed.empty()) {
@@ -3921,7 +4045,7 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 				// Multi-line: accumulate until }
 				body = AccumulateBraceBlock(reader);
 			}
-			execute_loop(lname, values, body);
+			execute_loop(lname, values, body, stmt_line);
 			continue;
 		}
 		if (str::StartsWith(lower, "forvalues ")) {
@@ -3937,11 +4061,11 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 			} else {
 				body = AccumulateBraceBlock(reader);
 			}
-			execute_loop(lname, values, body);
+			execute_loop(lname, values, body, stmt_line);
 			continue;
 		}
 
-		process_command(trimmed);
+		process_command(trimmed, stmt_line);
 	}
 
 	return side_effect_sql;
@@ -3955,6 +4079,13 @@ vector<string> ProcessDoFile(const string &filename, DodoState &state) {
 	if (!file.is_open()) {
 		throw DodoException("Cannot open file: " + filename);
 	}
+	// Set current script name (strip path, keep basename without extension)
+	auto slash = filename.rfind('/');
+	auto dot = filename.rfind('.');
+	if (slash == string::npos) slash = 0; else slash++;
+	if (dot == string::npos || dot < slash) dot = filename.size();
+	state.current_script = filename.substr(slash, dot - slash);
+
 	string line;
 	LineReader reader = [&](string &out) -> bool {
 		if (std::getline(file, out)) {
