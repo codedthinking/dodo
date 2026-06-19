@@ -27,6 +27,87 @@ static string QuoteIdent(const string &s) {
 	return str::QuoteIdent(s);
 }
 
+// Helper: detect time-series operators (L., F., D.) in an expression.
+// Returns true if any lag/lead/difference operator is found.
+static bool HasTimeSeriesOps(const string &expr) {
+	std::regex ts_re("\\b[LFD]\\d*\\.\\w+");
+	return std::regex_search(expr, ts_re);
+}
+
+// Helper: extract variable references from a Stata expression.
+// Returns "main.var" for each bare identifier that looks like a variable reference
+// (not a function name, not a number, not a keyword).
+static vector<string> ExtractVarRefs(const string &expr) {
+	static const unordered_set<string> KEYWORDS = {
+	    "if", "in", "of", "else", "end", "not", "and", "or", "using",
+	    "NULL", "null", "true", "false", "TRUE", "FALSE"};
+	static const unordered_set<string> FUNCTIONS = {
+	    "log", "ln", "exp", "sqrt", "abs", "round", "ceil", "floor", "int",
+	    "max", "min", "mod", "sign", "sum", "mean", "sd", "count",
+	    "missing", "cond", "inrange", "inlist", "string", "real", "strlen",
+	    "substr", "strtrim", "strlower", "strupper", "strpos", "subinstr",
+	    "word", "wordcount", "regexm", "regexs", "date", "mdy", "year",
+	    "month", "day", "doy", "dow", "week", "quarter", "clock", "Cdhms",
+	    "runiform", "rnormal", "rbinomial", "uniform", "normal",
+	    "lower", "upper", "proper", "trim", "ltrim", "rtrim",
+	    "total", "rowtotal", "rowmean", "rowsd", "rowmin", "rowmax",
+	    "rownonmiss", "rowmiss", "tag", "group", "rank"};
+
+	vector<string> refs;
+	unordered_set<string> seen;
+	idx_t i = 0;
+	while (i < expr.size()) {
+		// Skip L./F./D. prefixed vars — extract the base variable
+		if (i < expr.size() && (expr[i] == 'L' || expr[i] == 'F' || expr[i] == 'D')) {
+			idx_t start = i;
+			i++;
+			while (i < expr.size() && isdigit(expr[i])) i++;
+			if (i < expr.size() && expr[i] == '.') {
+				i++; // skip the dot
+				idx_t var_start = i;
+				while (i < expr.size() && (isalnum(expr[i]) || expr[i] == '_')) i++;
+				if (i > var_start) {
+					string var = expr.substr(var_start, i - var_start);
+					if (!seen.count(var)) {
+						seen.insert(var);
+						refs.push_back("main." + var);
+					}
+				}
+				continue;
+			}
+			// Not L./F./D. prefix, reset and fall through to normal identifier parsing
+			i = start;
+		}
+
+		if (isalpha(expr[i]) || expr[i] == '_') {
+			idx_t start = i;
+			while (i < expr.size() && (isalnum(expr[i]) || expr[i] == '_')) i++;
+			string token = expr.substr(start, i - start);
+			// Skip if followed by '(' — it's a function call
+			idx_t j = i;
+			while (j < expr.size() && expr[j] == ' ') j++;
+			if (j < expr.size() && expr[j] == '(') {
+				i = j;
+				continue;
+			}
+			// Skip keywords and Stata special vars
+			if (KEYWORDS.count(token)) continue;
+			if (token == "_n" || token == "_N" || token == "_b" || token == "_se" ||
+			    token == "_cons" || token == "_rc" || token == "_pi") continue;
+			// Skip type qualifiers
+			if (token == "byte" || token == "int" || token == "long" || token == "float" ||
+			    token == "double" || token == "str" || token == "strL") continue;
+			if (!seen.count(token)) {
+				seen.insert(token);
+				refs.push_back("main." + token);
+			}
+		} else {
+			i++;
+		}
+	}
+	return refs;
+}
+
 //===--------------------------------------------------------------------===//
 // SQL Formatting
 //===--------------------------------------------------------------------===//
@@ -839,7 +920,13 @@ const vector<string> DODO_COMMANDS = {
     "import",    "merge",      "tempfile", "preserve", "restore",    "xtset",      "tsset",
     "bysort",    "by",         "undo",     "redo",     "history",    "show",       "local",
     "global",    "scalar",     "macro",    "display",  "foreach",    "forvalues",  "tempvar",
-    "tempname", "assert", "compress", "levelsof"};
+    "tempname",  "assert",     "compress", "levelsof",
+    // Statistical/estimation commands — emit lineage only, no SQL transformation
+    "regress",   "logit",      "probit",   "ivregress", "reghdfe",
+    "areg",      "xtreg",      "xtlogit",  "xtprobit",
+    "tobit",     "heckman",    "poisson",  "nbreg",
+    "ologit",    "oprobit",    "mlogit",
+    "eststo",    "estimates",  "esttab",   "outreg2"};
 
 // Command classification for do-file execution
 // Transformation: modifies the CTE chain state
@@ -863,6 +950,45 @@ bool IsTransformationCommand(const string &command) {
 // Side-effect commands that produce SQL beyond state updates — must be executed in do-files
 bool IsSideEffectCommand(const string &command) {
 	return command == "export" || command == "save";
+}
+
+// Statistical/estimation commands that produce EMIT lineage nodes
+static bool IsEstimationCommand(const string &command) {
+	static const vector<string> ESTIMATION = {
+	    "regress", "logit", "probit", "ivregress", "reghdfe",
+	    "areg", "xtreg", "xtlogit", "xtprobit",
+	    "tobit", "heckman", "poisson", "nbreg",
+	    "ologit", "oprobit", "mlogit"};
+	for (auto &c : ESTIMATION) {
+		if (command == c) return true;
+	}
+	return false;
+}
+
+// Output/table commands — also emit nodes but with different semantics
+static bool IsOutputCommand(const string &command) {
+	return command == "eststo" || command == "estimates" || command == "esttab" || command == "outreg2";
+}
+
+// Map estimation command to estimator name for payload
+static string EstimatorName(const string &command) {
+	if (command == "regress") return "ols";
+	if (command == "logit") return "logit";
+	if (command == "probit") return "probit";
+	if (command == "ivregress") return "iv";
+	if (command == "reghdfe") return "reghdfe";
+	if (command == "areg") return "areg";
+	if (command == "xtreg") return "xtreg";
+	if (command == "xtlogit") return "xtlogit";
+	if (command == "xtprobit") return "xtprobit";
+	if (command == "tobit") return "tobit";
+	if (command == "heckman") return "heckman";
+	if (command == "poisson") return "poisson";
+	if (command == "nbreg") return "nbreg";
+	if (command == "ologit") return "ologit";
+	if (command == "oprobit") return "oprobit";
+	if (command == "mlogit") return "mlogit";
+	return command;
 }
 
 bool IsDodoCommand(const string &query, string &command_out) {
@@ -1609,6 +1735,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		auto inner_cmd = TokenizeCommand(inner_cmd_str);
 		inner_cmd.bysort_partition = partition_cols;
 		inner_cmd.bysort_order = order_cols;
+		inner_cmd.loc = cmd.loc;
+
+		// Emit BYOP lineage node for the by-prefix
+		{
+			LineageNode node;
+			node.verb = Verb::BYOP;
+			node.loc = cmd.loc;
+			node.rowset_in = state.CurrentRowset();
+			node.expression = state.pending_command;
+			node.payload["by"] = group_vars_str;
+			state.lineage.push_back(std::move(node));
+		}
 
 		// For generate with bysort: if the expression uses aggregate functions
 		// like sum(), they become running aggregates with ORDER BY
@@ -2322,6 +2460,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		// Check for string scalar
 		if (expr.size() >= 2 && expr.front() == '"' && expr.back() == '"') {
 			state.scalar_symbols[name] = {SymbolKind::LITERAL, expr.substr(1, expr.size() - 2)};
+			state.EmitNode(Verb::SCALAR, cmd.loc, {"scalar." + name}, {}, state.pending_command);
 			return "SELECT 'OK' AS status";
 		}
 
@@ -2345,6 +2484,17 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			string uname = DodoState::GenerateUname("s", name);
 			state.scalar_symbols[name] = {SymbolKind::VARIABLE, uname};
 			state.pending_sql.push_back(BuildSetVariableSQL(uname, expr, state));
+		}
+		// Emit SCALAR lineage node
+		{
+			auto sources = ExtractVarRefs(expr);
+			LineageNode node;
+			node.verb = Verb::SCALAR;
+			node.loc = cmd.loc;
+			node.targets = {"scalar." + name};
+			node.sources = std::move(sources);
+			node.expression = state.pending_command;
+			state.lineage.push_back(std::move(node));
 		}
 		return "SELECT 'OK' AS status";
 	}
@@ -2628,7 +2778,30 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT *, (" + sql_expr + ") AS " + var_name + " FROM " + prev);
 		}
-		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {}, state.pending_command);
+		{
+			auto sources = ExtractVarRefs(expr);
+			LineageNode node;
+			node.verb = Verb::ASSIGN;
+			node.loc = cmd.loc;
+			node.targets = {"main." + raw_var};
+			node.sources = std::move(sources);
+			node.rowset_in = state.CurrentRowset();
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
+		// Emit LAG node if expression uses time-series operators
+		if (HasTimeSeriesOps(expr)) {
+			LineageNode lag_node;
+			lag_node.verb = Verb::LAG;
+			lag_node.loc = cmd.loc;
+			lag_node.targets = {"main." + raw_var};
+			lag_node.sources = ExtractVarRefs(expr);
+			lag_node.rowset_in = state.CurrentRowset();
+			lag_node.expression = state.pending_command;
+			lag_node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(lag_node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2649,7 +2822,36 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT * REPLACE ((" + sql_expr + ") AS " + var_name + ") FROM " + prev);
 		}
-		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {"main." + raw_var}, state.pending_command);
+		{
+			auto sources = ExtractVarRefs(expr);
+			// For replace, the target variable is also a source (it's being modified)
+			bool has_self = false;
+			for (auto &s : sources) {
+				if (s == "main." + raw_var) { has_self = true; break; }
+			}
+			if (!has_self) sources.insert(sources.begin(), "main." + raw_var);
+			LineageNode node;
+			node.verb = Verb::ASSIGN;
+			node.loc = cmd.loc;
+			node.targets = {"main." + raw_var};
+			node.sources = std::move(sources);
+			node.rowset_in = state.CurrentRowset();
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
+		// Emit LAG node if expression uses time-series operators
+		if (HasTimeSeriesOps(expr)) {
+			LineageNode lag_node;
+			lag_node.verb = Verb::LAG;
+			lag_node.loc = cmd.loc;
+			lag_node.targets = {"main." + raw_var};
+			lag_node.sources = ExtractVarRefs(expr);
+			lag_node.rowset_in = state.CurrentRowset();
+			lag_node.expression = state.pending_command;
+			lag_node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(lag_node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -2713,7 +2915,18 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		} else {
 			state.AddStep("SELECT *, " + window_expr + " AS " + var_name + " FROM " + prev);
 		}
-		state.EmitNode(Verb::ASSIGN, cmd.loc, {"main." + raw_var}, {}, state.pending_command);
+		{
+			auto sources = ExtractVarRefs(func_arg);
+			LineageNode node;
+			node.verb = Verb::ASSIGN;
+			node.loc = cmd.loc;
+			node.targets = {"main." + raw_var};
+			node.sources = std::move(sources);
+			node.rowset_in = state.CurrentRowset();
+			node.expression = state.pending_command;
+			node.sql_ref = state.LatestStep();
+			state.lineage.push_back(std::move(node));
+		}
 		return "SELECT 'OK' AS status";
 	}
 
@@ -3641,6 +3854,159 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	}
 
 	if (cmd.command == "compress") {
+		return "SELECT 'OK' AS status";
+	}
+
+	// Statistical/estimation commands — emit EMIT lineage node, no SQL transformation
+	if (IsEstimationCommand(cmd.command)) {
+		// Parse: command depvar [regressors] [if cond], [options]
+		// Example: regress lnwage edu exp, vce(cluster firmid)
+		//          ivregress 2sls depvar (endogvar = instrument) exogvar, vce(robust)
+		string args = Trim(cmd.arguments);
+		vector<string> tokens;
+		{
+			// Split arguments on whitespace, but respect parenthesized groups
+			idx_t i = 0;
+			while (i < args.size()) {
+				while (i < args.size() && args[i] == ' ') i++;
+				if (i >= args.size()) break;
+				if (args[i] == '(') {
+					// Parenthesized group — include as one token
+					idx_t start = i;
+					int depth = 1;
+					i++;
+					while (i < args.size() && depth > 0) {
+						if (args[i] == '(') depth++;
+						else if (args[i] == ')') depth--;
+						i++;
+					}
+					tokens.push_back(args.substr(start, i - start));
+				} else {
+					idx_t start = i;
+					while (i < args.size() && args[i] != ' ') i++;
+					tokens.push_back(args.substr(start, i - start));
+				}
+			}
+		}
+
+		// For ivregress, first token is sub-type (2sls, liml, gmm)
+		string estimator = EstimatorName(cmd.command);
+		idx_t var_start = 0;
+		if (cmd.command == "ivregress" && !tokens.empty()) {
+			string sub = str::Lower(tokens[0]);
+			if (sub == "2sls" || sub == "liml" || sub == "gmm") {
+				estimator = "iv_" + sub;
+				var_start = 1;
+			}
+		}
+
+		string depvar;
+		vector<string> regressors;
+		vector<string> all_sources;
+
+		if (var_start < tokens.size()) {
+			depvar = tokens[var_start];
+			all_sources.push_back("main." + depvar);
+		}
+		for (idx_t i = var_start + 1; i < tokens.size(); i++) {
+			string tok = tokens[i];
+			if (tok.front() == '(') {
+				// Parenthesized group for IV: (endogvar = instrument)
+				string inner = tok.substr(1, tok.size() - 2);
+				auto parts = str::Split(inner, ' ');
+				for (auto &p : parts) {
+					string pt = Trim(p);
+					if (pt != "=" && !pt.empty()) {
+						regressors.push_back(pt);
+						all_sources.push_back("main." + pt);
+					}
+				}
+			} else {
+				regressors.push_back(tok);
+				all_sources.push_back("main." + tok);
+			}
+		}
+
+		// Build the EMIT node
+		LineageNode node;
+		node.verb = Verb::EMIT;
+		node.loc = cmd.loc;
+		node.targets = {">output"};
+		node.sources = all_sources;
+		node.rowset_in = state.CurrentRowset();
+		node.expression = state.pending_command;
+		node.payload["estimator"] = estimator;
+		if (!depvar.empty()) {
+			node.payload["depvar"] = "main." + depvar;
+		}
+		if (!regressors.empty()) {
+			string reg_str;
+			for (idx_t i = 0; i < regressors.size(); i++) {
+				if (i > 0) reg_str += " ";
+				reg_str += "main." + regressors[i];
+			}
+			node.payload["regressors"] = reg_str;
+		}
+
+		// Parse VCE from options
+		if (!cmd.options.empty()) {
+			string opts_lower = str::Lower(cmd.options);
+			idx_t vce_pos = opts_lower.find("vce(");
+			if (vce_pos != string::npos) {
+				idx_t start = vce_pos + 4;
+				idx_t end = cmd.options.find(')', start);
+				if (end != string::npos) {
+					string vce_content = Trim(cmd.options.substr(start, end - start));
+					// Parse "cluster varname" or "robust" etc.
+					auto vce_parts = str::Split(vce_content, ' ');
+					if (!vce_parts.empty()) {
+						string vce_type = Trim(vce_parts[0]);
+						if (vce_parts.size() > 1) {
+							string vce_var = Trim(vce_parts[1]);
+							node.payload["vce"] = vce_type + " main." + vce_var;
+						} else {
+							node.payload["vce"] = vce_type;
+						}
+					}
+				}
+			}
+
+			// Parse absorb() for reghdfe
+			idx_t abs_pos = opts_lower.find("absorb(");
+			if (abs_pos != string::npos) {
+				idx_t start = abs_pos + 7;
+				idx_t end = cmd.options.find(')', start);
+				if (end != string::npos) {
+					string absorb_content = Trim(cmd.options.substr(start, end - start));
+					auto abs_vars = str::Split(absorb_content, ' ');
+					string abs_str;
+					for (idx_t i = 0; i < abs_vars.size(); i++) {
+						if (i > 0) abs_str += " ";
+						abs_str += "main." + Trim(abs_vars[i]);
+					}
+					node.payload["absorb"] = abs_str;
+				}
+			}
+
+			// Parse robust shorthand
+			if (opts_lower.find("robust") != string::npos && node.payload.find("vce") == node.payload.end()) {
+				node.payload["vce"] = "robust";
+			}
+		}
+
+		state.lineage.push_back(std::move(node));
+		return "SELECT 'OK' AS status";
+	}
+
+	// Output/table commands — emit lineage-only, no SQL
+	if (IsOutputCommand(cmd.command)) {
+		LineageNode node;
+		node.verb = Verb::EMIT;
+		node.loc = cmd.loc;
+		node.targets = {">output"};
+		node.expression = state.pending_command;
+		node.payload["output_command"] = cmd.command;
+		state.lineage.push_back(std::move(node));
 		return "SELECT 'OK' AS status";
 	}
 
