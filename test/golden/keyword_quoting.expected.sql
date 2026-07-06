@@ -6,15 +6,10 @@ WITH
     SELECT *
     FROM dodo._current
   ),
-  -- [source] generate v1 = 1*
+  -- [source] keep pivot lateral qualify
   _s1 AS (
-    SELECT *, (1*) AS v1
+    SELECT "pivot", "lateral", "qualify"
     FROM _s0
-  ),
-  -- [source] generate v2 = 2*
-  _s2 AS (
-    SELECT *, (2*) AS v2
-    FROM _s1
   )
 SELECT *
-FROM _s2;
+FROM _s1;

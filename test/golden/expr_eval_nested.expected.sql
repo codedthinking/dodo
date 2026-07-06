@@ -1,0 +1,1 @@
+SELECT CAST(7 AS VARCHAR) AS display;

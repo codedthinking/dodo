@@ -219,6 +219,25 @@ inline bool IsSQLKeyword(const std::string &s) {
 	    "window",
 	    "with",
 	    "without",
+	    // DuckDB-specific reserved words not in the base (SQLite-derived) list above
+	    "anti",
+	    "asof",
+	    "columns",
+	    "describe",
+	    "fetch",
+	    "grouping",
+	    "install",
+	    "interval",
+	    "lateral",
+	    "load",
+	    "macro",
+	    "pivot",
+	    "positional",
+	    "qualify",
+	    "semi",
+	    "show",
+	    "summarize",
+	    "unpivot",
 	};
 	return KEYWORDS.count(Lower(s)) > 0;
 }

@@ -390,33 +390,33 @@ static vector<ExprToken> TokenizeExpr(const string &expr) {
 	return tokens;
 }
 
-// Recursive descent parser for simple arithmetic
-static idx_t expr_pos;
-static double ParseExprAddSub(const vector<ExprToken> &tokens);
+// Recursive descent parser for simple arithmetic. The cursor `pos` is threaded
+// through every function (no file-scope state) so evaluation is re-entrant.
+static double ParseExprAddSub(const vector<ExprToken> &tokens, idx_t &pos);
 
-static double ParseExprAtom(const vector<ExprToken> &tokens) {
-	auto &tok = tokens[expr_pos];
+static double ParseExprAtom(const vector<ExprToken> &tokens, idx_t &pos) {
+	auto &tok = tokens[pos];
 	if (tok.type == ExprToken::NUMBER) {
-		expr_pos++;
+		pos++;
 		return tok.value;
 	}
 	if (tok.type == ExprToken::OP && tok.op == 'n') {
 		// Unary negate
-		expr_pos++;
-		return -ParseExprAtom(tokens);
+		pos++;
+		return -ParseExprAtom(tokens, pos);
 	}
 	if (tok.type == ExprToken::FUNC) {
 		string fname = str::Lower(tok.func_name);
-		expr_pos++; // skip func name
-		if (tokens[expr_pos].type != ExprToken::LPAREN) {
+		pos++; // skip func name
+		if (tokens[pos].type != ExprToken::LPAREN) {
 			throw DodoException("Expected '(' after function " + fname);
 		}
-		expr_pos++; // skip (
-		double arg = ParseExprAddSub(tokens);
-		if (tokens[expr_pos].type != ExprToken::RPAREN) {
+		pos++; // skip (
+		double arg = ParseExprAddSub(tokens, pos);
+		if (tokens[pos].type != ExprToken::RPAREN) {
 			throw DodoException("Expected ')' after function argument");
 		}
-		expr_pos++; // skip )
+		pos++; // skip )
 		if (fname == "int" || fname == "floor") {
 			return std::floor(arg);
 		} else if (fname == "ceil") {
@@ -435,24 +435,24 @@ static double ParseExprAtom(const vector<ExprToken> &tokens) {
 		throw DodoException("Unknown function in expression: " + fname);
 	}
 	if (tok.type == ExprToken::LPAREN) {
-		expr_pos++; // skip (
-		double val = ParseExprAddSub(tokens);
-		if (tokens[expr_pos].type != ExprToken::RPAREN) {
+		pos++; // skip (
+		double val = ParseExprAddSub(tokens, pos);
+		if (tokens[pos].type != ExprToken::RPAREN) {
 			throw DodoException("Mismatched parentheses in expression");
 		}
-		expr_pos++; // skip )
+		pos++; // skip )
 		return val;
 	}
 	throw DodoException("Unexpected token in expression");
 }
 
-static double ParseExprMulDiv(const vector<ExprToken> &tokens) {
-	double left = ParseExprAtom(tokens);
-	while (tokens[expr_pos].type == ExprToken::OP &&
-	       (tokens[expr_pos].op == '*' || tokens[expr_pos].op == '/' || tokens[expr_pos].op == '%')) {
-		char op = tokens[expr_pos].op;
-		expr_pos++;
-		double right = ParseExprAtom(tokens);
+static double ParseExprMulDiv(const vector<ExprToken> &tokens, idx_t &pos) {
+	double left = ParseExprAtom(tokens, pos);
+	while (tokens[pos].type == ExprToken::OP &&
+	       (tokens[pos].op == '*' || tokens[pos].op == '/' || tokens[pos].op == '%')) {
+		char op = tokens[pos].op;
+		pos++;
+		double right = ParseExprAtom(tokens, pos);
 		if (op == '*') {
 			left *= right;
 		} else if (op == '/') {
@@ -467,13 +467,12 @@ static double ParseExprMulDiv(const vector<ExprToken> &tokens) {
 	return left;
 }
 
-static double ParseExprAddSub(const vector<ExprToken> &tokens) {
-	double left = ParseExprMulDiv(tokens);
-	while (tokens[expr_pos].type == ExprToken::OP &&
-	       (tokens[expr_pos].op == '+' || tokens[expr_pos].op == '-')) {
-		char op = tokens[expr_pos].op;
-		expr_pos++;
-		double right = ParseExprMulDiv(tokens);
+static double ParseExprAddSub(const vector<ExprToken> &tokens, idx_t &pos) {
+	double left = ParseExprMulDiv(tokens, pos);
+	while (tokens[pos].type == ExprToken::OP && (tokens[pos].op == '+' || tokens[pos].op == '-')) {
+		char op = tokens[pos].op;
+		pos++;
+		double right = ParseExprMulDiv(tokens, pos);
 		if (op == '+') {
 			left += right;
 		} else {
@@ -485,9 +484,9 @@ static double ParseExprAddSub(const vector<ExprToken> &tokens) {
 
 double EvaluateSimpleExpr(const string &expr) {
 	auto tokens = TokenizeExpr(Trim(expr));
-	expr_pos = 0;
-	double result = ParseExprAddSub(tokens);
-	if (tokens[expr_pos].type != ExprToken::END) {
+	idx_t pos = 0;
+	double result = ParseExprAddSub(tokens, pos);
+	if (tokens[pos].type != ExprToken::END) {
 		throw DodoException("Unexpected trailing content in expression: " + expr);
 	}
 	return result;
@@ -2519,21 +2518,26 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				}
 				// Silently skip the format spec for now
 			} else {
-				// Bare expression token — collect until next quoted string or whitespace
-				// but respect parentheses (e.g. getvariable('name'))
+				// Bare expression: accumulate across spaces and operators (so `1 + 1`
+				// is one expression, not three) until a quoted string or a
+				// whitespace-separated %format spec at paren depth 0.
 				size_t start = i;
 				int paren_depth = 0;
 				while (i < args.size()) {
-					if (args[i] == '(') {
+					char c = args[i];
+					if (c == '(') {
 						paren_depth++;
-					} else if (args[i] == ')') {
-						paren_depth--;
-						if (paren_depth <= 0) {
-							i++;
+					} else if (c == ')') {
+						if (paren_depth > 0) {
+							paren_depth--;
+						}
+					} else if (paren_depth == 0) {
+						if (c == '"') {
 							break;
 						}
-					} else if (paren_depth == 0 && (args[i] == ' ' || args[i] == '"')) {
-						break;
+						if (c == '%' && i > start && args[i - 1] == ' ') {
+							break;
+						}
 					}
 					i++;
 				}
@@ -3881,50 +3885,50 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 	execute_loop = [&](const string &lname, const vector<string> &values, const vector<string> &body) {
 		for (auto &val : values) {
 			state.local_symbols[lname] = {SymbolKind::LITERAL, val};
-			for (auto &body_line : body) {
-				// Expand macros in body line
-				string expanded = ExpandMacros(body_line, state);
+			for (idx_t bi = 0; bi < body.size(); bi++) {
+				// Expand macros in the (header) body line. Inner loop *bodies* are
+				// consumed raw below and expanded inside the recursive call, once all
+				// enclosing loop variables are bound.
+				string expanded = ExpandMacros(body[bi], state);
 				if (expanded.empty()) {
 					continue;
 				}
 
 				string lower = str::Lower(expanded);
+				bool is_foreach = str::StartsWith(lower, "foreach ");
+				bool is_forvalues = str::StartsWith(lower, "forvalues ");
 
-				// Nested foreach
-				if (str::StartsWith(lower, "foreach ")) {
-					auto [inner_lname, inner_values] = ParseForeachHeader(expanded, state);
-					// Check if body is on same line (single-line loop)
+				if (is_foreach || is_forvalues) {
 					idx_t brace = expanded.find('{');
-					idx_t close = expanded.find('}');
+					idx_t close = expanded.rfind('}');
 					vector<string> inner_body;
-					if (brace != string::npos && close != string::npos && close > brace) {
-						// Single-line: foreach x in a b { cmd }
+					if (brace != string::npos && close != string::npos && close > brace + 1) {
+						// Single-line nested loop: foreach x in a b { cmd }
 						string inline_body = Trim(expanded.substr(brace + 1, close - brace - 1));
 						if (!inline_body.empty()) {
 							inner_body.push_back(inline_body);
 						}
+					} else {
+						// Multi-line nested loop: accumulate the following body lines
+						// until the braces balance (raises on an unterminated block).
+						idx_t ai = bi + 1;
+						LineReader inner_reader = [&](string &out) -> bool {
+							if (ai < body.size()) {
+								out = body[ai++];
+								return true;
+							}
+							return false;
+						};
+						inner_body = AccumulateBraceBlock(inner_reader);
+						bi = ai - 1; // skip lines consumed by the inner block
 					}
-					// Note: nested multi-line loops within a loop body are already accumulated
-					// because the outer body was accumulated from the stream. Inner braces
-					// within the body lines need special handling — for now, we support
-					// single-line nested loops and multi-line via pre-accumulated body.
-					execute_loop(inner_lname, inner_values, inner_body);
-					continue;
-				}
-
-				// Nested forvalues
-				if (str::StartsWith(lower, "forvalues ")) {
-					auto [inner_lname, inner_values] = ParseForvaluesHeader(expanded);
-					idx_t brace = expanded.find('{');
-					idx_t close = expanded.find('}');
-					vector<string> inner_body;
-					if (brace != string::npos && close != string::npos && close > brace) {
-						string inline_body = Trim(expanded.substr(brace + 1, close - brace - 1));
-						if (!inline_body.empty()) {
-							inner_body.push_back(inline_body);
-						}
+					if (is_foreach) {
+						auto [inner_lname, inner_values] = ParseForeachHeader(expanded, state);
+						execute_loop(inner_lname, inner_values, inner_body);
+					} else {
+						auto [inner_lname, inner_values] = ParseForvaluesHeader(expanded);
+						execute_loop(inner_lname, inner_values, inner_body);
 					}
-					execute_loop(inner_lname, inner_values, inner_body);
 					continue;
 				}
 
