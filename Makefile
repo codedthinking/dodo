@@ -9,8 +9,8 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # ---- dodoc standalone CLI (no DuckDB dependency) ----
 DODOC_BUILD_DIR := build/dodoc
-DODOC_SOURCES := src/cli/dodoc.cpp src/core/dodo_core.cpp duckdb-dta/src/dta_reader.cpp
-DODOC_HEADERS := src/core/dodo_core.hpp src/core/string_utils.hpp duckdb-dta/src/include/dta_reader.hpp
+DODOC_SOURCES := src/cli/dodoc.cpp src/core/dodo_core.cpp src/core/do_lexer.cpp duckdb-dta/src/dta_reader.cpp
+DODOC_HEADERS := src/core/dodo_core.hpp src/core/string_utils.hpp src/core/do_lexer.hpp duckdb-dta/src/include/dta_reader.hpp
 CXX ?= c++
 CXXFLAGS ?= -O2 -std=c++17
 
@@ -28,9 +28,18 @@ dodoc-install: dodoc
 dodoc-clean:
 	rm -rf $(DODOC_BUILD_DIR)
 
+# ---- Unit tests for the do_lexer module ----
+.PHONY: test-lexer
+test-lexer: $(DODOC_BUILD_DIR)/lexer_test
+	$(DODOC_BUILD_DIR)/lexer_test
+
+$(DODOC_BUILD_DIR)/lexer_test: test/unit/lexer_test.cpp src/core/do_lexer.cpp src/core/do_lexer.hpp src/core/string_utils.hpp
+	@mkdir -p $(DODOC_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -Isrc/core -o $@ test/unit/lexer_test.cpp src/core/do_lexer.cpp
+
 # ---- Golden-SQL regression tests for the core (no DuckDB build required) ----
 .PHONY: test-core test-core-update
-test-core: dodoc
+test-core: test-lexer dodoc
 	DODOC=$(DODOC_BUILD_DIR)/dodoc bash test/golden/run_golden.sh
 
 test-core-update: dodoc

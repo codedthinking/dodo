@@ -22,6 +22,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/extension ${CMAKE_CURRENT_SO
 set(EXTENSION_SOURCES
     src/extension/dodo_extension.cpp
     src/core/dodo_core.cpp
+    src/core/do_lexer.cpp
     duckdb-dta/src/dta_reader.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -38,7 +39,7 @@ install(
 # the distributable extension and its toolchain flags do not apply there. The
 # Makefile builds it independently for local/dev use.
 if(NOT EMSCRIPTEN AND NOT MINGW)
-  add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
+  add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp src/core/do_lexer.cpp
                  duckdb-dta/src/dta_reader.cpp)
   target_include_directories(dodoc PRIVATE src/core duckdb-dta/src/include)
   target_compile_features(dodoc PRIVATE cxx_std_17)

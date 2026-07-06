@@ -6,10 +6,15 @@ WITH
     SELECT *
     FROM dodo._current
   ),
-  -- [source] generate doubled = 5 * 2
+  -- [source] generate paid = "amount in USD"
   _s1 AS (
-    SELECT *, (5 * 2) AS doubled
+    SELECT *, ('amount in USD') AS paid
     FROM _s0
+  ),
+  -- [source] generate note = "region is here"
+  _s2 AS (
+    SELECT *, ('region is here') AS note
+    FROM _s1
   )
 SELECT *
-FROM _s1;
+FROM _s2;

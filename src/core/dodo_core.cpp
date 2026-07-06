@@ -1,4 +1,5 @@
 #include "dodo_core.hpp"
+#include "do_lexer.hpp"
 #include "dta_reader.hpp"
 
 #include <cmath>
@@ -784,22 +785,73 @@ string ExpandMacros(const string &text, const DodoState &state) {
 
 		result = expanded;
 
-		// Bare scalar name substitution: replace standalone identifiers
-		// that match scalar names with their resolved values
-		for (auto &[sname, entry] : state.scalar_symbols) {
-			string resolved = DodoState::ResolveSymbol(entry);
-			idx_t spos = 0;
-			while ((spos = result.find(sname, spos)) != string::npos) {
-				bool start_ok = (spos == 0 || (!isalnum(result[spos - 1]) && result[spos - 1] != '_'));
-				bool end_ok = (spos + sname.size() >= result.size() ||
-				               (!isalnum(result[spos + sname.size()]) && result[spos + sname.size()] != '_'));
-				if (start_ok && end_ok) {
-					result.replace(spos, sname.size(), resolved);
-					spos += resolved.size();
-				} else {
-					spos += sname.size();
+		// Scalar substitution: replace standalone identifiers that match scalar
+		// names, and the explicit scalar(name) form, with their resolved values.
+		// Single quote-aware pass so scalar names appearing inside string literals
+		// are NOT substituted (Stata does not substitute inside strings).
+		// NOTE (documented deviation): when a scalar and a data column share a
+		// name, dodo resolves the bare name to the scalar (Stata resolves to the
+		// column, which dodo cannot see at compile time). Use scalar(name) to be
+		// explicit. See docs/VARIABLE_SUBSTITUTION.md.
+		if (!state.scalar_symbols.empty()) {
+			string out;
+			char quote = 0;
+			idx_t i = 0;
+			while (i < result.size()) {
+				char c = result[i];
+				if (quote) {
+					out += c;
+					if (c == quote) {
+						quote = 0;
+					}
+					i++;
+					continue;
 				}
+				if (c == '"' || c == '\'') {
+					quote = c;
+					out += c;
+					i++;
+					continue;
+				}
+				if (isalpha(static_cast<unsigned char>(c)) || c == '_') {
+					idx_t start = i;
+					while (i < result.size() && (isalnum(static_cast<unsigned char>(result[i])) || result[i] == '_')) {
+						i++;
+					}
+					string ident = result.substr(start, i - start);
+
+					// Explicit scalar(name): resolve name from the scalar table.
+					if (ident == "scalar") {
+						idx_t j = i;
+						while (j < result.size() && result[j] == ' ') {
+							j++;
+						}
+						if (j < result.size() && result[j] == '(') {
+							idx_t close = result.find(')', j + 1);
+							if (close != string::npos) {
+								string inner = Trim(result.substr(j + 1, close - j - 1));
+								auto sit = state.scalar_symbols.find(inner);
+								if (sit != state.scalar_symbols.end()) {
+									out += DodoState::ResolveSymbol(sit->second);
+									i = close + 1;
+									continue;
+								}
+							}
+						}
+					}
+
+					auto it = state.scalar_symbols.find(ident);
+					if (it != state.scalar_symbols.end()) {
+						out += DodoState::ResolveSymbol(it->second);
+					} else {
+						out += ident;
+					}
+					continue;
+				}
+				out += c;
+				i++;
 			}
+			result = out;
 		}
 
 		if (result == prev) {
@@ -942,61 +994,33 @@ DodoCommand TokenizeCommand(const string &query) {
 		}
 	}
 
-	// Split off options after comma (not inside quotes or parens)
-	int paren_depth = 0;
-	bool in_quotes = false;
-	idx_t comma_pos = string::npos;
-	for (idx_t i = 0; i < trimmed.size(); i++) {
-		char c = trimmed[i];
-		if (c == '"') {
-			in_quotes = !in_quotes;
-		} else if (!in_quotes) {
-			if (c == '(') {
-				paren_depth++;
-			} else if (c == ')') {
-				paren_depth--;
-			} else if (c == ',' && paren_depth == 0) {
-				comma_pos = i;
-				break;
+	// Split off options after the first top-level comma (outside quotes/parens).
+	auto comma_parts = lex::SplitOutsideQuotes(trimmed, ',');
+	string before_comma = Trim(comma_parts[0]);
+	if (comma_parts.size() > 1) {
+		// Rejoin the remainder so options may themselves contain commas.
+		string opts;
+		for (idx_t i = 1; i < comma_parts.size(); i++) {
+			if (i > 1) {
+				opts += ",";
 			}
+			opts += comma_parts[i];
 		}
+		result.options = Trim(opts);
 	}
 
-	string before_comma = trimmed;
-	if (comma_pos != string::npos) {
-		before_comma = Trim(trimmed.substr(0, comma_pos));
-		result.options = Trim(trimmed.substr(comma_pos + 1));
-	}
-
-	// Split on "if " keyword (at start or after space, not inside quotes)
+	// Split on the "if " condition keyword (outside quotes/parens).
 	string lower_bc = str::Lower(before_comma);
 	idx_t if_pos = string::npos;
 	idx_t cond_start = string::npos;
-
-	// Check if it starts with "if "
 	if (str::StartsWith(lower_bc, "if ")) {
 		if_pos = 0;
 		cond_start = 3;
 	} else {
-		// Look for " if " in the middle
-		idx_t search_start = 0;
-		while (true) {
-			idx_t pos = lower_bc.find(" if ", search_start);
-			if (pos == string::npos) {
-				break;
-			}
-			bool inside_quotes = false;
-			for (idx_t i = 0; i < pos; i++) {
-				if (before_comma[i] == '"') {
-					inside_quotes = !inside_quotes;
-				}
-			}
-			if (!inside_quotes) {
-				if_pos = pos;
-				cond_start = pos + 4;
-				break;
-			}
-			search_start = pos + 4;
+		idx_t pos = lex::FindKeywordOutsideQuotes(lower_bc, " if ");
+		if (pos != string::npos) {
+			if_pos = pos;
+			cond_start = pos + 4;
 		}
 	}
 
@@ -3643,42 +3667,23 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 static vector<string> AccumulateBraceBlock(LineReader reader) {
 	vector<string> body;
 	int depth = 1;
+	bool in_block_comment = false;
 	string line;
 	while (reader(line)) {
-		string trimmed = Trim(line);
-
-		// Strip comments
-		if (!trimmed.empty() && trimmed[0] == '*') {
-			continue;
-		}
-		idx_t comment_pos = trimmed.find("//");
-		if (comment_pos != string::npos) {
-			if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
-				// /// continuation inside block — not typical but handle gracefully
-				trimmed = Trim(trimmed.substr(0, comment_pos));
-			} else {
-				trimmed = Trim(trimmed.substr(0, comment_pos));
-			}
-		}
-
+		bool line_continued = false; // /// inside a block body is unusual; treat as plain strip
+		string trimmed = Trim(lex::StripComments(line, in_block_comment, line_continued));
 		if (trimmed.empty()) {
 			continue;
 		}
 
-		// Track brace depth
-		for (auto c : trimmed) {
-			if (c == '{') {
-				depth++;
-			} else if (c == '}') {
-				depth--;
-			}
-		}
+		// Track brace depth (quote-aware).
+		depth += lex::BraceDelta(trimmed);
 
 		if (depth <= 0) {
-			// The closing } line — don't add it to body
-			// But if there's content before }, add it
+			// The closing } line — don't add it to the body, but keep any content
+			// before the brace that closes the block.
 			idx_t close_pos = trimmed.find('}');
-			if (close_pos > 0) {
+			if (close_pos != string::npos && close_pos > 0) {
 				string before = Trim(trimmed.substr(0, close_pos));
 				if (!before.empty()) {
 					body.push_back(before);
@@ -3701,25 +3706,12 @@ static vector<string> AccumulateBraceBlock(LineReader reader) {
 // Loop Parsing Helpers
 //===--------------------------------------------------------------------===//
 
-// Split a string into tokens respecting quotes
+// Split a string into whitespace-separated tokens, respecting quotes (via the
+// shared lexer). Quoted strings become a single token with quotes stripped.
 static vector<string> SplitTokens(const string &s) {
 	vector<string> tokens;
-	string current;
-	bool in_quotes = false;
-	for (idx_t i = 0; i < s.size(); i++) {
-		if (s[i] == '"') {
-			in_quotes = !in_quotes;
-		} else if (s[i] == ' ' && !in_quotes) {
-			if (!current.empty()) {
-				tokens.push_back(current);
-				current.clear();
-			}
-		} else {
-			current += s[i];
-		}
-	}
-	if (!current.empty()) {
-		tokens.push_back(current);
+	for (auto &t : lex::Tokenize(s)) {
+		tokens.push_back(t.text);
 	}
 	return tokens;
 }
@@ -3940,49 +3932,20 @@ vector<string> ProcessLines(LineReader reader, DodoState &state, bool skip_termi
 	};
 
 	while (reader(line)) {
-		string trimmed = Trim(line);
+		// Quote/comment-aware stripping: block comments (spanning lines via
+		// in_block_comment), // line comments (not fired inside strings or in
+		// "http://"), /// continuation, and leading-* whole-line comments.
+		bool line_continued = false;
+		string trimmed = Trim(lex::StripComments(line, in_block_comment, line_continued));
 
-		// Handle block comments /* ... */
-		if (in_block_comment) {
-			idx_t end_pos = trimmed.find("*/");
-			if (end_pos != string::npos) {
-				in_block_comment = false;
-				trimmed = Trim(trimmed.substr(end_pos + 2));
-			} else {
-				continue;
-			}
-		}
-
-		// Check for block comment start
-		idx_t block_start = trimmed.find("/*");
-		if (block_start != string::npos) {
-			idx_t block_end = trimmed.find("*/", block_start + 2);
-			if (block_end != string::npos) {
-				trimmed = Trim(trimmed.substr(0, block_start) + trimmed.substr(block_end + 2));
-			} else {
-				trimmed = Trim(trimmed.substr(0, block_start));
-				in_block_comment = true;
-			}
-		}
-
-		// Strip // line comments
-		idx_t comment_pos = trimmed.find("//");
-		if (comment_pos != string::npos) {
-			if (comment_pos + 2 < trimmed.size() && trimmed[comment_pos + 2] == '/') {
-				continued_line += Trim(trimmed.substr(0, comment_pos)) + " ";
-				continue;
-			}
-			trimmed = Trim(trimmed.substr(0, comment_pos));
-		}
-
-		// Strip * line-start comments
-		if (!trimmed.empty() && trimmed[0] == '*') {
+		if (line_continued) {
+			continued_line += trimmed + " ";
 			continue;
 		}
 
 		// Handle line continuation
 		if (!continued_line.empty()) {
-			trimmed = continued_line + trimmed;
+			trimmed = Trim(continued_line + trimmed);
 			continued_line.clear();
 		}
 

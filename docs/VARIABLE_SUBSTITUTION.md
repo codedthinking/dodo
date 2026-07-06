@@ -403,3 +403,34 @@ raw line(s)
   result table + `WHERE employment > (SELECT min FROM _result)`
 - Stale `r()`: `summarize a; count; keep if x > r(max)` → error (volatility)
 - `r(nonexistent)` → compile-time error (field validation)
+
+## Scalars vs. data columns (known deviation)
+
+dodo translates commands to SQL without reading the dataset's schema, so at
+compile time it cannot tell whether a bare identifier is a data column or a
+scalar. When a scalar and a column share a name, dodo resolves the **bare name
+to the scalar** — Stata resolves it to the column (variables take precedence
+over scalars).
+
+```stata
+scalar revenue = 5
+generate doubled = revenue * 2   // dodo: (5 * 2);  Stata: (<column revenue> * 2)
+```
+
+To be explicit and portable, use the `scalar(name)` function form, which always
+resolves to the scalar regardless of any same-named column:
+
+```stata
+generate scaled = scalar(factor) * revenue   // scalar(factor) -> the scalar; revenue -> the column
+```
+
+Scalar substitution never occurs inside string literals:
+
+```stata
+scalar region = 5
+generate note = "region is here"   // -> 'region is here' (not '5 is here')
+```
+
+Global (`$name`, `${name}`) and local (`` `name' ``) macros do expand inside
+double-quoted strings (matching Stata). A `$` followed by a non-letter (e.g.
+`$20`) is left literal, since Stata macro names cannot begin with a digit.

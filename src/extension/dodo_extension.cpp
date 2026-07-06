@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "dodo_extension.hpp"
+#include "do_lexer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -73,8 +74,9 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
                                                  ParserOptions &options) {
 	auto &state = dynamic_cast<DodoStateInfo &>(*info);
 
-	// Split the full query into individual statements by ';'
-	auto statements_str = StringUtil::Split(query, ';');
+	// Split the full query into individual statements by ';', ignoring ';' inside
+	// string literals (SQL or .do) so a literal semicolon can't split a statement.
+	auto statements_str = dodo::lex::SplitOutsideQuotes(query, ';');
 
 	bool has_dodo_commands = false;
 	bool has_conflict_commands = false;
@@ -146,7 +148,7 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 		// input from do-files, pasted blocks, etc.)
 		vector<string> all_lines;
 		for (auto &s : statements_str) {
-			auto lines = StringUtil::Split(s, '\n');
+			auto lines = dodo::lex::SplitOutsideQuotes(s, '\n');
 			for (auto &l : lines) {
 				string tl = l;
 				StringUtil::Trim(tl);
@@ -263,9 +265,11 @@ static ParserOverrideResult dodo_parser_override(ParserExtensionInfo *info, cons
 					all_statements.push_back(std::move(parser.statements[si]));
 				}
 			} else {
-				// Not a dodo command — parse as standard SQL
+				// Not a dodo command — parse as standard SQL. Use the ORIGINAL,
+				// unexpanded line so dodo macro expansion cannot corrupt plain SQL
+				// containing '$', '`', or '${...}' (e.g. inside string literals).
 				Parser parser;
-				parser.ParseQuery(trimmed);
+				parser.ParseQuery(all_lines[li]);
 				for (auto &stmt : parser.statements) {
 					all_statements.push_back(std::move(stmt));
 				}

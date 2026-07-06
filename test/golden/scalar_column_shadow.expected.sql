@@ -6,9 +6,15 @@ WITH
     SELECT *
     FROM dodo._current
   ),
-  -- [source] generate url = "http:
+  -- [source] generate bare = 3 * 2
   _s1 AS (
-    SELECT *, ('http:) AS url FROM _s0
+    SELECT *, (3 * 2) AS bare
+    FROM _s0
+  ),
+  -- [source] generate explicit = 3 * revenue
+  _s2 AS (
+    SELECT *, (3 * revenue) AS explicit
+    FROM _s1
   )
 SELECT *
-FROM _s1;
+FROM _s2;
