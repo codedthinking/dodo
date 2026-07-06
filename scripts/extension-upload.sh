@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# NOTE: This script is currently UNUSED — no workflow invokes it (the main
+# distribution pipeline defines no deploy stage). Wiring up S3 deployment is a
+# product decision, tracked separately. It also writes the signing key to
+# private.pem on disk without a trap cleanup (see docs/CODE_REVIEW.md §4.4)
+# before it is used again.
+
 # Extension upload script
 
 # Usage: ./extension-upload.sh <name> <extension_version> <duckdb_version> <architecture> <s3_bucket> <copy_to_latest> <copy_to_versioned>

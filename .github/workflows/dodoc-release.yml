@@ -38,25 +38,49 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # dodoc depends on the dta reader sources. Init just that submodule
+      # (not recursive — the heavy duckdb submodule is not needed for the CLI).
+      - name: Init dta submodule
+        run: git submodule update --init --depth 1 duckdb-dta
+        shell: bash
 
       - name: Build dodoc
+        shell: bash
         run: |
-          CXXFLAGS="-O2 -std=c++17"
+          CXXFLAGS="-O2 -std=c++17 -Isrc/core -Iduckdb-dta/src/include"
           if [ "${{ matrix.static }}" = "true" ]; then
             CXXFLAGS="$CXXFLAGS -static"
           fi
           if [ -n "${{ matrix.cross }}" ]; then
             CXXFLAGS="$CXXFLAGS ${{ matrix.cross }}"
           fi
+          # Single-source the version from the release tag when present.
+          if [[ "$GITHUB_REF" == refs/tags/dodoc-v* ]]; then
+            CXXFLAGS="$CXXFLAGS -DDODOC_VERSION_OVERRIDE=${GITHUB_REF#refs/tags/dodoc-v}"
+          fi
           mkdir -p build/dodoc
-          c++ $CXXFLAGS -Isrc/core -o build/dodoc/dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
+          c++ $CXXFLAGS -o build/dodoc/dodoc \
+            src/cli/dodoc.cpp src/core/dodo_core.cpp duckdb-dta/src/dta_reader.cpp
           strip build/dodoc/dodoc || true
 
-      - name: Smoke test
+      - name: Smoke test (native)
         if: ${{ !matrix.cross }}
+        shell: bash
         run: |
           echo 'use "data.csv", clear' | build/dodoc/dodoc
           build/dodoc/dodoc --help
+
+      - name: Smoke test (cross artifact is well-formed)
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: |
+          # Can't execute the x86_64 binary on the arm64 runner; verify it is a
+          # non-empty Mach-O x86_64 object so a broken cross-build can't ship.
+          test -s build/dodoc/dodoc
+          file build/dodoc/dodoc | grep -q 'x86_64'
 
       - name: Package
         run: |
@@ -75,14 +99,31 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Init dta submodule
+        run: git submodule update --init --depth 1 duckdb-dta
+        shell: bash
 
       - name: Set up MSVC
+        # TODO(security): pin to a full commit SHA (currently a mutable tag).
         uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compute version define
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/dodoc-v* ]]; then
+            echo "def=/DDODOC_VERSION_OVERRIDE=${GITHUB_REF#refs/tags/dodoc-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "def=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build dodoc
         run: |
           mkdir build\dodoc
-          cl /O2 /EHsc /std:c++17 /MT /Isrc\core /Fe:build\dodoc\dodoc.exe src\cli\dodoc.cpp src\core\dodo_core.cpp
+          cl /O2 /EHsc /std:c++17 /MT ${{ steps.ver.outputs.def }} /Isrc\core /Iduckdb-dta\src\include /Fe:build\dodoc\dodoc.exe src\cli\dodoc.cpp src\core\dodo_core.cpp duckdb-dta\src\dta_reader.cpp
         shell: cmd
 
       - name: Smoke test
@@ -113,6 +154,7 @@ jobs:
           path: artifacts
 
       - name: Create release
+        # TODO(security): pin to a full commit SHA (currently a mutable tag).
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -131,9 +173,12 @@ jobs:
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Download release artifacts
+        env:
+          # Pass the tag as data, never interpolated into the script text
+          # (tag names are attacker-influenceable via tag push).
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          tag="${{ steps.version.outputs.tag }}"
-          base="https://github.com/codedthinking/dodo/releases/download/${tag}"
+          base="https://github.com/codedthinking/dodo/releases/download/${TAG}"
           for platform in macos-arm64 macos-x86_64 linux-x86_64 linux-arm64; do
             curl -fsSL -o "dodoc-${platform}.tar.gz" "${base}/dodoc-${platform}.tar.gz"
           done
@@ -153,8 +198,14 @@ jobs:
           token: ${{ secrets.TAP_TOKEN }}
 
       - name: Update formula
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA_MACOS_ARM64: ${{ steps.sha.outputs.macos_arm64 }}
+          SHA_MACOS_X86_64: ${{ steps.sha.outputs.macos_x86_64 }}
+          SHA_LINUX_X86_64: ${{ steps.sha.outputs.linux_x86_64 }}
+          SHA_LINUX_ARM64: ${{ steps.sha.outputs.linux_arm64 }}
         run: |
-          tag="${{ steps.version.outputs.tag }}"
+          tag="$TAG"
           version="${tag#dodoc-v}"
           cat > Formula/dodoc.rb << 'FORMULA'
           class Dodoc < Formula
@@ -195,17 +246,18 @@ jobs:
           url_base="https://github.com/codedthinking/dodo/releases/download/${tag}"
           sed -i "s|VERSION_PLACEHOLDER|${version}|g" Formula/dodoc.rb
           sed -i "s|URL_BASE|${url_base}|g" Formula/dodoc.rb
-          sed -i "s|SHA_MACOS_ARM64|${{ steps.sha.outputs.macos_arm64 }}|g" Formula/dodoc.rb
-          sed -i "s|SHA_MACOS_X86_64|${{ steps.sha.outputs.macos_x86_64 }}|g" Formula/dodoc.rb
-          sed -i "s|SHA_LINUX_X86_64|${{ steps.sha.outputs.linux_x86_64 }}|g" Formula/dodoc.rb
-          sed -i "s|SHA_LINUX_ARM64|${{ steps.sha.outputs.linux_arm64 }}|g" Formula/dodoc.rb
+          sed -i "s|SHA_MACOS_ARM64|${SHA_MACOS_ARM64}|g" Formula/dodoc.rb
+          sed -i "s|SHA_MACOS_X86_64|${SHA_MACOS_X86_64}|g" Formula/dodoc.rb
+          sed -i "s|SHA_LINUX_X86_64|${SHA_LINUX_X86_64}|g" Formula/dodoc.rb
+          sed -i "s|SHA_LINUX_ARM64|${SHA_LINUX_ARM64}|g" Formula/dodoc.rb
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' Formula/dodoc.rb
 
       - name: Push to tap
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          tag="${{ steps.version.outputs.tag }}"
-          version="${tag#dodoc-v}"
+          version="${TAG#dodoc-v}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/dodoc.rb
@@ -230,14 +282,18 @@ jobs:
           echo "version=${tag#dodoc-v}" >> "$GITHUB_OUTPUT"
 
       - name: Update version in description.yml
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sed -i "s/version: .*/version: ${{ steps.version.outputs.version }}/" docs/description.yml
+          sed -i "s/version: .*/version: ${VERSION}/" docs/description.yml
 
       - name: Push to website
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add docs/description.yml
           git diff --cached --quiet && exit 0
-          git commit -m "Bump version to ${{ steps.version.outputs.version }}"
+          git commit -m "Bump version to ${VERSION}"
           git push origin website

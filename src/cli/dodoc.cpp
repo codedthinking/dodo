@@ -6,7 +6,18 @@
 #include <string>
 #include <vector>
 
+// Version is single-sourced from the release tag: the release workflow compiles
+// with -DDODOC_VERSION_OVERRIDE=<version> (no quotes needed — stringized here).
+// Local/dev builds with no override fall back to the value below.
+#ifdef DODOC_VERSION_OVERRIDE
+#define DODOC_STR2(x) #x
+#define DODOC_STR(x) DODOC_STR2(x)
+static const char *DODOC_VERSION = DODOC_STR(DODOC_VERSION_OVERRIDE);
+#undef DODOC_STR
+#undef DODOC_STR2
+#else
 static const char *DODOC_VERSION = "0.3.0";
+#endif
 
 static void print_usage(const char *prog) {
 	std::cerr << "Usage: " << prog << " [OPTIONS] [INPUT_FILE]\n"

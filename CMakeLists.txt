@@ -11,6 +11,10 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# NOTE: these are global (not target-scoped) because DuckDB's extension build
+# macros (build_static_extension / build_loadable_extension) create their
+# targets internally, so target_include_directories cannot be attached to them
+# from here. The paths are only consumed by the dodo sources compiled below.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/extension ${CMAKE_CURRENT_SOURCE_DIR}/src/core
                     ${CMAKE_CURRENT_SOURCE_DIR}/duckdb-dta/src/include
                     ${CMAKE_CURRENT_SOURCE_DIR}/duckdb-dta/src)
@@ -29,8 +33,13 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-# CLI tool (standalone, no DuckDB dependency)
-add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
-               duckdb-dta/src/dta_reader.cpp)
-target_include_directories(dodoc PRIVATE src/core duckdb-dta/src/include)
-target_compile_features(dodoc PRIVATE cxx_std_17)
+# CLI tool (standalone, no DuckDB dependency).
+# Gated off cross-compile targets (wasm/mingw): the native CLI is not part of
+# the distributable extension and its toolchain flags do not apply there. The
+# Makefile builds it independently for local/dev use.
+if(NOT EMSCRIPTEN AND NOT MINGW)
+  add_executable(dodoc src/cli/dodoc.cpp src/core/dodo_core.cpp
+                 duckdb-dta/src/dta_reader.cpp)
+  target_include_directories(dodoc PRIVATE src/core duckdb-dta/src/include)
+  target_compile_features(dodoc PRIVATE cxx_std_17)
+endif()

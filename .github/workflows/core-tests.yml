@@ -1,0 +1,36 @@
+#
+# Fast core regression tests: build the standalone dodoc compiler and run the
+# golden-SQL suite. No DuckDB build is required, so this completes in under a
+# minute and gates every push/PR on translation stability.
+#
+name: Core Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: core-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  golden:
+    name: dodoc golden-SQL suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Only the submodules dodoc actually needs: the dta reader sources and the
+      # extension-ci-tools Makefile fragment the top-level Makefile includes.
+      # (Deliberately NOT recursive — the heavy duckdb submodule is not needed.)
+      - name: Init required submodules
+        run: git submodule update --init --depth 1 duckdb-dta extension-ci-tools
+
+      - name: Build dodoc
+        run: make dodoc
+
+      - name: Run golden-SQL suite
+        run: make test-core

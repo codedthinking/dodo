@@ -28,6 +28,14 @@ dodoc-install: dodoc
 dodoc-clean:
 	rm -rf $(DODOC_BUILD_DIR)
 
+# ---- Golden-SQL regression tests for the core (no DuckDB build required) ----
+.PHONY: test-core test-core-update
+test-core: dodoc
+	DODOC=$(DODOC_BUILD_DIR)/dodoc bash test/golden/run_golden.sh
+
+test-core-update: dodoc
+	DODOC=$(DODOC_BUILD_DIR)/dodoc UPDATE=1 bash test/golden/run_golden.sh
+
 # ---- E2E tests across client interfaces ----
 .PHONY: e2e e2e-cli e2e-python e2e-r e2e-node
 
