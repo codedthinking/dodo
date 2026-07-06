@@ -27,27 +27,16 @@ static string BuildHistorySQL(const DodoStateInfo &state) {
 		if (!first) {
 			sql += ", ";
 		}
-		string escaped_cmd = state.core.cte_commands[i];
-		size_t pos = 0;
-		while ((pos = escaped_cmd.find('\'', pos)) != string::npos) {
-			escaped_cmd.replace(pos, 1, "''");
-			pos += 2;
-		}
-		sql += "(" + to_string(i) + ", '" + escaped_cmd + "', false)";
+		sql += "(" + to_string(i) + ", " + dodo::str::SqlString(state.core.cte_commands[i]) + ", false)";
 		first = false;
 	}
 	for (idx_t i = 0; i < state.core.redo_stack.size(); i++) {
 		if (!first) {
 			sql += ", ";
 		}
-		string escaped_cmd = state.core.redo_stack[state.core.redo_stack.size() - 1 - i].first;
-		size_t pos = 0;
-		while ((pos = escaped_cmd.find('\'', pos)) != string::npos) {
-			escaped_cmd.replace(pos, 1, "''");
-			pos += 2;
-		}
 		int step_id = static_cast<int>(state.core.cte_commands.size()) + static_cast<int>(i);
-		sql += "(" + to_string(step_id) + ", '" + escaped_cmd + "', true)";
+		sql += "(" + to_string(step_id) + ", " +
+		       dodo::str::SqlString(state.core.redo_stack[state.core.redo_stack.size() - 1 - i].first) + ", true)";
 		first = false;
 	}
 	if (first) {

@@ -243,6 +243,22 @@ inline bool NeedsQuoting(const std::string &s) {
 	return false;
 }
 
+// Wrap a value as a SQL single-quoted string literal, doubling embedded quotes.
+// Use this for EVERY user-supplied value pasted into generated SQL (filenames,
+// labels, history text) so an apostrophe cannot break — or inject into — the query.
+inline std::string SqlString(const std::string &s) {
+	std::string out = "'";
+	for (char c : s) {
+		if (c == '\'') {
+			out += "''";
+		} else {
+			out += c;
+		}
+	}
+	out += "'";
+	return out;
+}
+
 inline std::string QuoteIdent(const std::string &s) {
 	if (NeedsQuoting(s)) {
 		std::string escaped = s;

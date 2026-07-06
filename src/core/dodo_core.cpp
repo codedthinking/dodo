@@ -27,6 +27,47 @@ static string QuoteIdent(const string &s) {
 	return str::QuoteIdent(s);
 }
 
+// Checked number parsing: throw a DodoException (never a raw std::invalid_argument,
+// which would abort the process) when a token is not a full, valid number. `ctx`
+// names the command/context for the error message.
+static int ParseIntStrict(const string &s, const string &ctx) {
+	string t = Trim(s);
+	if (t.empty()) {
+		throw DodoException(ctx + ": expected an integer, got empty text");
+	}
+	try {
+		size_t consumed = 0;
+		int v = std::stoi(t, &consumed);
+		if (consumed != t.size()) {
+			throw DodoException(ctx + ": expected an integer, got '" + t + "'");
+		}
+		return v;
+	} catch (const DodoException &) {
+		throw;
+	} catch (...) {
+		throw DodoException(ctx + ": expected an integer, got '" + t + "'");
+	}
+}
+
+static double ParseDoubleStrict(const string &s, const string &ctx) {
+	string t = Trim(s);
+	if (t.empty()) {
+		throw DodoException(ctx + ": expected a number, got empty text");
+	}
+	try {
+		size_t consumed = 0;
+		double v = std::stod(t, &consumed);
+		if (consumed != t.size()) {
+			throw DodoException(ctx + ": expected a number, got '" + t + "'");
+		}
+		return v;
+	} catch (const DodoException &) {
+		throw;
+	} catch (...) {
+		throw DodoException(ctx + ": expected a number, got '" + t + "'");
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // SQL Formatting
 //===--------------------------------------------------------------------===//
@@ -317,7 +358,7 @@ static vector<ExprToken> TokenizeExpr(const string &expr) {
 					tokens.push_back({ExprToken::OP, 0, 'n', ""}); // 'n' = negate
 					continue;
 				}
-				tokens.push_back({ExprToken::NUMBER, std::stod(expr.substr(start, i - start)), 0, ""});
+				tokens.push_back({ExprToken::NUMBER, ParseDoubleStrict(expr.substr(start, i - start), "expression"), 0, ""});
 			} else {
 				tokens.push_back({ExprToken::OP, 0, '-', ""});
 				i++;
@@ -327,7 +368,7 @@ static vector<ExprToken> TokenizeExpr(const string &expr) {
 			while (i < expr.size() && (isdigit(expr[i]) || expr[i] == '.' || expr[i] == 'e' || expr[i] == 'E')) {
 				i++;
 			}
-			tokens.push_back({ExprToken::NUMBER, std::stod(expr.substr(start, i - start)), 0, ""});
+			tokens.push_back({ExprToken::NUMBER, ParseDoubleStrict(expr.substr(start, i - start), "expression"), 0, ""});
 		} else if (isalpha(c) || c == '_') {
 			idx_t start = i;
 			while (i < expr.size() && (isalnum(expr[i]) || expr[i] == '_')) {
@@ -790,9 +831,9 @@ vector<string> ParseNumlist(const string &spec) {
 		idx_t paren_open = t.find('(');
 		idx_t paren_close = t.find(')');
 		if (paren_open != string::npos && paren_close != string::npos && paren_close > paren_open) {
-			double start = std::stod(t.substr(0, paren_open));
-			double step = std::stod(t.substr(paren_open + 1, paren_close - paren_open - 1));
-			double end = std::stod(t.substr(paren_close + 1));
+			double start = ParseDoubleStrict(t.substr(0, paren_open), "numlist '" + t + "'");
+			double step = ParseDoubleStrict(t.substr(paren_open + 1, paren_close - paren_open - 1), "numlist '" + t + "'");
+			double end = ParseDoubleStrict(t.substr(paren_close + 1), "numlist '" + t + "'");
 			if (step == 0) {
 				throw DodoException("Step size cannot be zero in numlist: " + t);
 			}
@@ -811,8 +852,8 @@ vector<string> ParseNumlist(const string &spec) {
 		// Check for a/b pattern (step = 1)
 		idx_t slash_pos = t.find('/');
 		if (slash_pos != string::npos && slash_pos > 0 && slash_pos < t.size() - 1) {
-			int start = std::stoi(t.substr(0, slash_pos));
-			int end = std::stoi(t.substr(slash_pos + 1));
+			int start = ParseIntStrict(t.substr(0, slash_pos), "numlist '" + t + "'");
+			int end = ParseIntStrict(t.substr(slash_pos + 1), "numlist '" + t + "'");
 			int step = (start <= end) ? 1 : -1;
 			for (int v = start; (step > 0 ? v <= end : v >= end); v += step) {
 				result.push_back(to_string(v));
@@ -985,15 +1026,18 @@ string ExtractQuotedString(const string &s) {
 
 string FileReadFunction(const string &filename) {
 	string lower = str::Lower(filename);
+	string lit = str::SqlString(filename);
 	if (str::EndsWith(lower, ".csv")) {
-		return "read_csv('" + filename + "')";
+		return "read_csv(" + lit + ")";
 	} else if (str::EndsWith(lower, ".parquet")) {
-		return "read_parquet('" + filename + "')";
+		return "read_parquet(" + lit + ")";
 	} else if (str::EndsWith(lower, ".dta")) {
-		return "read_dta('" + filename + "')";
+		return "read_dta(" + lit + ")";
 	} else if (str::EndsWith(lower, ".json")) {
-		return "read_json('" + filename + "')";
+		return "read_json(" + lit + ")";
 	}
+	// Unknown extension: treat as a bare table/relation reference (not a string
+	// literal — it may be schema-qualified), so pass through unquoted.
 	return filename;
 }
 
@@ -1720,7 +1764,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		int n = 1;
 		if (!cmd.arguments.empty()) {
-			n = std::stoi(Trim(cmd.arguments));
+			n = ParseIntStrict(cmd.arguments, "'undo'");
 		}
 		int max_undo = static_cast<int>(state.cte_steps.size()) - 1;
 		if (n > max_undo) {
@@ -1743,7 +1787,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		int n = 1;
 		if (!cmd.arguments.empty()) {
-			n = std::stoi(Trim(cmd.arguments));
+			n = ParseIntStrict(cmd.arguments, "'redo'");
 		}
 		int max_redo = static_cast<int>(state.redo_stack.size());
 		if (n > max_redo) {
@@ -1852,7 +1896,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 					}
 				}
 
-				int val = std::stoi(val_str);
+				int val = ParseIntStrict(val_str, "'label define'");
 				mapping[val] = text;
 			}
 
@@ -1885,16 +1929,10 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 			// Variable labels
 			for (auto &[col, label] : state.variable_labels) {
-				string escaped = label;
-				size_t pos = 0;
-				while ((pos = escaped.find('\'', pos)) != string::npos) {
-					escaped.replace(pos, 1, "''");
-					pos += 2;
-				}
 				if (has_rows) {
 					sql += ", ";
 				}
-				sql += "('" + col + "', 'variable', '" + escaped + "')";
+				sql += "(" + str::SqlString(col) + ", 'variable', " + str::SqlString(label) + ")";
 				has_rows = true;
 			}
 
@@ -1903,23 +1941,17 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				if (has_rows) {
 					sql += ", ";
 				}
-				sql += "('" + col + "', 'value_label', '" + lbl_name + "')";
+				sql += "(" + str::SqlString(col) + ", 'value_label', " + str::SqlString(lbl_name) + ")";
 				has_rows = true;
 			}
 
 			// Value label definitions
 			for (auto &[lbl_name, mapping] : state.value_label_defs) {
 				for (auto &[val, text] : mapping) {
-					string escaped = text;
-					size_t pos = 0;
-					while ((pos = escaped.find('\'', pos)) != string::npos) {
-						escaped.replace(pos, 1, "''");
-						pos += 2;
-					}
 					if (has_rows) {
 						sql += ", ";
 					}
-					sql += "('" + lbl_name + "', '" + to_string(val) + "', '" + escaped + "')";
+					sql += "(" + str::SqlString(lbl_name) + ", '" + to_string(val) + "', " + str::SqlString(text) + ")";
 					has_rows = true;
 				}
 			}
@@ -1958,11 +1990,12 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string result_sql;
 		if (!lazy) {
 			result_sql = "CREATE SCHEMA IF NOT EXISTS dodo; ";
-			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM read_csv('" + filename + "'); ";
+			result_sql += "CREATE OR REPLACE TABLE dodo._current AS SELECT * FROM read_csv(" +
+			              str::SqlString(filename) + "); ";
 			state.AddStep("SELECT * FROM dodo._current");
 			state.materialized = true;
 		} else {
-			state.AddStep("SELECT * FROM read_csv('" + filename + "')");
+			state.AddStep("SELECT * FROM read_csv(" + str::SqlString(filename) + ")");
 		}
 		state.current_source = filename;
 		result_sql += "SELECT 'OK' AS status";
@@ -1981,27 +2014,16 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			if (!first) {
 				sql += ", ";
 			}
-			string escaped = state.cte_commands[i];
-			size_t pos = 0;
-			while ((pos = escaped.find('\'', pos)) != string::npos) {
-				escaped.replace(pos, 1, "''");
-				pos += 2;
-			}
-			sql += "(" + to_string(i) + ", '" + escaped + "', false)";
+			sql += "(" + to_string(i) + ", " + str::SqlString(state.cte_commands[i]) + ", false)";
 			first = false;
 		}
 		for (idx_t i = 0; i < state.redo_stack.size(); i++) {
 			if (!first) {
 				sql += ", ";
 			}
-			string escaped = state.redo_stack[state.redo_stack.size() - 1 - i].first;
-			size_t pos = 0;
-			while ((pos = escaped.find('\'', pos)) != string::npos) {
-				escaped.replace(pos, 1, "''");
-				pos += 2;
-			}
 			int step_id = static_cast<int>(state.cte_commands.size()) + static_cast<int>(i);
-			sql += "(" + to_string(step_id) + ", '" + escaped + "', true)";
+			sql += "(" + to_string(step_id) + ", " +
+			       str::SqlString(state.redo_stack[state.redo_stack.size() - 1 - i].first) + ", true)";
 			first = false;
 		}
 		if (first) {
@@ -2029,14 +2051,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		string full_sql = state.BuildQuery("SELECT * FROM " + prev_step);
 		state.format_sql = saved_format;
 		state.sql_comments = saved_comments;
-		// Escape single quotes for SQL string literal
-		string escaped = full_sql;
-		size_t pos = 0;
-		while ((pos = escaped.find('\'', pos)) != string::npos) {
-			escaped.replace(pos, 1, "''");
-			pos += 2;
-		}
-		return "SELECT '" + escaped + "' AS sql";
+		return "SELECT " + str::SqlString(full_sql) + " AS sql";
 	}
 
 	//===--------------------------------------------------------------------===//
@@ -2249,13 +2264,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 					sql += ", ";
 				}
 				string display_val = (entry.kind == SymbolKind::VARIABLE) ? "<runtime:" + entry.value + ">" : entry.value;
-				string escaped_val = display_val;
-				size_t qpos = 0;
-				while ((qpos = escaped_val.find('\'', qpos)) != string::npos) {
-					escaped_val.replace(qpos, 1, "''");
-					qpos += 2;
-				}
-				sql += "('" + sn + "', '" + escaped_val + "')";
+				sql += "(" + str::SqlString(sn) + ", " + str::SqlString(display_val) + ")";
 				has_rows = true;
 			}
 			if (!has_rows) {
@@ -2384,16 +2393,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 					end = args.size();
 				}
 				string lit = args.substr(start, end - start);
-				// Escape single quotes for SQL
-				string escaped;
-				for (char c : lit) {
-					if (c == '\'') {
-						escaped += "''";
-					} else {
-						escaped += c;
-					}
-				}
-				sql_parts.push_back("'" + escaped + "'");
+				sql_parts.push_back(str::SqlString(lit));
 				i = (end < args.size()) ? end + 1 : end;
 			} else if (args[i] == '%') {
 				// Format spec like %5.2f — skip it (formatting not yet supported)
@@ -3053,7 +3053,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			rest = Trim(rest.substr(6));
 		}
 		string filename = ExtractQuotedString(rest);
-		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + filename + "' (FORMAT CSV, HEADER)";
+		return "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO " + str::SqlString(filename) +
+		       " (FORMAT CSV, HEADER)";
 	}
 
 	// --- Terminal commands ---
@@ -3113,13 +3114,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (!state.variable_labels.empty()) {
 			var_label_expr = "CASE column_name";
 			for (auto &[col, label] : state.variable_labels) {
-				string escaped = label;
-				size_t pos = 0;
-				while ((pos = escaped.find('\'', pos)) != string::npos) {
-					escaped.replace(pos, 1, "''");
-					pos += 2;
-				}
-				var_label_expr += " WHEN '" + col + "' THEN '" + escaped + "'";
+				var_label_expr += " WHEN " + str::SqlString(col) + " THEN " + str::SqlString(label);
 			}
 			var_label_expr += " ELSE '' END";
 		} else {
@@ -3131,7 +3126,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (!state.column_labels.empty()) {
 			val_label_expr = "CASE column_name";
 			for (auto &[col, label_name] : state.column_labels) {
-				val_label_expr += " WHEN '" + col + "' THEN '" + label_name + "'";
+				val_label_expr += " WHEN " + str::SqlString(col) + " THEN " + str::SqlString(label_name);
 			}
 			val_label_expr += " ELSE '' END";
 		} else {
@@ -3159,15 +3154,6 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (it != state.variable_labels.end()) {
 			var_label = it->second;
 		}
-		// Escape single quotes in label for SQL
-		string escaped_label;
-		for (char c : var_label) {
-			if (c == '\'') {
-				escaped_label += "''";
-			} else {
-				escaped_label += c;
-			}
-		}
 
 		bool detail = (str::Lower(cmd.options).find("detail") != string::npos ||
 		               str::Lower(cmd.options).find("d") == 0);
@@ -3189,7 +3175,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 		// detail option: formatted text output matching Stata layout
 		// Build header line: right-aligned variable label (or name)
-		string header_text = escaped_label.empty() ? raw_name : escaped_label;
+		string header_text = var_label.empty() ? raw_name : var_label;
 
 		// CTE: _prev is the data, _stats computes aggregates,
 		// _smallest/_largest get extreme values
@@ -3205,7 +3191,7 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 
 		string sql =
 		    "SELECT "
-		    "lpad('" + header_text + "', 61, ' ')"
+		    "lpad(" + str::SqlString(header_text) + ", 61, ' ')"
 		    + NL + "'-------------------------------------------------------------'"
 		    + NL + "'      Percentiles      Smallest'"
 		    + NL + "' 1%    ' || " + F(9, "p1") + " || '       ' || " + F(12, "s1")
@@ -3306,17 +3292,13 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		// For .dta: apply variable labels as COMMENT ON COLUMN on materialized table
 		if (str::EndsWith(lower_fn, ".dta") && state.materialized && !state.variable_labels.empty()) {
 			for (auto &[col, label] : state.variable_labels) {
-				string escaped_label = label;
-				size_t pos = 0;
-				while ((pos = escaped_label.find('\'', pos)) != string::npos) {
-					escaped_label.replace(pos, 1, "''");
-					pos += 2;
-				}
-				pre_save_sql += "COMMENT ON COLUMN dodo._current." + col + " IS '" + escaped_label + "'; ";
+				pre_save_sql += "COMMENT ON COLUMN dodo._current." + QuoteIdent(col) + " IS " +
+				                str::SqlString(label) + "; ";
 			}
 		}
 
-		return pre_save_sql + "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO '" + target + "'" + format_clause;
+		return pre_save_sql + "COPY (" + state.BuildQuery("SELECT * FROM " + prev) + ") TO " +
+		       str::SqlString(target) + format_clause;
 	}
 
 	if (cmd.command == "append") {
@@ -3516,15 +3498,8 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			throw DodoException("'assert' requires an expression");
 		}
 		string cond = TrExpr(cmd.arguments);
-		string escaped_expr = cmd.arguments;
-		// Escape single quotes for SQL string
-		idx_t qpos = 0;
-		while ((qpos = escaped_expr.find('\'', qpos)) != string::npos) {
-			escaped_expr.replace(qpos, 1, "''");
-			qpos += 2;
-		}
-		return state.BuildQuery("SELECT CASE WHEN bool_or(NOT (" + cond + ")) THEN error('Assertion failed: " +
-		       escaped_expr + "') ELSE 'OK' END AS status FROM " + prev);
+		return state.BuildQuery("SELECT CASE WHEN bool_or(NOT (" + cond + ")) THEN error(" +
+		       str::SqlString("Assertion failed: " + cmd.arguments) + ") ELSE 'OK' END AS status FROM " + prev);
 	}
 
 	if (cmd.command == "compress") {
