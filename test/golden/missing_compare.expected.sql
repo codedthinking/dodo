@@ -8,8 +8,14 @@ WITH
   ),
   -- [source] replace revenue = 0 if revenue >= .
   _s1 AS (
-    SELECT * REPLACE (CASE WHEN revenue >= NULL THEN 0 ELSE revenue END AS revenue)
+    SELECT * REPLACE (CASE WHEN (revenue IS NULL) THEN 0 ELSE revenue END AS revenue)
     FROM _s0
+  ),
+  -- [source] keep if price < .
+  _s2 AS (
+    SELECT *
+    FROM _s1
+    WHERE (price IS NOT NULL)
   )
 SELECT *
-FROM _s1;
+FROM _s2;

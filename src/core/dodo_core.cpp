@@ -256,14 +256,15 @@ static string BuildSetVariableSQL(const string &uname, const string &expr, const
 
 static string FindRuntimeToken(const string &expr) {
 	string lower = str::Lower(expr);
-	// _N (observation count) — only valid in SQL expressions, not compile-time
-	// Match as whole word to avoid false positives like "a_N_b"
-	for (idx_t i = 0; i < lower.size(); i++) {
-		if (lower[i] == '_' && i + 1 < lower.size() && lower[i + 1] == 'n') {
-			bool start_ok = (i == 0 || (!isalnum(lower[i - 1]) && lower[i - 1] != '_'));
-			bool end_ok = (i + 2 >= lower.size() || (!isalnum(lower[i + 2]) && lower[i + 2] != '_'));
+	// _N (observation count) and _n (observation index) are DIFFERENT Stata tokens
+	// and must not be conflated — scan the ORIGINAL, case-sensitive text. _N can be
+	// resolved at compile time (a count subquery); _n cannot (it needs a row).
+	for (idx_t i = 0; i < expr.size(); i++) {
+		if (expr[i] == '_' && i + 1 < expr.size() && (expr[i + 1] == 'N' || expr[i + 1] == 'n')) {
+			bool start_ok = (i == 0 || (!isalnum(expr[i - 1]) && expr[i - 1] != '_'));
+			bool end_ok = (i + 2 >= expr.size() || (!isalnum(expr[i + 2]) && expr[i + 2] != '_'));
 			if (start_ok && end_ok) {
-				return "_N";
+				return expr[i + 1] == 'N' ? "_N" : "_n";
 			}
 		}
 	}
@@ -1232,6 +1233,36 @@ idx_t FindFunctionArgs(const string &s, idx_t open_paren, string &args_out) {
 	return i;
 }
 
+// Rewrite a comparison against Stata's missing sentinel `.` into a NULL test.
+// Stata treats `.` as larger than every real number, so `x >= .` means "x is
+// missing" and `x < .` means "x is present". `missing_on_left` selects the
+// `. op operand` orientation (inequalities flip). Result is parenthesized.
+static string MissingCompareRewrite(const string &operand, const string &op, bool missing_on_left) {
+	// Normalize the effective operator to the "operand OP ." orientation.
+	string eff = op;
+	if (missing_on_left) {
+		if (op == ">")
+			eff = "<";
+		else if (op == "<")
+			eff = ">";
+		else if (op == ">=")
+			eff = "<=";
+		else if (op == "<=")
+			eff = ">=";
+	}
+	if (eff == "==" || eff == "=" || eff == ">=") {
+		return "(" + operand + " IS NULL)";
+	}
+	if (eff == "!=" || eff == "~=" || eff == "<") {
+		return "(" + operand + " IS NOT NULL)";
+	}
+	if (eff == ">") {
+		return "(FALSE)"; // nothing exceeds missing
+	}
+	// eff == "<="
+	return "(TRUE)"; // everything is <= missing
+}
+
 string TranslateExpression(const string &expr, const string &by_cols, const string &panel_var, const string &time_var,
                            const string &bysort_order) {
 	string result = expr;
@@ -1275,6 +1306,41 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 				out += result[i];
 			}
 		}
+		result = out;
+	}
+
+	// Stata missing-value comparisons must be rewritten BEFORE the bare `.` -> NULL
+	// pass below, since `x >= NULL` is never true. `.` is Stata's missing sentinel.
+	{
+		// operand OP .   (missing on the right — the common `x >= .` idiom)
+		static const std::regex miss_rhs(
+		    R"(([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)\s*(==|!=|~=|>=|<=|>|<|=)\s*\.(?![0-9A-Za-z_.]))");
+		string out;
+		string rest = result;
+		std::smatch m;
+		while (std::regex_search(rest, m, miss_rhs)) {
+			out += m.prefix().str();
+			out += MissingCompareRewrite(m[1].str(), m[2].str(), /*missing_on_left=*/false);
+			rest = m.suffix().str();
+		}
+		out += rest;
+		result = out;
+	}
+	{
+		// . OP operand   (missing on the left). Capture the char before `.` so a
+		// trailing-dot number like `2. > x` is not mistaken for a missing literal.
+		static const std::regex miss_lhs(
+		    R"((^|[^A-Za-z0-9_.])\.\s*(==|!=|~=|>=|<=|>|<|=)\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?))");
+		string out;
+		string rest = result;
+		std::smatch m;
+		while (std::regex_search(rest, m, miss_lhs)) {
+			out += m.prefix().str();
+			out += m[1].str();
+			out += MissingCompareRewrite(m[3].str(), m[2].str(), /*missing_on_left=*/true);
+			rest = m.suffix().str();
+		}
+		out += rest;
 		result = out;
 	}
 
@@ -1582,6 +1648,18 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	return result;
 }
 
+// Stata's `in` row-range qualifier (e.g. `keep in 1/10`) has no set-based SQL
+// equivalent; detect a standalone `in` token so it can be rejected cleanly
+// rather than mistranslated into a column list.
+static bool HasInRangeQualifier(const string &args) {
+	for (auto &tok : str::Split(args, ' ')) {
+		if (str::Lower(Trim(tok)) == "in") {
+			return true;
+		}
+	}
+	return false;
+}
+
 //===--------------------------------------------------------------------===//
 // Process command: update state, return SQL
 //===--------------------------------------------------------------------===//
@@ -1766,7 +1844,16 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		if (!cmd.arguments.empty()) {
 			n = ParseIntStrict(cmd.arguments, "'undo'");
 		}
+		if (n < 0) {
+			throw DodoException("'undo': count cannot be negative");
+		}
 		int max_undo = static_cast<int>(state.cte_steps.size()) - 1;
+		// Do not let undo shrink the chain below an active preserve checkpoint —
+		// 'restore' would then grow the vector with empty CTEs (invalid SQL).
+		if (state.preserve_checkpoint >= 0 &&
+		    static_cast<int>(state.cte_steps.size()) - n < state.preserve_checkpoint) {
+			throw DodoException("'undo' cannot cross an active 'preserve'; run 'restore' first.");
+		}
 		if (n > max_undo) {
 			n = max_undo;
 		}
@@ -2115,6 +2202,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			name = Trim(args.substr(0, eq));
 			name = Trim(name);
 			value = Trim(args.substr(eq + 1));
+			// Empty right-hand side clears the macro (Stata: `local x =`).
+			if (value.empty()) {
+				state.local_symbols[name] = {SymbolKind::LITERAL, ""};
+				return "SELECT 'OK' AS status";
+			}
 			// Check if it's a quoted string
 			if ((value.front() == '"' && value.back() == '"') ||
 			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
@@ -2131,6 +2223,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 						throw DodoException("'local " + name + " = " + value +
 						                    "': expression contains runtime token '" + rt +
 						                    "' which requires M14c (stored results as tables).");
+					}
+					if (rt == "_n") {
+						throw DodoException("'local " + name + " = " + value +
+						                    "': _n (observation index) has no value outside a row context; "
+						                    "use 'generate' to compute it per row.");
 					}
 					if (rt == "_N" && !state.HasData()) {
 						throw DodoException("'local " + name + " = " + value +
@@ -2186,6 +2283,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 			name = Trim(args.substr(0, eq));
 			name = Trim(name);
 			value = Trim(args.substr(eq + 1));
+			// Empty right-hand side clears the macro (Stata: `global x =`).
+			if (value.empty()) {
+				state.global_symbols[name] = {SymbolKind::LITERAL, ""};
+				return "SELECT 'OK' AS status";
+			}
 			if ((value.front() == '"' && value.back() == '"') ||
 			    (value.size() >= 4 && value.substr(0, 2) == "`\"" && value.substr(value.size() - 2) == "\"'")) {
 				state.global_symbols[name] = {SymbolKind::LITERAL, ExtractQuotedString(value)};
@@ -2201,6 +2303,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 						throw DodoException("'global " + name + " = " + value +
 						                    "': expression contains runtime token '" + rt +
 						                    "' which requires M14c (stored results as tables).");
+					}
+					if (rt == "_n") {
+						throw DodoException("'global " + name + " = " + value +
+						                    "': _n (observation index) has no value outside a row context; "
+						                    "use 'generate' to compute it per row.");
 					}
 					if (rt == "_N" && !state.HasData()) {
 						throw DodoException("'global " + name + " = " + value +
@@ -2300,6 +2407,9 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 		}
 		string name = Trim(args.substr(0, eq_pos));
 		string expr = Trim(args.substr(eq_pos + 1));
+		if (expr.empty()) {
+			throw DodoException("'scalar " + name + " =': assignment requires an expression");
+		}
 
 		// Check for string scalar
 		if (expr.size() >= 2 && expr.front() == '"' && expr.back() == '"') {
@@ -2319,6 +2429,11 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 				throw DodoException("'scalar " + name + " = " + expr +
 				                    "': expression contains runtime token '" + rt +
 				                    "' which requires M14c (stored results as tables).");
+			}
+			if (rt == "_n") {
+				throw DodoException("'scalar " + name + " = " + expr +
+				                    "': _n (observation index) has no value outside a row context; "
+				                    "use 'generate' to compute it per row.");
 			}
 			if (rt == "_N" && !state.HasData()) {
 				throw DodoException("'scalar " + name + " = " + expr +
@@ -2447,6 +2562,14 @@ string ProcessCommand(const DodoCommand &cmd, DodoState &state) {
 	}
 
 	string prev = state.LatestStep();
+
+	// Reject the `in` row-range qualifier for the commands that take a varlist —
+	// otherwise `keep in 1/10` is silently mistranslated to a column list.
+	if ((cmd.command == "keep" || cmd.command == "drop" || cmd.command == "list") &&
+	    HasInRangeQualifier(cmd.arguments)) {
+		throw DodoException("'" + cmd.command +
+		                    " ... in <range>' is not supported; use 'if' with a condition on _n instead.");
+	}
 
 	// --- Transformation commands ---
 	if (cmd.command == "keep") {
