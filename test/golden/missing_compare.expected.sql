@@ -16,6 +16,24 @@ WITH
     SELECT *
     FROM _s1
     WHERE (price IS NOT NULL)
+  ),
+  -- [source] keep if (revenue + cost) >= .
+  _s3 AS (
+    SELECT *
+    FROM _s2
+    WHERE ((revenue + cost) IS NULL)
+  ),
+  -- [source] keep if substr(region,1,1) != .
+  _s4 AS (
+    SELECT *
+    FROM _s3
+    WHERE (SUBSTRING(region,1,1) IS NOT NULL)
+  ),
+  -- [source] keep if . > price
+  _s5 AS (
+    SELECT *
+    FROM _s4
+    WHERE (price IS NOT NULL)
   )
 SELECT *
-FROM _s2;
+FROM _s5;

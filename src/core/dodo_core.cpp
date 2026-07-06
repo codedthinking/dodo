@@ -995,7 +995,9 @@ DodoCommand TokenizeCommand(const string &query) {
 	}
 
 	// Split off options after the first top-level comma (outside quotes/parens).
-	auto comma_parts = lex::SplitOutsideQuotes(trimmed, ',');
+	// .do-mode quoting: only " opens a string here — an apostrophe in raw .do
+	// text is a macro closer / plain character, not a string delimiter.
+	auto comma_parts = lex::SplitOutsideQuotes(trimmed, ',', "\"");
 	string before_comma = Trim(comma_parts[0]);
 	if (comma_parts.size() > 1) {
 		// Rejoin the remainder so options may themselves contain commas.
@@ -1017,7 +1019,7 @@ DodoCommand TokenizeCommand(const string &query) {
 		if_pos = 0;
 		cond_start = 3;
 	} else {
-		idx_t pos = lex::FindKeywordOutsideQuotes(lower_bc, " if ");
+		idx_t pos = lex::FindKeywordOutsideQuotes(lower_bc, " if ", "\"");
 		if (pos != string::npos) {
 			if_pos = pos;
 			cond_start = pos + 4;
@@ -1286,6 +1288,192 @@ static string MissingCompareRewrite(const string &operand, const string &op, boo
 	return "(TRUE)"; // everything is <= missing
 }
 
+static bool IsComparisonOp(const string &op) {
+	return op == "==" || op == "=" || op == "!=" || op == "~=" || op == ">=" || op == "<=" || op == ">" || op == "<";
+}
+
+static bool IsOperatorChar(char c) {
+	return c == '=' || c == '<' || c == '>' || c == '!' || c == '~';
+}
+
+static bool IsIdentNumChar(char c) {
+	// Identifier/number characters, including '.' for decimals (1.5) and
+	// qualified names (a.b).
+	return isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
+}
+
+// Scan backwards from `end` (exclusive) for a comparison operand: a balanced
+// paren group with optional function name, a subscripted variable, or an
+// identifier/number. Returns the operand's start index, or string::npos.
+static idx_t ScanOperandBackwards(const string &s, idx_t end) {
+	if (end == 0) {
+		return string::npos;
+	}
+	idx_t i = end;
+	char last = s[i - 1];
+	if (last == ')' || last == ']') {
+		char open = (last == ')') ? '(' : '[';
+		char close = last;
+		int depth = 0;
+		while (i > 0) {
+			i--;
+			if (s[i] == close) {
+				depth++;
+			} else if (s[i] == open) {
+				depth--;
+				if (depth == 0) {
+					break;
+				}
+			}
+		}
+		if (depth != 0) {
+			return string::npos;
+		}
+		// Include a directly-adjacent function/variable name: f(x), var[...]
+		while (i > 0 && (isalnum(static_cast<unsigned char>(s[i - 1])) || s[i - 1] == '_')) {
+			i--;
+		}
+		return i;
+	}
+	if (IsIdentNumChar(last)) {
+		while (i > 0 && IsIdentNumChar(s[i - 1])) {
+			i--;
+		}
+		return i;
+	}
+	return string::npos;
+}
+
+// Scan forwards from `start` for a comparison operand (mirror of the above,
+// with an optional leading unary minus). Returns one past the operand's end,
+// or string::npos.
+static idx_t ScanOperandForwards(const string &s, idx_t start) {
+	idx_t i = start;
+	if (i < s.size() && s[i] == '-') {
+		i++;
+	}
+	if (i >= s.size()) {
+		return string::npos;
+	}
+	if (s[i] == '(') {
+		int depth = 0;
+		while (i < s.size()) {
+			if (s[i] == '(') {
+				depth++;
+			} else if (s[i] == ')') {
+				depth--;
+				if (depth == 0) {
+					return i + 1;
+				}
+			}
+			i++;
+		}
+		return string::npos;
+	}
+	if (!IsIdentNumChar(s[i])) {
+		return string::npos;
+	}
+	while (i < s.size() && IsIdentNumChar(s[i])) {
+		i++;
+	}
+	// Function call or subscript directly after the name.
+	if (i < s.size() && (s[i] == '(' || s[i] == '[')) {
+		char open = s[i];
+		char close = (open == '(') ? ')' : ']';
+		int depth = 0;
+		while (i < s.size()) {
+			if (s[i] == open) {
+				depth++;
+			} else if (s[i] == close) {
+				depth--;
+				if (depth == 0) {
+					return i + 1;
+				}
+			}
+			i++;
+		}
+		return string::npos;
+	}
+	return i;
+}
+
+// Rewrite comparisons against the bare missing sentinel `.` into NULL tests.
+// Handles identifier, subscripted, function-call, parenthesized, and numeric
+// operands on either side; skips content inside double-quoted string literals.
+static string RewriteMissingComparisons(const string &expr) {
+	string s = expr;
+	bool in_string = false;
+	for (idx_t i = 0; i < s.size(); i++) {
+		if (s[i] == '"') {
+			in_string = !in_string;
+			continue;
+		}
+		if (in_string || s[i] != '.') {
+			continue;
+		}
+		// Bare-missing boundary check (not part of a number or qualified name).
+		bool prev_ok = (i == 0 || (!isalnum(static_cast<unsigned char>(s[i - 1])) && s[i - 1] != '_' && s[i - 1] != '.'));
+		bool next_ok = (i + 1 >= s.size() ||
+		                (!isalnum(static_cast<unsigned char>(s[i + 1])) && s[i + 1] != '_' && s[i + 1] != '.'));
+		if (!prev_ok || !next_ok) {
+			continue;
+		}
+
+		// operand OP .   (missing on the right — the common `x >= .` idiom)
+		{
+			idx_t k = i;
+			while (k > 0 && s[k - 1] == ' ') {
+				k--;
+			}
+			idx_t op_end = k;
+			while (k > 0 && IsOperatorChar(s[k - 1])) {
+				k--;
+			}
+			string op = s.substr(k, op_end - k);
+			if (IsComparisonOp(op)) {
+				idx_t oe = k;
+				while (oe > 0 && s[oe - 1] == ' ') {
+					oe--;
+				}
+				idx_t ostart = ScanOperandBackwards(s, oe);
+				if (ostart != string::npos && ostart < oe) {
+					string repl = MissingCompareRewrite(s.substr(ostart, oe - ostart), op, /*missing_on_left=*/false);
+					s = s.substr(0, ostart) + repl + s.substr(i + 1);
+					i = ostart + repl.size() - 1;
+					continue;
+				}
+			}
+		}
+
+		// . OP operand   (missing on the left)
+		{
+			idx_t k = i + 1;
+			while (k < s.size() && s[k] == ' ') {
+				k++;
+			}
+			idx_t op_start = k;
+			while (k < s.size() && IsOperatorChar(s[k])) {
+				k++;
+			}
+			string op = s.substr(op_start, k - op_start);
+			if (IsComparisonOp(op)) {
+				idx_t os = k;
+				while (os < s.size() && s[os] == ' ') {
+					os++;
+				}
+				idx_t oend = ScanOperandForwards(s, os);
+				if (oend != string::npos && oend > os) {
+					string repl = MissingCompareRewrite(s.substr(os, oend - os), op, /*missing_on_left=*/true);
+					s = s.substr(0, i) + repl + s.substr(oend);
+					i = i + repl.size() - 1;
+					continue;
+				}
+			}
+		}
+	}
+	return s;
+}
+
 string TranslateExpression(const string &expr, const string &by_cols, const string &panel_var, const string &time_var,
                            const string &bysort_order) {
 	string result = expr;
@@ -1333,56 +1521,31 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	}
 
 	// Stata missing-value comparisons must be rewritten BEFORE the bare `.` -> NULL
-	// pass below, since `x >= NULL` is never true. `.` is Stata's missing sentinel.
-	{
-		// operand OP .   (missing on the right — the common `x >= .` idiom)
-		static const std::regex miss_rhs(
-		    R"(([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)\s*(==|!=|~=|>=|<=|>|<|=)\s*\.(?![0-9A-Za-z_.]))");
-		string out;
-		string rest = result;
-		std::smatch m;
-		while (std::regex_search(rest, m, miss_rhs)) {
-			out += m.prefix().str();
-			out += MissingCompareRewrite(m[1].str(), m[2].str(), /*missing_on_left=*/false);
-			rest = m.suffix().str();
-		}
-		out += rest;
-		result = out;
-	}
-	{
-		// . OP operand   (missing on the left). Capture the char before `.` so a
-		// trailing-dot number like `2. > x` is not mistaken for a missing literal.
-		static const std::regex miss_lhs(
-		    R"((^|[^A-Za-z0-9_.])\.\s*(==|!=|~=|>=|<=|>|<|=)\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?))");
-		string out;
-		string rest = result;
-		std::smatch m;
-		while (std::regex_search(rest, m, miss_lhs)) {
-			out += m.prefix().str();
-			out += m[1].str();
-			out += MissingCompareRewrite(m[3].str(), m[2].str(), /*missing_on_left=*/true);
-			rest = m.suffix().str();
-		}
-		out += rest;
-		result = out;
-	}
+	// pass below, since `x >= NULL` is never true. Handles identifier, subscript,
+	// function-call, parenthesized, and numeric operands on either side.
+	result = RewriteMissingComparisons(result);
 
 	// Bare . as Stata missing value -> NULL (e.g., generate x = .)
-	// Match . when surrounded by non-alphanumeric, non-dot characters
+	// Match . when surrounded by non-alphanumeric, non-dot characters,
+	// skipping content inside double-quoted string literals.
 	{
 		string out;
+		bool in_string = false;
 		for (idx_t i = 0; i < result.size(); i++) {
-			if (result[i] == '.') {
+			if (result[i] == '"') {
+				in_string = !in_string;
+				out += result[i];
+				continue;
+			}
+			if (!in_string && result[i] == '.') {
 				bool prev_ok = (i == 0 || (!isalnum(result[i - 1]) && result[i - 1] != '_' && result[i - 1] != '.'));
 				bool next_ok = (i + 1 >= result.size() || (!isalnum(result[i + 1]) && result[i + 1] != '_' && result[i + 1] != '.'));
 				if (prev_ok && next_ok) {
 					out += "NULL";
-				} else {
-					out += '.';
+					continue;
 				}
-			} else {
-				out += result[i];
 			}
+			out += result[i];
 		}
 		result = out;
 	}
@@ -1588,18 +1751,26 @@ string TranslateExpression(const string &expr, const string &by_cols, const stri
 	// round(x) and round(x, d) — DuckDB supports ROUND natively, pass through
 	// abs(x) — DuckDB supports ABS natively, pass through
 
-	// Convert double-quoted strings to single-quoted (do-file syntax uses " for strings, SQL uses ')
-	// But be careful not to convert column name references — only convert within expressions
+	// Convert double-quoted strings to single-quoted SQL literals (do-file syntax
+	// uses " for strings, SQL uses '), doubling any embedded single quote so
+	// "it's" becomes 'it''s' instead of the invalid 'it's'.
 	{
 		string out;
-		bool in_dquote = false;
-		for (idx_t i = 0; i < result.size(); i++) {
+		idx_t i = 0;
+		while (i < result.size()) {
 			if (result[i] == '"') {
-				out += '\'';
-				in_dquote = !in_dquote;
-			} else {
-				out += result[i];
+				idx_t end = result.find('"', i + 1);
+				if (end == string::npos) {
+					// Unterminated string — escape what remains.
+					out += str::SqlString(result.substr(i + 1));
+					break;
+				}
+				out += str::SqlString(result.substr(i + 1, end - i - 1));
+				i = end + 1;
+				continue;
 			}
+			out += result[i];
+			i++;
 		}
 		result = out;
 	}

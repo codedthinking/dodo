@@ -45,6 +45,15 @@ test-core: test-lexer dodoc
 test-core-update: dodoc
 	DODOC=$(DODOC_BUILD_DIR)/dodoc UPDATE=1 bash test/golden/run_golden.sh
 
+# Type-check the extension translation unit against DuckDB headers without a
+# full build. Needs the duckdb submodule (shallow is fine:
+#   git submodule update --init --depth 1 duckdb duckdb-dta).
+.PHONY: check-extension
+check-extension:
+	$(CXX) -fsyntax-only -std=c++17 -Isrc/extension -Isrc/core -Isrc/include \
+		-Iduckdb-dta/src/include -Iduckdb/src/include src/extension/dodo_extension.cpp
+	@echo "extension TU: syntax OK"
+
 # ---- E2E tests across client interfaces ----
 .PHONY: e2e e2e-cli e2e-python e2e-r e2e-node
 

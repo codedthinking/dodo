@@ -65,7 +65,14 @@ int main() {
 		auto p = SplitOutsideQuotes("f(a, b), c", ',');
 		check(p.size() == 2, "comma inside parens ignored");
 		auto semi = SplitOutsideQuotes("SELECT ';' AS x; SELECT 2", ';');
-		check(semi.size() == 2, "semicolon inside string ignored");
+		check(semi.size() == 2, "semicolon inside string ignored (SQL mode)");
+		// .do-mode ("\"" only): an apostrophe is not a string delimiter, so it
+		// must not swallow a later comma.
+		auto apo = SplitOutsideQuotes("label don't stop, replace", ',', "\"");
+		check(apo.size() == 2, ".do-mode: apostrophe does not open a string");
+		// but a double-quoted string still protects its comma in .do-mode
+		auto dq = SplitOutsideQuotes("keep if x == \"a,b\", opts", ',', "\"");
+		check(dq.size() == 2, ".do-mode: comma in double-quoted string ignored");
 	}
 
 	// --- FindKeywordOutsideQuotes ---
@@ -73,6 +80,9 @@ int main() {
 		check(FindKeywordOutsideQuotes("keep price if x > 0", " if ") == 10, "find ' if '");
 		check(FindKeywordOutsideQuotes("keep if name == \" if \"", " if ") == 4, "first ' if ' outside string");
 		check(FindKeywordOutsideQuotes("gen s = \" if \"", " if ") == std::string::npos, "' if ' only in string");
+		// .do-mode: an apostrophe (e.g. from "don't") must not hide a real ' if '
+		check(FindKeywordOutsideQuotes("keep don't if x > 0", " if ", "\"") == 10,
+		      ".do-mode: apostrophe does not hide ' if '");
 	}
 
 	// --- Tokenize ---

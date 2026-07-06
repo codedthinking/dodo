@@ -85,7 +85,16 @@ string StripComments(const string &line, bool &in_block_comment, bool &line_cont
 	return out;
 }
 
-vector<string> SplitOutsideQuotes(const string &s, char delim) {
+static bool IsQuoteChar(char c, const char *quote_chars) {
+	for (const char *q = quote_chars; *q; q++) {
+		if (c == *q) {
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<string> SplitOutsideQuotes(const string &s, char delim, const char *quote_chars) {
 	vector<string> result;
 	string current;
 	char quote = 0; // 0 = not in a string; otherwise the opening quote char
@@ -98,7 +107,7 @@ vector<string> SplitOutsideQuotes(const string &s, char delim) {
 			}
 			continue;
 		}
-		if (c == '"' || c == '\'') {
+		if (IsQuoteChar(c, quote_chars)) {
 			quote = c;
 			current += c;
 			continue;
@@ -126,7 +135,7 @@ vector<string> SplitOutsideQuotes(const string &s, char delim) {
 	return result;
 }
 
-size_t FindKeywordOutsideQuotes(const string &s, const string &kw) {
+size_t FindKeywordOutsideQuotes(const string &s, const string &kw, const char *quote_chars) {
 	if (kw.empty() || kw.size() > s.size()) {
 		return string::npos;
 	}
@@ -140,7 +149,7 @@ size_t FindKeywordOutsideQuotes(const string &s, const string &kw) {
 			}
 			continue;
 		}
-		if (c == '"' || c == '\'') {
+		if (IsQuoteChar(c, quote_chars)) {
 			quote = c;
 			continue;
 		}

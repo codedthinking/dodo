@@ -34,3 +34,25 @@ jobs:
 
       - name: Run golden-SQL suite
         run: make test-core
+
+  extension-syntax:
+    name: extension TU syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Shallow-init just what the extension translation unit needs to
+      # type-check: DuckDB headers and the dta reader headers. This catches
+      # API/type mismatches in src/extension/ in ~2 minutes instead of waiting
+      # for the full distribution build.
+      - name: Init submodules (shallow)
+        run: git submodule update --init --depth 1 duckdb duckdb-dta
+
+      - name: Syntax-check extension against DuckDB headers
+        run: >
+          g++ -fsyntax-only -std=c++17
+          -Isrc/extension -Isrc/core -Isrc/include
+          -Iduckdb-dta/src/include -Iduckdb/src/include
+          src/extension/dodo_extension.cpp

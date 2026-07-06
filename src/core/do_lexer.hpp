@@ -32,12 +32,16 @@ namespace lex {
 // (e.g. inside "http://x") is NOT a comment.
 std::string StripComments(const std::string &line, bool &in_block_comment, bool &line_continued);
 
-// Split `s` on `delim`, ignoring delimiters inside "..." strings and (...) groups.
-std::vector<std::string> SplitOutsideQuotes(const std::string &s, char delim);
+// Split `s` on `delim`, ignoring delimiters inside quoted strings and (...)
+// groups. `quote_chars` selects which characters open a string: pass "\"" for
+// raw .do source (where an apostrophe is NOT a string delimiter — it closes a
+// backtick macro) and the default "\"'" for SQL or post-expansion text (where
+// '...' literals from getvariable() etc. are real strings).
+std::vector<std::string> SplitOutsideQuotes(const std::string &s, char delim, const char *quote_chars = "\"'");
 
-// Find the first occurrence of `kw` that lies outside "..." strings and (...)
-// groups. Returns std::string::npos if not found.
-std::size_t FindKeywordOutsideQuotes(const std::string &s, const std::string &kw);
+// Find the first occurrence of `kw` that lies outside quoted strings and (...)
+// groups. Returns std::string::npos if not found. Same `quote_chars` rule.
+std::size_t FindKeywordOutsideQuotes(const std::string &s, const std::string &kw, const char *quote_chars = "\"'");
 
 // Tokenize into whitespace-separated words and quoted strings. String tokens
 // carry their inner (unquoted) content and kind == STRING.

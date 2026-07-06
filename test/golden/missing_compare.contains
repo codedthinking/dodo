@@ -1,0 +1,3 @@
+(revenue IS NULL)
+(price IS NOT NULL)
+((revenue + cost) IS NULL)

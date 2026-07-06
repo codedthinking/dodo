@@ -7,6 +7,11 @@
 #   NAME.do + NAME.expected.err   -> dodoc must exit non-zero and stderr must
 #                                    contain the (trimmed) contents of the .err file
 #
+# Optional property assertions (checked EVEN in UPDATE=1 mode, so regenerating
+# snapshots cannot silently bake in a regression on a load-bearing property):
+#   NAME.contains       -> every non-empty line must appear in the output
+#   NAME.not_contains   -> no non-empty line may appear in the output
+#
 # The suite drives the whole core pipeline through the standalone `dodoc`
 # compiler, so it needs no DuckDB build and runs in well under a second.
 #
@@ -54,6 +59,32 @@ for do_file in "$HERE"/*.do; do
 	code=$?
 	actual_err="$(cat "$tmp_err")"
 
+	# Property assertions run in every mode (including UPDATE=1).
+	prop_fail=""
+	if [[ -f "$HERE/$name.contains" ]]; then
+		while IFS= read -r want; do
+			[[ -z "$want" ]] && continue
+			if [[ "$actual_out" != *"$want"* ]]; then
+				prop_fail="missing required text: $want"
+				break
+			fi
+		done < "$HERE/$name.contains"
+	fi
+	if [[ -z "$prop_fail" && -f "$HERE/$name.not_contains" ]]; then
+		while IFS= read -r bad; do
+			[[ -z "$bad" ]] && continue
+			if [[ "$actual_out" == *"$bad"* ]]; then
+				prop_fail="contains forbidden text: $bad"
+				break
+			fi
+		done < "$HERE/$name.not_contains"
+	fi
+	if [[ -n "$prop_fail" ]]; then
+		fail=$((fail + 1))
+		failures+=("$name ($prop_fail)")
+		continue
+	fi
+
 	if [[ -f "$err_file" ]]; then
 		# Error case: expect failure + substring in stderr.
 		want="$(cat "$err_file")"
@@ -96,6 +127,11 @@ done
 echo
 if [[ "$UPDATE" == "1" ]]; then
 	echo "golden: regenerated $regen .expected.sql snapshot(s); $pass error-case(s) left untouched."
+	if [[ $fail -gt 0 ]]; then
+		echo "golden: $fail case(s) NOT regenerated — property assertions failed:"
+		printf '  FAIL: %s\n' "${failures[@]}"
+		exit 1
+	fi
 	exit 0
 fi
 
