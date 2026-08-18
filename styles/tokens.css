@@ -11,6 +11,8 @@
   --ochre-50:  #FBF6E8;   /* fossil ivory, lifted */
   --ochre-100: #F7F2E8;   /* warm page background */
   --ochre-200: #F3E7C9;   /* fossil ivory */
+  --ochre-150: #D4C9B0;
+  --ochre-250: #C4B890;
   --ochre-300: #EBD299;
   --ochre-400: #DDB66A;
   --ochre-500: #D8A44C;   /* primary ochre */
@@ -22,7 +24,9 @@
   --ink-50:  #F4F2EE;
   --ink-100: #E2DED6;
   --ink-200: #B8B3A8;
+  --ink-300: #B0A48C;
   --ink-400: #6B6760;
+  --ink-500: #8C8370;
   --ink-700: #2A2722;
   --ink-900: #1A1A1A;     /* outline black */
   --ink-950: #111111;     /* dark background */
@@ -56,6 +60,7 @@
 
   /* Semantic — states */
   --success:    #4F7A3B;
+  --success-10: #DCECD5;
   --warning:    #B86E1C;
   --danger:     #9E2A1F;
   --info:       var(--ochre-800);
@@ -114,7 +119,7 @@
 
   --r-sm: 4px;
   --r-md: 8px;
-  --r-lg: 14px;
+  --r-lg: 16px;
   --r-xl: 22px;
   --r-pill: 999px;
   --r-circle: 50%;
